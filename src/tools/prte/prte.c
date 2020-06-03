@@ -721,14 +721,21 @@ int main(int argc, char *argv[])
     /* detach from controlling terminal
      * otherwise, remain attached so output can get to us
      */
+#if 0
     if (!prte_debug_flag &&
         !prte_debug_daemons_flag &&
         prte_cmd_line_is_taken(prte_cmd_line, "daemonize")) {
+#endif
+    if ( prte_cmd_line_is_taken(prte_cmd_line, "daemonize")) {
+        fprintf(stderr,"wound up here call pipe on wait_pipe\n");
         pipe(wait_pipe);
         prte_state_base_parent_fd = wait_pipe[1];
+        fprintf(stderr,"calling prte_daemon_init_callback\n");
         prte_daemon_init_callback(NULL, wait_dvm);
+        fprintf(stderr,"calling prte_daemon_init_callback called\n");
         close(wait_pipe[0]);
     } else {
+        fprintf(stderr,"wound up here\n");
 #if defined(HAVE_SETSID)
         /* see if we were directed to separate from current session */
         if (prte_cmd_line_is_taken(prte_cmd_line, "set-sid")) {

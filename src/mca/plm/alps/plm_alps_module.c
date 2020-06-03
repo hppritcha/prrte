@@ -263,8 +263,10 @@ static void launch_daemons(int fd, short args, void *cbdata)
         unsetenv("PMIX_LAUNCHER_RENDEZVOUS_FILE");
     }
 
+#if 1
     /* add the aprun command */
     prte_argv_append(&argc, &argv, prte_plm_alps_component.aprun_cmd);
+#endif
 
     /* Append user defined arguments to aprun */
     if ( NULL != prte_plm_alps_component.custom_args ) {
@@ -277,14 +279,17 @@ static void launch_daemons(int fd, short args, void *cbdata)
     }
 
     /* number of processors needed */
+    prte_argv_append(&argc, &argv, "-D4");
     prte_argv_append(&argc, &argv, "-n");
     prte_asprintf(&tmp, "%lu", (unsigned long) map->num_new_daemons);
     prte_argv_append(&argc, &argv, tmp);
     free(tmp);
     prte_argv_append(&argc, &argv, "-N");
     prte_argv_append(&argc, &argv, "1");
+#if 0
     prte_argv_append(&argc, &argv, "-cc");
     prte_argv_append(&argc, &argv, "none");
+#endif
     /*
      * stuff below is necessary in the event that we've sadly configured PRTE with --disable-dlopen,
      * which results in the orted's being linked against all kinds of unnecessary cray libraries, including
@@ -416,14 +421,15 @@ static void launch_daemons(int fd, short args, void *cbdata)
 
     if (0 < prte_output_get_verbosity(prte_plm_base_framework.framework_output)) {
         param = prte_argv_join(argv, ' ');
-        PRTE_OUTPUT_VERBOSE((1, prte_plm_base_framework.framework_output,
+        fprintf(stderr,
                              "%s plm:alps: final top-level argv:\n\t%s",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                             (NULL == param) ? "NULL" : param));
+                             (NULL == param) ? "NULL" : param);
         if (NULL != param) free(param);
     }
 
     /* exec the daemon(s) */
+    fprintf(stderr, "PID %d about to call plm_alps_start_proc\n",getpid());
     if (PRTE_SUCCESS != (rc = plm_alps_start_proc(argc, argv, env, cur_prefix))) {
         PRTE_ERROR_LOG(rc);
         goto cleanup;
@@ -562,7 +568,7 @@ static void alps_wait_cb(int sd, short args, void *cbdata) {
 static int plm_alps_start_proc(int argc, char **argv, char **env,
                                 char *prefix)
 {
-    int fd;
+    int fd, i=0;
     pid_t alps_pid;
     char *exec_argv = prte_path_findv(argv[0], 0, env, NULL);
 
@@ -591,6 +597,11 @@ static int plm_alps_start_proc(int argc, char **argv, char **env,
            explaining all the rationale for how / why we're doing
            this. */
 
+        while (argv[i] != NULL) {
+          fprintf(stderr,"PID %d argv[%d] = %s\n", getpid(), i, argv[i]);
+          i++;
+        }
+
         lib_base = prte_basename(prte_install_dirs.libdir);
         bin_base = prte_basename(prte_install_dirs.bindir);
 
@@ -598,6 +609,8 @@ static int plm_alps_start_proc(int argc, char **argv, char **env,
            LD_LIBRARY_PATH environment variables.  */
         if (NULL != prefix) {
             char *oldenv, *newenv;
+
+            fprintf(stderr, "messing with LD_LIBRARY_PATH\n");
 
             /* Reset PATH */
             oldenv = getenv("PATH");
@@ -655,17 +668,23 @@ static int plm_alps_start_proc(int argc, char **argv, char **env,
         setpgid(0, 0);
 
 
+        fprintf(stderr,"PID %d about to execve for %s %s %s %s %s %s\n", getpid(),
+exec_argv, argv[0], argv[1], argv[2], argv[3], argv[4]); 
+#if 1
         execve(exec_argv, argv, env);
+#endif
 
         prte_output(0, "plm:alps:start_proc: exec failed");
         /* don't return - need to exit - returning would be bad -
            we're not in the calling process anymore */
+        sleep(100);
         exit(1);
     } else {  /* parent */
         /* just in case, make sure that the alps process is not in our
         process group any more.  Stevens says always do this on both
         sides of the fork... */
         setpgid(alps_pid, alps_pid);
+        fprintf(stderr,"PID %d is continuing on\n",getpid());
 
         free(exec_argv);
     }

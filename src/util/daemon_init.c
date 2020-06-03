@@ -36,6 +36,7 @@
 #include "src/util/daemon_init.h"
 #include "constants.h"
 
+#include <stdio.h>
 
 int prte_daemon_init_callback(char *working_dir, int (*parent_fn)(pid_t))
 {
@@ -48,12 +49,14 @@ int prte_daemon_init_callback(char *working_dir, int (*parent_fn)(pid_t))
     } else if (pid != 0) {
         /* parent goes bye-bye */
         int rc = 0;
+        fprintf(stderr, "about to invoke partent_fn\n");
         if (NULL != parent_fn) {
             rc = parent_fn(pid);
         }
         exit(rc);
     }
 
+    fprintf(stderr,"continuing in child\n");
     /* child continues */
 #if defined(HAVE_SETSID)
     setsid();  /* become session leader */
@@ -65,6 +68,7 @@ int prte_daemon_init_callback(char *working_dir, int (*parent_fn)(pid_t))
 	}
     }
 
+    fprintf(stderr,"about to shut off stdin\n");
     /* connect input to /dev/null */
     fd = open("/dev/null", O_RDONLY);
     if (0 > fd) {
@@ -75,7 +79,9 @@ int prte_daemon_init_callback(char *working_dir, int (*parent_fn)(pid_t))
         close(fd);
     }
 
+    fprintf(stderr,"about to shut off stdout .. but not really\n");
     /* connect outputs to /dev/null */
+#if 0
     fd = open("/dev/null", O_RDWR|O_CREAT|O_TRUNC, 0666);
     if (fd >= 0) {
         dup2(fd, STDOUT_FILENO);
@@ -92,10 +98,13 @@ int prte_daemon_init_callback(char *working_dir, int (*parent_fn)(pid_t))
     } else {
         return PRTE_ERR_FATAL;
     }
+#endif
 
+    fprintf(stderr,"returning from prte_daemon_init_callback\n");
     return PRTE_SUCCESS;
 
 #else /* HAVE_FORK */
+    fprintf(stderr,"well I don't think this is supported\n");
     return PRTE_ERR_NOT_SUPPORTED;
 #endif
 }
