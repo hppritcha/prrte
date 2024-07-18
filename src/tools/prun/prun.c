@@ -119,6 +119,7 @@ int prun(int argc, char *argv[])
     pargv = pmix_argv_copy_strip(argv);  // strip any quoted arguments
     gethostname(hostname, sizeof(hostname));
 
+    fprintf(stderr,"%d\n",getpid());
     rc = prte_init_minimum();
     if (PRTE_SUCCESS != rc) {
         return rc;

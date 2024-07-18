@@ -307,6 +307,7 @@ int main(int argc, char *argv[])
     pmix_cli_item_t *opt;
     FILE *fp;
 
+    fprintf(stderr, "%d\n", getpid());
     /* init the globals */
     PMIX_CONSTRUCT(&apps, pmix_list_t);
     if (NULL == (param = getenv("PRTE_BASENAME"))) {
