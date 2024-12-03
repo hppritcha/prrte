@@ -34,7 +34,7 @@ headers += \
         runtime/prte_wait.h \
         runtime/prte_progress_threads.h
 
-libprrte_la_SOURCES += \
+lib@PRTE_BINARY_PREFIX@prrte_la_SOURCES += \
         runtime/prte_finalize.c \
         runtime/prte_init.c \
         runtime/prte_locks.c \

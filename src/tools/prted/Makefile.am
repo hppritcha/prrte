@@ -51,4 +51,4 @@ bin_PROGRAMS = @PRTE_BINARY_PREFIX@prted
     $(prte_libevent_LIBS) \
     $(prte_hwloc_LIBS) \
     $(prte_pmix_LIBS) \
-	$(top_builddir)/src/libprrte.la
+	$(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la
