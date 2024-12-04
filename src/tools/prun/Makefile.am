@@ -39,15 +39,16 @@ AM_CFLAGS = \
             -DPRTE_REPO_REV="\"@PRTE_REPO_REV@\"" \
             -DPMIX_RELEASE_DATE="\"@PMIX_RELEASE_DATE@\""
 
-bin_PROGRAMS = prun
+#Apply binary prefix to the names
+bin_PROGRAMS = @PRTE_BINARY_PREFIX@prun
 
-prun_SOURCES = \
+@PRTE_BINARY_PREFIX@prun_SOURCES = \
         main.c \
         prun.c \
         prun.h
 
-prun_LDADD = \
+@PRTE_BINARY_PREFIX@prun_LDADD = \
     $(prte_libevent_LIBS) \
     $(prte_hwloc_LIBS) \
     $(prte_pmix_LIBS) \
-	$(top_builddir)/src/libprrte.la
+	$(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la

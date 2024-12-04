@@ -154,11 +154,11 @@ src/include/prte_config.h
 src/mca/rmaps/rank_file/rmaps_rank_file_lex.c
 src/mca/rmaps/rank_file/rankfile_lex.c
 
-src/tools/prun/prun
-src/tools/prte_info/prte_info
-src/tools/prted/prted
-src/tools/prte/prte
-src/tools/pterm/pterm
+src/tools/prun/ompi-prun
+src/tools/prte_info/ompi-prte_info
+src/tools/prted/ompi-prted
+src/tools/prte/ompi-prte
+src/tools/pterm/ompi-pterm
 
 src/util/hostfile/hostfile_lex.c
 src/util/keyval/keyval_lex.c

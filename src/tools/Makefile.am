@@ -29,11 +29,13 @@ SUBDIRS += \
 	tools/prted \
 	tools/prun \
     tools/prte_info \
+    tools/prte \
     tools/pterm
 
 DIST_SUBDIRS += \
 	tools/prted \
 	tools/prun \
     tools/prte_info \
+    tools/prte \
     tools/pterm
 

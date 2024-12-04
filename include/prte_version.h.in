@@ -23,4 +23,6 @@
 #define PRTE_VERSION_RELEASE @prterelease@
 
 #define PRTE_NUMERIC_VERSION @prtenumeric@
+
+#define PRTE_BINARY_PREFIX @PRTE_BINARY_PREFIX@
 #endif

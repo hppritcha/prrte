@@ -9,9 +9,9 @@
 #                         University of Stuttgart.  All rights reserved.
 # Copyright (c) 2004-2005 The Regents of the University of California.
 #                         All rights reserved.
-# Copyright (c) 2007-2020 Cisco Systems, Inc.  All rights reserved
+# Copyright (c) 2008-2020 Cisco Systems, Inc.  All rights reserved
 # Copyright (c) 2008      Sun Microsystems, Inc.  All rights reserved.
-# Copyright (c) 2016-2020 Intel, Inc.  All rights reserved.
+# Copyright (c) 2015-2020 Intel, Inc.  All rights reserved.
 # Copyright (c) 2021-2022 Nanook Consulting.  All rights reserved.
 # $COPYRIGHT$
 #
@@ -37,17 +37,12 @@ AM_CFLAGS = \
             -DPRTE_REPO_REV="\"@PRTE_REPO_REV@\"" \
             -DPMIX_RELEASE_DATE="\"@PMIX_RELEASE_DATE@\""
 
-bin_PROGRAMS = @PRTE_BINARY_PREFIX@prted
+bin_PROGRAMS = @PRTE_BINARY_PREFIX@prte
 
-@PRTE_BINARY_PREFIX@prted_SOURCES = prted.c
-# the following empty prted_LDFLAGS is used
-#  so that the prted can be compiled statically
-#  by simply changing the value of this from
-#  nothing to -all-static in the Makefile.in
-#  nice for systems that don't have all the shared
-#  libraries on the computes
-@PRTE_BINARY_PREFIX@prted_LDFLAGS =
-@PRTE_BINARY_PREFIX@prted_LDADD = \
+@PRTE_BINARY_PREFIX@prte_SOURCES = \
+        prte.c
+
+@PRTE_BINARY_PREFIX@prte_LDADD = \
     $(prte_libevent_LIBS) \
     $(prte_hwloc_LIBS) \
     $(prte_pmix_LIBS) \
