@@ -41,7 +41,7 @@ AM_CFLAGS = \
 AM_LDFLAGS = $(prte_hwloc_LDFLAGS) $(prte_libevent_LDFLAGS) $(prte_pmix_LDFLAGS)
 
 #Applied binary prefix to the names
-bin_PROGRAMS = @PRTE_BINARY_PREFIX@prte_info
+bin_PROGRAMS = @PRTE_BINARY_PREFIX@prte-info
 
 @PRTE_BINARY_PREFIX@prte_info_SOURCES = \
         pinfo.h \
@@ -60,7 +60,7 @@ bin_PROGRAMS = @PRTE_BINARY_PREFIX@prte_info
 if PRTE_WANT_LEGACY_TOOLS
 
 install-exec-hook:
-	(cd $(DESTDIR)$(bindir); rm -f prte_info$(EXEEXT); $(LN_S) prte-info$(EXEEXT) prte_info$(EXEEXT))
+	(cd $(DESTDIR)$(bindir); rm -f prte_info$(EXEEXT); $(LN_S) @PRTE_BINARY_PREFIX@prte-info$(EXEEXT) prte_info$(EXEEXT))
 
 uninstall-local:
 	rm -f $(DESTDIR)$(bindir)/prte_info$(EXEEXT)

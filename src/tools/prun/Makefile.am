@@ -56,7 +56,7 @@ bin_PROGRAMS = @PRTE_BINARY_PREFIX@prte-submit
 if PRTE_WANT_LEGACY_TOOLS
 
 install-exec-hook:
-	(cd $(DESTDIR)$(bindir); rm -f prun$(EXEEXT); $(LN_S) prte-submit$(EXEEXT) prun$(EXEEXT))
+	(cd $(DESTDIR)$(bindir); rm -f prun$(EXEEXT); $(LN_S) @PRTE_BINARY_PREFIX@prte-submit$(EXEEXT) prun$(EXEEXT))
 
 uninstall-local:
 	rm -f $(DESTDIR)$(bindir)/prun$(EXEEXT)
