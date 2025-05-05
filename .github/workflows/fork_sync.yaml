@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: tgymnich/fork-sync@v1.8
         with:
-          token: token: ${{ secrets.PRRTE_SYNC_UPSTREAM_MASTER_ID }}
+          token: ${{ secrets.PRRTE_SYNC_UPSTREAM_MASTER_ID }}
           owner: openpmix
           base: master
           head: master
