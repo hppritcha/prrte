@@ -19,5 +19,6 @@ jobs:
           head: master
           auto_merge: true
           auto_approve: false
+          ignore_fail: true
 
           
