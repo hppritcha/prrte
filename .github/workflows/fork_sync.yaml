@@ -18,6 +18,6 @@ jobs:
           base: master
           head: master
           auto_merge: false
-          auto_approve: true
+          auto_approve: false
 
           
