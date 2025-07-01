@@ -14,6 +14,7 @@ jobs:
       - uses: tgymnich/fork-sync@v1.8
         with:
           owner: openpmix
+          token: ${{ secrets.GITHUB_TOKEN }}
           base: master
           head: master
           auto_merge: true
