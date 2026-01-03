@@ -20,7 +20,7 @@
  *                         All rights reserved.
  * Copyright (c) 2018      Amazon.com, Inc. or its affiliates.  All Rights reserved.
  * Copyright (c) 2019-2020 IBM Corporation.  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * Copyright (c) 2023      Advanced Micro Devices, Inc. All rights reserved.
  * $COPYRIGHT$
  *
@@ -377,7 +377,7 @@ int prte_hwloc_base_get_topology(void)
         pmix_output_verbose(1, prte_hwloc_base_output,
                             "hwloc:base discovering topology");
         if (0 != hwloc_topology_init(&prte_hwloc_topology) ||
-            0 != prte_hwloc_base_topology_set_flags(prte_hwloc_topology, 0, true) ||
+            0 != prte_hwloc_base_topology_set_flags(prte_hwloc_topology, HWLOC_TOPOLOGY_FLAG_IS_THISSYSTEM, true) ||
             0 != hwloc_topology_load(prte_hwloc_topology)) {
             PRTE_ERROR_LOG(PRTE_ERR_NOT_SUPPORTED);
             return PRTE_ERR_NOT_SUPPORTED;
@@ -403,11 +403,13 @@ int prte_hwloc_base_get_topology(void)
 
 int prte_hwloc_base_set_topology(char *topofile)
 {
-    struct hwloc_topology_support *support;
     hwloc_obj_t obj;
     unsigned j, k;
+    int rc;
+    struct hwloc_topology_support *support;
 
-    PMIX_OUTPUT_VERBOSE((5, prte_hwloc_base_output, "hwloc:base:set_topology %s", topofile));
+    PMIX_OUTPUT_VERBOSE((5, prte_hwloc_base_output,
+                        "hwloc:base:set_topology %s", topofile));
 
     if (NULL != prte_hwloc_topology) {
         hwloc_topology_destroy(prte_hwloc_topology);
@@ -420,14 +422,24 @@ int prte_hwloc_base_set_topology(char *topofile)
         PMIX_OUTPUT_VERBOSE((5, prte_hwloc_base_output, "hwloc:base:set_topology bad topo file"));
         return PRTE_ERR_NOT_SUPPORTED;
     }
+
     /* since we are loading this from an external source, we have to
      * explicitly set a flag so hwloc sets things up correctly
      */
-    if (0 != prte_hwloc_base_topology_set_flags(prte_hwloc_topology,
-                                                HWLOC_TOPOLOGY_FLAG_IS_THISSYSTEM, true)) {
+    rc = prte_hwloc_base_topology_set_flags(prte_hwloc_topology, 0, true);
+    if (0 != rc) {
         hwloc_topology_destroy(prte_hwloc_topology);
         return PRTE_ERR_NOT_SUPPORTED;
     }
+    /* unfortunately, early hwloc does not include support info in its
+     * xml output :-(( We default to assuming it is present as
+     * systems that use this option are likely to provide
+     * binding support
+     */
+    support = (struct hwloc_topology_support *) hwloc_topology_get_support(prte_hwloc_topology);
+    support->cpubind->set_thisproc_cpubind = true;
+    support->membind->set_thisproc_membind = true;
+
     if (0 != hwloc_topology_load(prte_hwloc_topology)) {
         hwloc_topology_destroy(prte_hwloc_topology);
         PMIX_OUTPUT_VERBOSE((5, prte_hwloc_base_output, "hwloc:base:set_topology failed to load"));
@@ -459,15 +471,6 @@ int prte_hwloc_base_set_topology(char *topofile)
             break;
         }
     }
-
-    /* unfortunately, hwloc does not include support info in its
-     * xml output :-(( We default to assuming it is present as
-     * systems that use this option are likely to provide
-     * binding support
-     */
-    support = (struct hwloc_topology_support *) hwloc_topology_get_support(prte_hwloc_topology);
-    support->cpubind->set_thisproc_cpubind = true;
-    support->membind->set_thisproc_membind = true;
 
     /* fill prte_cache_line_size global with the smallest L1 cache
        line size */
@@ -1392,55 +1395,31 @@ static int compare_unsigned(const void *a, const void *b)
 }
 
 /* generate a logical string output of a hwloc_cpuset_t */
-static bool build_map(char *answer, size_t size,
-                      hwloc_const_cpuset_t bitmap,
-                      bool use_hwthread_cpus,
-                      bool physical, bool bits_as_cores,
-                      hwloc_topology_t topo)
+static int build_map(char *answer, size_t size,
+                     hwloc_const_cpuset_t bitmap,
+                     bool physical, char *prefix,
+                     hwloc_topology_t topo)
 {
     unsigned indices[2048], id;
     int nsites = 0, n, start, end, idx;
     hwloc_obj_t pu;
-    char tmp[128], *prefix;
+    char tmp[128];
     bool inrange, first, unique;
     unsigned val;
-
-    if (bits_as_cores || !use_hwthread_cpus) {
-        if (physical) {
-            prefix = "core:P";
-        } else {
-            prefix = "core:L";
-        }
-    } else {
-        if (physical) {
-            prefix = "hwt:P";
-        } else {
-            prefix = "hwt:L";
-        }
-    }
 
     for (id = hwloc_bitmap_first(bitmap);
          id != (unsigned)-1;
          id = hwloc_bitmap_next(bitmap, id)) {
-        // id is the physical ID for the given PU
-        if (bits_as_cores) {
-            pu =  hwloc_get_obj_by_type(topo, HWLOC_OBJ_CORE, id);
-        } else if (!use_hwthread_cpus) {
-            // the id's are for threads, but we want cores
-            pu = hwloc_get_pu_obj_by_os_index(topo, id);
-            // go upward to find the core that contains this pu
-            while (NULL != pu && pu->type != HWLOC_OBJ_CORE) {
-                pu = pu->parent;
-            }
-            if (NULL == pu) {
-                return false;
-            }
-        } else {
-            pu = hwloc_get_pu_obj_by_os_index(topo, id);
+        // the id's are for threads, but we want cores
+        pu = hwloc_get_pu_obj_by_os_index(topo, id);
+
+        // go upward to find the core that contains this pu
+        while (NULL != pu && pu->type != HWLOC_OBJ_CORE) {
+            pu = pu->parent;
         }
         if (NULL == pu) {
             pmix_show_help("help-prte-hwloc-base.txt", "pu-not-found", true, id);
-            return false;
+            return PRTE_ERR_SILENT;
         }
         if (physical) {
             // record the physical site
@@ -1450,7 +1429,6 @@ static bool build_map(char *answer, size_t size,
             val = pu->logical_index;
         }
         // add it uniquely to the array of indices - it could be a duplicate
-        // if we are looking for cores
         unique = true;
         for (n=0; n < nsites; n++) {
             if (indices[n] == val) {
@@ -1463,22 +1441,21 @@ static bool build_map(char *answer, size_t size,
             ++nsites;
             if (2048 == nsites) {
                 pmix_show_help("help-prte-hwloc-base.txt", "too-many-sites", true);
-                return false;
+                return PRTE_ERR_SILENT;
             }
         }
-
     }
 
     /* this should never happen as it would mean that the bitmap was
      * empty, which is something we checked before calling this function */
     if (0 == nsites) {
-        return false;
+        return PRTE_ERR_NOT_FOUND;
     }
 
     if (1 == nsites) {
         // only bound to one location - most common case
         snprintf(answer, size, "%s%u", prefix, indices[0]);
-        return true;
+        return PRTE_SUCCESS;
     }
 
     // sort them
@@ -1494,7 +1471,7 @@ static bool build_map(char *answer, size_t size,
     idx = strlen(prefix);
 
     for (n=1; n < nsites; n++) {
-        // see if we are in a range
+       // see if we are in a range
         if (1 == (indices[n]-end)) {
             inrange = true;
             end = indices[n];
@@ -1560,7 +1537,7 @@ static bool build_map(char *answer, size_t size,
         memcpy(&answer[idx], tmp, strlen(tmp));
         idx += strlen(tmp);
     }
-    return true;
+    return PRTE_SUCCESS;
 }
 
 /*
@@ -1577,7 +1554,8 @@ char *prte_hwloc_base_cset2str(hwloc_const_cpuset_t cpuset,
     char **output = NULL, *result;
     hwloc_obj_t pkg;
     bool bits_as_cores = false;
-    bool complete;
+    int complete;
+    char *prefix;
 
     /* if the cpuset is all zero, then something is wrong */
     if (hwloc_bitmap_iszero(cpuset)) {
@@ -1607,6 +1585,19 @@ char *prte_hwloc_base_cset2str(hwloc_const_cpuset_t cpuset,
     if (!use_hwthread_cpus && !bits_as_cores) {
         coreset = hwloc_bitmap_alloc();
     }
+    if (bits_as_cores || !use_hwthread_cpus) {
+        if (physical) {
+            prefix = "core:P";
+        } else {
+            prefix = "core:L";
+        }
+    } else {
+        if (physical) {
+            prefix = "hwt:P";
+        } else {
+            prefix = "hwt:L";
+        }
+    }
 
     for (n = 0; n < npkgs; n++) {
         memset(tmp, 0, sizeof(tmp));
@@ -1617,17 +1608,28 @@ char *prte_hwloc_base_cset2str(hwloc_const_cpuset_t cpuset,
         if (hwloc_bitmap_iszero(avail)) {
             continue;
         }
-        // build the map for this cpuset
-        complete = build_map(tmp, 2048, avail, use_hwthread_cpus,
-                             physical, bits_as_cores, topo);
-        if (complete) {
-            if (physical) {
-                snprintf(ans, 4096, "package[%d][%s]", n, tmp);
-            } else {
-                snprintf(ans, 4096, "package[%d][%s]", n, tmp);
-            }
+        if (bits_as_cores) {
+            /* can just use the hwloc fn directly */
+            hwloc_bitmap_list_snprintf(tmp, 2048, avail);
+            snprintf(ans, 4096, "package[%d][%s%s]", n, prefix, tmp);
+        } else if (use_hwthread_cpus) {
+            /* can just use the hwloc fn directly */
+            hwloc_bitmap_list_snprintf(tmp, 2048, avail);
+            snprintf(ans, 4096, "package[%d][%s%s]", n, prefix, tmp);
         } else {
-            snprintf(ans, 4096, "package[%d][N/A]", n);
+            // build the map for this cpuset
+            complete = build_map(tmp, 2048, avail,
+                                 physical, prefix, topo);
+            if (PRTE_SUCCESS == complete) {
+                if (physical) {
+                    snprintf(ans, 4096, "package[%d][%s]", n, tmp);
+                } else {
+                    snprintf(ans, 4096, "package[%d][%s]", n, tmp);
+                }
+            } else {
+                PMIX_ARGV_FREE_COMPAT(output);
+                return NULL;
+            }
         }
         PMIX_ARGV_APPEND_NOSIZE_COMPAT(&output, ans);
     }
