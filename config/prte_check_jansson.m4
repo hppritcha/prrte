@@ -66,9 +66,6 @@ AC_DEFUN([PRTE_CHECK_JANSSON],[
     	CPPFLAGS="$prte_check_jansson_save_CPPFLAGS"
     fi
 
-    AS_IF([test "$prte_check_jansson_happy" = "no" -a "$with_jansson" != "no"],
-          [AC_MSG_ERROR([Jansson support requested but not found.  Aborting])])
-
     AC_MSG_CHECKING([Jansson support available])
     AC_MSG_RESULT([$prte_check_jansson_happy])
 
