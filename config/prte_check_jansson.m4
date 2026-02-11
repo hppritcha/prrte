@@ -70,8 +70,10 @@ AC_DEFUN([PRTE_CHECK_JANSSON],[
     AC_MSG_RESULT([$prte_check_jansson_happy])
 
     AS_IF([test "$prte_check_jansson_happy" = "yes"],
-          [$2],
-          [$3])
+         [$2],
+         [AS_IF([test ! -z "$with_jansson" && test "$with_jansson" != "no"],
+               [AC_MSG_ERROR([Jansson support requested but not found.  Aborting])])
+         $3])
 
 
     AM_CONDITIONAL([HAVE_JANSSON], [test "$prte_check_jansson_happy" = "yes"])

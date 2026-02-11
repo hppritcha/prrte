@@ -40,6 +40,15 @@ AC_DEFUN([PRTE_CHECK_FLUX],[
             prte_check_flux_happy="yes"
         fi
 
+dnl
+dnl     first check if jansson available as this is needed by flux RAS
+dnl
+dnl
+        AS_IF([test "$prte_check_flux_happy" = "yes"],
+              [PRTE_CHECK_JANSSON([ras_flux_jansson], [ras_jansson_happy="yes"], [ras_jansson_happy="no"])])
+        AS_IF([test "$ras_jansson_happy" != "yes"],
+              [prte_check_flux_happy="no"])
+
         AS_IF([test "$prte_check_flux_happy" = "yes"],
           [OAC_CHECK_PACKAGE([flux],
                              [$1],
@@ -50,7 +59,6 @@ AC_DEFUN([PRTE_CHECK_FLUX],[
                              [prte_check_flux_happy="no"])
               ])
 
-
 dnl
 dnl        placeholder in case we need to add some kind of flux PLM
 dnl
@@ -59,11 +67,14 @@ dnl              [AC_CHECK_FUNC([execve],
 dnl                             [prte_check_flux_happy="yes"],
 dnl                             [prte_check_flux_happy="no"])])
 
+
         PRTE_SUMMARY_ADD([Resource Managers], [flux], [], [$prte_check_flux_happy])
     fi
 
     AS_IF([test "$prte_check_flux_happy" = "yes"],
-          [$2],
-          [$3])
+         [$2],
+         [AS_IF([test ! -z "$with_flux" && test "$with_flux" != "no"],
+               [AC_MSG_ERROR([flux support requested but not found.  Aborting])])
+         $3])
 ])
 
