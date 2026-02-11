@@ -32,7 +32,7 @@ sources = \
         ras_flux_module.c \
         ras_flux_utils.c
 
-#EXTRA_DIST = help-ras-flux.txt
+EXTRA_DIST = help-ras-flux.txt
 
 # Make the output library in this directory, and name it either
 # mca_<type>_<name>.la (for DSO builds) or libmca_<type>_<name>.la
