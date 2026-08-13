@@ -17,7 +17,7 @@
  *                         and Technology (RIST). All rights reserved.
  *
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
- * Copyright (c) 2021-2024 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * Copyright (c) 2026      Sandia National Laboratories  All rights reserved.
  * $COPYRIGHT$
  *
@@ -79,6 +79,144 @@ PRTE_EXPORT int prte_rml_send_buffer_nb(pmix_rank_t rank,
                             __FILE__, __func__, __LINE__);      \
         (_r) = prte_rml_send_buffer_nb(r, b, t);                \
     } while(0)
+
+/**
+ * As prte_rml_send_buffer_nb, but tell the caller how the send ended.
+ *
+ * The return value of a plain send says only that the message was *queued*.
+ * The next hop is resolved on a later event, so an unreachable addressee, a
+ * peer that goes away mid-flight, or a connection that never completes are all
+ * discovered after the call has returned - and reported nowhere the caller can
+ * see.  A caller that is tracking whether the message arrived (a collective
+ * waiting on the subtree beneath this hop) needs to be told.
+ *
+ * cbfunc runs on the progress thread and OWNS the buffer, exactly as the
+ * default prte_rml_send_callback does - releasing it is the callback's job, and
+ * chaining to prte_rml_send_callback is the way to keep the RML's own failure
+ * reporting while adding to it.
+ *
+ * A message to *self* short-circuits into the local receive path and never
+ * reaches the OOB, so cbfunc does not fire for one (the receive owns the
+ * buffer).  There is nothing to report there - a self-send cannot fail - but a
+ * caller counting callbacks must not count on one.
+ */
+PRTE_EXPORT int prte_rml_send_buffer_cb_nb(pmix_rank_t rank,
+                                           pmix_data_buffer_t *buffer,
+                                           prte_rml_tag_t tag,
+                                           prte_rml_buffer_callback_fn_t cbfunc,
+                                           void *cbdata);
+
+#define PRTE_RML_SEND_CB(_r, r, b, t, cf, cd)                   \
+    do {                                                        \
+        pmix_output_verbose(2, prte_rml_base.rml_output,        \
+                            "RML-SEND-CB(%s:%d): %s:%s:%d",     \
+                            PMIX_RANK_PRINT(r), t,              \
+                            __FILE__, __func__, __LINE__);      \
+        (_r) = prte_rml_send_buffer_cb_nb(r, b, t, cf, cd);     \
+    } while(0)
+
+/**
+ * As prte_rml_send_buffer_cb_nb, but transmit a *shared* payload that the send
+ * does not own.
+ *
+ * This is what a broadcast wants.  The ordinary send owns its buffer, so
+ * sending identical bytes to every routing-tree child means building one
+ * buffer per child - a full copy of the payload each, all of them made on the
+ * progress thread before the first byte reaches the wire.  At the default
+ * radix that is 64 copies of a launch message, 64 allocations of it, and 64x
+ * its size resident on the sender at once.  A payload is packed once and
+ * handed to every child.
+ *
+ * Ownership: the caller holds the reference PMIX_NEW gave it and must release
+ * that reference once it has finished handing the payload out.  Each call that
+ * returns PRTE_SUCCESS takes a reference of its own, dropped when that send
+ * completes; a call that returns an error takes none.  So the buffer lives
+ * until the last destination is done with it, whether that is a send or the
+ * caller.
+ *
+ * The payload must not be modified once it has been handed to a send - several
+ * sends read it concurrently.
+ *
+ * A message to *self* cannot share: the local receive path takes ownership of
+ * the buffer it delivers.  Rather than making that a rule callers have to know,
+ * a self-send here copies the payload and proceeds normally.
+ *
+ * cbfunc is called with a NULL buffer (see PRTE_RML_SEND_COMPLETE) because
+ * there is nothing for it to dispose of.
+ */
+PRTE_EXPORT int prte_rml_send_payload_cb_nb(pmix_rank_t rank,
+                                            prte_rml_payload_t *payload,
+                                            prte_rml_tag_t tag,
+                                            prte_rml_buffer_callback_fn_t cbfunc,
+                                            void *cbdata);
+
+#define PRTE_RML_SEND_PAYLOAD_CB(_r, r, p, t, cf, cd)               \
+    do {                                                            \
+        pmix_output_verbose(2, prte_rml_base.rml_output,            \
+                            "RML-SEND-PAYLOAD-CB(%s:%d): %s:%s:%d", \
+                            PMIX_RANK_PRINT(r), t,                  \
+                            __FILE__, __func__, __LINE__);          \
+        (_r) = prte_rml_send_payload_cb_nb(r, p, t, cf, cd);        \
+    } while (0)
+
+/**
+ * As prte_rml_send_buffer_nb, but bypass the routing tree and deliver straight
+ * to the named peer.
+ *
+ * The routed send picks the next hop toward its target, which at the default
+ * radix funnels any non-child through the root.  That is right for control
+ * traffic and wrong for a bandwidth-efficient collective, whose exchange
+ * partners are deliberately not its tree neighbours: routing those exchanges
+ * would push every byte through the one node the algorithm exists to keep out
+ * of the path.
+ *
+ * Falls back to a routed send if the peer's contact information cannot be
+ * obtained, so a caller never has to handle "no direct route" itself.
+ *
+ * A peer reached this way should be registered with
+ * prte_rml_lateral_register() so that losing the link is not mistaken for a
+ * routing-tree fault.
+ */
+PRTE_EXPORT int prte_rml_send_buffer_direct_nb(pmix_rank_t rank,
+                                               pmix_data_buffer_t *buffer,
+                                               prte_rml_tag_t tag);
+
+#define PRTE_RML_SEND_DIRECT(_r, r, b, t)                       \
+    do {                                                        \
+        pmix_output_verbose(2, prte_rml_base.rml_output,        \
+                            "RML-SEND-DIRECT(%s:%d): %s:%s:%d", \
+                            PMIX_RANK_PRINT(r), t,              \
+                            __FILE__, __func__, __LINE__);      \
+        (_r) = prte_rml_send_buffer_direct_nb(r, b, t);         \
+    } while(0)
+
+/**
+ * Lateral links: peers we talk to directly that are not our routing-tree
+ * neighbours.
+ *
+ * Registering one is not what creates the link - prte_rml_send_buffer_direct_nb
+ * does that.  Registration is what tells the fault machinery how to read the
+ * link's death.  A routing-tree connection dropping means the tree has changed
+ * shape and must be repaired; a lateral link dropping means nothing of the
+ * sort, and repairing the tree on the strength of it would abort every
+ * in-flight collective across the DVM.
+ *
+ * A rank can be both: a collective's exchange partner may happen to be our
+ * parent or one of our children.  Losing *that* link is a genuine tree fault,
+ * so the registry is only consulted for peers that are purely lateral.
+ */
+PRTE_EXPORT void prte_rml_lateral_register(pmix_rank_t rank);
+PRTE_EXPORT void prte_rml_lateral_deregister(pmix_rank_t rank);
+
+/* Is this rank one we hold a lateral link to and NOT a routing-tree
+ * neighbour?  False for anything in the tree, so a caller can use it as the
+ * single test for "this loss is not the tree's business". */
+PRTE_EXPORT bool prte_rml_is_lateral_only(pmix_rank_t rank);
+
+/* Notified when a purely-lateral link is lost, so the collective that opened
+ * it can end or re-plan.  The RML does nothing else about such a loss. */
+typedef void (*prte_rml_lateral_lost_fn_t)(pmix_rank_t rank);
+PRTE_EXPORT void prte_rml_lateral_set_lost_callback(prte_rml_lateral_lost_fn_t cbfunc);
 
 /**
  * As prte_rml_send_buffer_nb, but attempts to deliver message even after daemon
@@ -210,6 +348,20 @@ typedef struct {
     pmix_data_array_t children;
     // Count of children != PMIX_RANK_INVALID
     int n_children;
+
+    // Ranks we hold a link to that is NOT part of the routing tree, opened by
+    // prte_rml_send_buffer_direct_nb on behalf of a collective whose exchange
+    // partners are chosen for bandwidth rather than for tree adjacency. This
+    // set exists so a dropped connection can be read correctly: a tree
+    // connection dropping means the tree changed shape and must be repaired,
+    // a lateral one dropping means nothing about the tree at all. Repairing on
+    // the strength of a lateral loss would end every in-flight collective in
+    // the DVM. Deliberately NOT re-initialized by compute_routing_tree - a
+    // grow does not dissolve a collective's exchange partners.
+    pmix_bitmap_t lateral_links;
+    // Told when a purely-lateral link is lost, so the collective that opened it
+    // can end or re-plan. NULL until a collective registers interest.
+    prte_rml_lateral_lost_fn_t lateral_lost_cb;
 } prte_rml_base_t;
 
 PRTE_EXPORT extern prte_rml_base_t prte_rml_base;
@@ -234,6 +386,13 @@ PRTE_EXPORT uint64_t prte_rml_get_epoch(pmix_rank_t rank);
 PRTE_EXPORT void prte_rml_register(void);
 PRTE_EXPORT void prte_rml_close(void);
 PRTE_EXPORT int prte_rml_open(void);
+/* Render dead_dmns as a compact, range-collapsed list ("2,7:9") for the prted
+ * command line, or NULL when nothing has departed. The caller frees it. The
+ * partner routine loads such a list back into dead_dmns; it is what a daemon
+ * launched into a DVM that has already lost ranks uses to build its FIRST
+ * routing tree, since nothing it could receive would arrive in time. */
+PRTE_EXPORT char *prte_rml_render_dead_dmns(void);
+PRTE_EXPORT void prte_rml_load_dead_dmns(const char *spec);
 /* common implementations */
 PRTE_EXPORT void prte_rml_base_post_recv(int sd, short args, void *cbdata);
 PRTE_EXPORT void prte_rml_base_process_msg(int fd, short flags, void *cbdata);
@@ -307,11 +466,18 @@ PRTE_EXPORT bool prte_rml_is_node_up(pmix_rank_t node);
  * buffer the callback has already released. Nobody else holds a reference
  * to the send object at this point, so the caller must not touch it after
  * completing it.
+ *
+ * A send carrying a *shared payload* is the exception: its buffer belongs to
+ * the payload and other destinations may still be transmitting it, so the
+ * callback is handed no buffer at all and the send's reference is dropped by
+ * the destructor below. A callback that wants to inspect the payload must
+ * therefore tolerate a NULL buffer - which the default one does, and which is
+ * the honest statement of the situation: this callback has nothing to free.
  */
 #define PRTE_RML_SEND_COMPLETE(m)                                                             \
     do {                                                                                      \
         prte_rml_send_t *_snd = (m);                                                          \
-        pmix_data_buffer_t *_dbuf = _snd->dbuf;                                               \
+        pmix_data_buffer_t *_dbuf = (NULL == _snd->payload) ? _snd->dbuf : NULL;              \
         pmix_output_verbose(5, prte_rml_base.rml_output,                                      \
                             "%s-%s Send message complete at %s:%d",                           \
                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(&(_snd->dst)),\

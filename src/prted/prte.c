@@ -659,9 +659,6 @@ PRTE_EXPORT int prte(int argc, char *argv[])
     }
 
     /* check for debug options */
-    if (pmix_cmd_line_is_taken(&results, PRTE_CLI_DEBUG)) {
-        prte_debug_flag = true;
-    }
     if (pmix_cmd_line_is_taken(&results, PRTE_CLI_DEBUG_DAEMONS)) {
         prte_debug_daemons_flag = true;
     }
@@ -1118,6 +1115,11 @@ PRTE_EXPORT int prte(int argc, char *argv[])
      */
     PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_DAEMON,
                   PRTE_RML_PERSISTENT, prte_daemon_recv, NULL);
+    /* The launch message rides its own tag so grpcomm can tell it apart from
+     * the commands, but it is the same command stream and the same handler -
+     * prte_daemon_recv ignores the tag it was delivered on. */
+    PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_DAEMON_LAUNCH,
+                  PRTE_RML_PERSISTENT, prte_daemon_recv, NULL);
 
     /* setup to capture job-level info */
     PMIX_INFO_LIST_START(jinfo);
@@ -1451,7 +1453,7 @@ DONE:
         unlink(mypidfile);
     }
 
-    if (prte_debug_flag) {
+    if (prte_debug_daemons_flag) {
         fprintf(stderr, "exiting with status %d\n", prte_exit_status);
     }
     exit(prte_exit_status);

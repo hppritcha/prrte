@@ -66,7 +66,11 @@
 #include "src/util/pmix_argv.h"
 #include "src/util/pmix_if.h"
 
+#include "src/pmix/pmix-internal.h"
+#include "src/rml/rml.h"
+#include "src/rml/oob/oob.h"
 #include "src/rml/oob/oob_tcp.h"
+#include "src/rml/oob/oob_tcp_peer.h"
 
 #define CHECK(label, cond)                                    \
     do {                                                      \
@@ -336,6 +340,174 @@ static int test_subnet_resolves_and_dedupes(void)
     return failures;
 }
 
+/*
+ * A shared payload outlives the sends that transmit it.
+ *
+ * This is the one ownership rule in the RML that differs from every other:
+ * an ordinary prte_rml_send_t owns its dbuf and frees it in its destructor,
+ * while a send carrying a payload owns only a *reference* and must leave the
+ * buffer alone.  Getting that backwards is a use-after-free in the middle of
+ * a broadcast -- the second child would transmit a buffer the first child's
+ * completion had already freed -- and it would show up as corruption on the
+ * wire under load rather than as anything a smoke test notices.  So pin it
+ * here, where it needs no DVM: build the send by hand, release it, and
+ * confirm the payload and its bytes are still there.
+ */
+static int test_payload_outlives_sends(void)
+{
+    int failures = 0;
+    prte_rml_payload_t *payload;
+    prte_rml_send_t *snd;
+    pmix_data_buffer_t *dbuf;
+    pmix_byte_object_t bo;
+    static const char pattern[] = "shared-payload-canary";
+    pmix_status_t prc;
+    int rc;
+
+    /* PMIx refuses to move bytes into a buffer until it is up, and a daemon
+     * reaches that state through PMIx_server_init - so do the same, and only
+     * around this test, since nothing else in this binary needs it */
+    prc = PMIx_server_init(NULL, NULL, 0);
+    if (PMIX_SUCCESS != prc) {
+        fprintf(stderr, "FAIL [payload test]: PMIx_server_init: %s\n",
+                PMIx_Error_string(prc));
+        return 1;
+    }
+
+    payload = PMIX_NEW(prte_rml_payload_t);
+    CHECK("payload constructs with no buffer", NULL == payload->dbuf);
+    CHECK("payload starts at one reference", 1 == payload->super.obj_reference_count);
+
+    PMIX_DATA_BUFFER_CREATE(dbuf);
+    bo.size = sizeof(pattern);
+    bo.bytes = malloc(bo.size);
+    memcpy(bo.bytes, pattern, bo.size);
+    rc = PMIx_Data_load(dbuf, &bo);
+    CHECK("payload loads", PMIX_SUCCESS == rc);
+    payload->dbuf = dbuf;
+
+    /* what a send does when it accepts the payload */
+    snd = PMIX_NEW(prte_rml_send_t);
+    CHECK("a send starts with no payload", NULL == snd->payload);
+    PMIX_RETAIN(payload);
+    snd->payload = payload;
+    snd->dbuf = payload->dbuf;
+    CHECK("send took a reference", 2 == payload->super.obj_reference_count);
+
+    /* ...and what it must do when it completes */
+    PMIX_RELEASE(snd);
+    CHECK("send dropped its reference", 1 == payload->super.obj_reference_count);
+    CHECK("payload still holds its buffer", dbuf == payload->dbuf);
+    CHECK("payload bytes survived the send", sizeof(pattern) == payload->dbuf->bytes_used);
+    CHECK("payload contents survived the send",
+          NULL != payload->dbuf->base_ptr
+              && 0 == memcmp(pattern, payload->dbuf->base_ptr, sizeof(pattern)));
+
+    /* the last reference is the one that frees the buffer */
+    PMIX_RELEASE(payload);
+
+    /* a payload with nothing in it is refused rather than sent */
+    rc = prte_rml_send_payload_cb_nb(1, NULL, PRTE_RML_TAG_XCAST, NULL, NULL);
+    CHECK("NULL payload refused", PRTE_ERR_BAD_PARAM == rc);
+    payload = PMIX_NEW(prte_rml_payload_t);
+    rc = prte_rml_send_payload_cb_nb(1, payload, PRTE_RML_TAG_XCAST, NULL, NULL);
+    CHECK("empty payload refused", PRTE_ERR_BAD_PARAM == rc);
+    CHECK("a refused send takes no reference", 1 == payload->super.obj_reference_count);
+    PMIX_RELEASE(payload);
+
+    PMIx_server_finalize();
+
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_payload_outlives_sends\n");
+    }
+    return failures;
+}
+
+/*
+ * The pool of event bases that peer sockets are serviced on.
+ *
+ * Two properties matter and neither needs a socket to check.  First, the
+ * "no worker threads" case - which is the default, and therefore the shape
+ * every existing deployment runs - must still leave ev_bases holding exactly
+ * one entry, prte_event_base, because every call site indexes the array
+ * unconditionally; a NULL array or a zero-length one is a segfault on the
+ * first peer.  Second, peers must be handed out round-robin and the cursor
+ * must wrap, since a cursor that ran off the end would index past the array.
+ *
+ * The multi-thread case is driven with a hand-built array rather than by
+ * asking for real threads: prte_progress_thread_init spins an actual engine
+ * thread per base, which a bare test process has no business starting.  What
+ * is under test here is the assignment arithmetic, not libevent.
+ */
+static int test_progress_thread_pool(void)
+{
+    int failures = 0, i;
+    prte_event_base_t *fake[3];
+    prte_oob_tcp_peer_t *peers[7];
+
+    /* the default: no dedicated threads */
+    prte_oob_base.num_progress_threads = 0;
+    prte_oob_base.ev_bases = NULL;
+    prte_oob_base.ev_threads = NULL;
+    prte_oob_base.next_base = 0;
+    CHECK("pool starts", PRTE_SUCCESS == prte_oob_start_progress_threads());
+    CHECK("array exists with no threads", NULL != prte_oob_base.ev_bases);
+    CHECK("no threads means the main base",
+          NULL != prte_oob_base.ev_bases && prte_event_base == prte_oob_base.ev_bases[0]);
+    CHECK("no threads recorded", 0 == prte_oob_base.num_progress_threads);
+    CHECK("no thread names recorded", NULL == prte_oob_base.ev_threads);
+
+    /* every peer lands on that one entry, and the cursor does not move */
+    for (i = 0; i < 3; i++) {
+        peers[i] = PMIX_NEW(prte_oob_tcp_peer_t);
+        CHECK("peer takes the main base", prte_event_base == peers[i]->evbase);
+    }
+    CHECK("cursor pinned with no threads", 0 == prte_oob_base.next_base);
+    for (i = 0; i < 3; i++) {
+        PMIX_RELEASE(peers[i]);
+    }
+
+    prte_oob_harvest_progress_threads();
+    CHECK("harvest clears the array", NULL == prte_oob_base.ev_bases);
+    CHECK("harvest clears the count", 0 == prte_oob_base.num_progress_threads);
+
+    /* a negative request is a request for none, not an array sized -1 */
+    prte_oob_base.num_progress_threads = -4;
+    CHECK("negative pool starts", PRTE_SUCCESS == prte_oob_start_progress_threads());
+    CHECK("negative clamps to none", 0 == prte_oob_base.num_progress_threads);
+    CHECK("negative still yields the main base",
+          NULL != prte_oob_base.ev_bases && prte_event_base == prte_oob_base.ev_bases[0]);
+    prte_oob_harvest_progress_threads();
+
+    /* three bases, seven peers: 0,1,2,0,1,2,0 */
+    for (i = 0; i < 3; i++) {
+        /* distinct non-NULL values are all the assignment arithmetic sees */
+        fake[i] = (prte_event_base_t *) &fake[i];
+    }
+    prte_oob_base.num_progress_threads = 3;
+    prte_oob_base.ev_bases = fake;
+    prte_oob_base.next_base = 0;
+    for (i = 0; i < 7; i++) {
+        peers[i] = PMIX_NEW(prte_oob_tcp_peer_t);
+    }
+    for (i = 0; i < 7; i++) {
+        CHECK("peer assigned round-robin", fake[i % 3] == peers[i]->evbase);
+    }
+    CHECK("cursor wrapped", 1 == prte_oob_base.next_base);
+    for (i = 0; i < 7; i++) {
+        PMIX_RELEASE(peers[i]);
+    }
+    /* the array is on our stack - do not let harvest free it */
+    prte_oob_base.ev_bases = NULL;
+    prte_oob_base.num_progress_threads = 0;
+    prte_oob_base.next_base = 0;
+
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_progress_thread_pool\n");
+    }
+    return failures;
+}
+
 int main(void)
 {
     int rc, failures = 0;
@@ -354,6 +526,8 @@ int main(void)
                     " the warnings it prints are expected --\n");
     failures += test_bad_subnets_dropped();
     failures += test_subnet_resolves_and_dedupes();
+    failures += test_payload_outlives_sends();
+    failures += test_progress_thread_pool();
 
     prte_finalize();
 

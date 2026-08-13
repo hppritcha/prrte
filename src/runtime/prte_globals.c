@@ -107,16 +107,19 @@ static void grow_campaign_construct(prte_grow_campaign_t *p)
 {
     p->targets = NULL;
     p->ntargets = 0;
-    PMIX_PROC_LOAD(&p->requester, NULL, PMIX_RANK_INVALID);
-    p->alloc_id = NULL;
-    p->req_id = NULL;
-    p->have_requester = false;
+    p->requesters = NULL;
+    p->nrequesters = 0;
 }
 static void grow_campaign_destruct(prte_grow_campaign_t *p)
 {
+    int r;
+
     free(p->targets);
-    free(p->alloc_id);
-    free(p->req_id);
+    for (r = 0; r < p->nrequesters; r++) {
+        free(p->requesters[r].alloc_id);
+        free(p->requesters[r].req_id);
+    }
+    free(p->requesters);
 }
 PMIX_CLASS_INSTANCE(prte_grow_campaign_t, pmix_list_item_t,
                     grow_campaign_construct, grow_campaign_destruct);
@@ -243,7 +246,7 @@ int prte_dt_init(void)
     prte_debug_output = pmix_output_open(NULL);
 
     /* open up the verbose output for PRTE debugging */
-    if (prte_debug_flag || 0 < prte_debug_verbosity
+    if (0 < prte_debug_verbosity
         || (prte_debug_daemons_flag && (PRTE_PROC_IS_DAEMON || PRTE_PROC_IS_MASTER))) {
         if (0 < prte_debug_verbosity) {
             pmix_output_set_verbosity(prte_debug_output, prte_debug_verbosity);

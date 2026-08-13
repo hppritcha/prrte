@@ -57,7 +57,9 @@
 
 #include "prte_config.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "constants.h"
 #include "types.h"
@@ -67,6 +69,8 @@
 #include "src/mca/ras/base/base.h"
 #include "src/mca/rmaps/rmaps_types.h"
 #include "src/pmix/pmix-internal.h"
+#include "src/rml/oob/oob.h"
+#include "src/rml/rml.h"
 #include "src/runtime/prte_globals.h"
 #include "src/runtime/prte_progress_threads.h"
 #include "src/runtime/runtime.h"
@@ -683,6 +687,8 @@ static int test_pack_roundtrip(void)
 {
     int failures = 0;
     pmix_data_buffer_t buf;
+    prte_node_t *wnode;
+    prte_proc_t *wdmn;
     prte_job_t *src, *dst = NULL;
     prte_app_context_t *app, *app2;
     prte_proc_t *proc;
@@ -720,6 +726,18 @@ static int test_pack_roundtrip(void)
     pmix_pointer_array_set_item(src->apps, 0, app);
     src->num_apps = 1;
 
+    /* The placement no longer travels as a per-proc array: it travels as a
+     * node map plus a proc map per app, and the receiver rebuilds each
+     * proc's rank, hosting daemon, app, app rank and local rank from those.
+     * So this needs a real map - nodes that are in the global pool (that is
+     * what the far end resolves names against) and that carry a daemon (that
+     * is where "parent" comes from) - rather than a bare num_nodes. */
+    wnode = make_node("wire.node1");
+    wnode->index = pmix_pointer_array_add(prte_node_pool, wnode);
+    wdmn = PMIX_NEW(prte_proc_t);
+    PMIX_LOAD_PROCID(&wdmn->name, "wire.dvm", 1);
+    wnode->daemon = wdmn;   /* the node holds a counted reference */
+
     proc = PMIX_NEW(prte_proc_t);
     PMIX_LOAD_PROCID(&proc->name, "wire.job", 0);
     proc->parent = 1;
@@ -730,6 +748,8 @@ static int test_pack_roundtrip(void)
     proc->state = PRTE_PROC_STATE_RUNNING;
     proc->cpuset = strdup("0-3");
     pmix_pointer_array_set_item(src->procs, 0, proc);
+    PMIX_RETAIN(proc);
+    pmix_pointer_array_add(wnode->procs, proc);
 
     proc = PMIX_NEW(prte_proc_t);
     PMIX_LOAD_PROCID(&proc->name, "wire.job", 1);
@@ -740,12 +760,16 @@ static int test_pack_roundtrip(void)
     proc->app_idx = 0;
     proc->state = PRTE_PROC_STATE_RUNNING;
     pmix_pointer_array_set_item(src->procs, 1, proc);
+    PMIX_RETAIN(proc);
+    pmix_pointer_array_add(wnode->procs, proc);
 
     src->map = PMIX_NEW(prte_job_map_t);
     src->map->mapping = 9;
     src->map->ranking = 4;
     src->map->binding = 6;
-    src->map->num_nodes = 3;
+    PMIX_RETAIN(wnode);
+    pmix_pointer_array_add(src->map->nodes, wnode);
+    src->map->num_nodes = 1;
 
     PMIX_DATA_BUFFER_CONSTRUCT(&buf);
     rc = prte_job_pack(&buf, src);
@@ -809,12 +833,23 @@ static int test_pack_roundtrip(void)
         proc = (prte_proc_t *) pmix_pointer_array_get_item(dst->procs, 1);
         CHECK("wire: proc 1 crossed and has no cpuset",
               NULL != proc && NULL == proc->cpuset && 1 == proc->local_rank);
+        /* Nothing of proc 1's identity or placement was on the wire - all of
+         * it is rebuilt from the node map and the app's proc map. */
+        CHECK("wire: proc 1 takes the job's nspace",
+              NULL != proc && PMIX_CHECK_NSPACE(proc->name.nspace, "wire.job")
+                  && 1 == proc->name.rank);
+        CHECK("wire: proc 1's daemon is derived from the node map",
+              NULL != proc && 1 == proc->parent);
+        CHECK("wire: proc 1's app and app rank are derived",
+              NULL != proc && 0 == proc->app_idx && 1 == proc->app_rank);
+        CHECK("wire: proc 1's node rank still travels",
+              NULL != proc && 1 == proc->node_rank);
 
         CHECK("wire: the map crossed", NULL != dst->map);
         if (NULL != dst->map) {
             CHECK("wire: map policies round-trip",
                   9 == dst->map->mapping && 4 == dst->map->ranking && 6 == dst->map->binding);
-            CHECK("wire: map num_nodes round-trips", 3 == dst->map->num_nodes);
+            CHECK("wire: map num_nodes round-trips", 1 == dst->map->num_nodes);
         }
         PMIX_RELEASE(dst);
     }
@@ -928,8 +963,8 @@ static int test_object_lifetimes(void)
               NULL == sc->targets && NULL == sc->alloc_id && NULL == sc->req_id
                   && 0 == sc->ntargets && !sc->have_requester);
         CHECK("lifetime: grow campaign starts empty",
-              NULL == gc->targets && NULL == gc->alloc_id && NULL == gc->req_id
-                  && 0 == gc->ntargets && !gc->have_requester);
+              NULL == gc->targets && NULL == gc->requesters
+                  && 0 == gc->ntargets && 0 == gc->nrequesters);
         /* destructing an untouched campaign must not free garbage */
         PMIX_RELEASE(sc);
         PMIX_RELEASE(gc);
@@ -1226,6 +1261,70 @@ static int test_progress_thread_cpus(void)
     return failures;
 }
 
+/* ------------------------------------------------------------------ */
+/* MCA parameter files                                                */
+/* ------------------------------------------------------------------ */
+
+/* The parameter files are applied by publishing their contents into the
+ * environment, and an MCA variable reads its environment exactly once, when
+ * it is first registered.  So the registration of everything that is not
+ * itself needed to *find* the files has to happen after they are read.  It
+ * did not: prte_init_minimum() registered every prte_* parameter - plus all
+ * of RML, OOB and grpcomm - before preloading the files, so a value set in
+ * mca-params.conf was read, published, and then ignored by the variable it
+ * named.  The same line in the same file was honored or not depending only
+ * on whether the variable behind it happened to be registered here or later,
+ * at framework open.
+ *
+ * setup_paramfile() below runs before prte_init_util(), so the whole
+ * ordering is what is under test.
+ */
+static const char *paramfile = "test_runtime_mca_params.conf";
+static bool paramfile_written = false;
+
+static void setup_paramfile(void)
+{
+    FILE *fp;
+
+    fp = fopen(paramfile, "w");
+    if (NULL == fp) {
+        /* nothing to test against, and not worth failing the suite over -
+         * test_paramfile_ordering reports the skip */
+        return;
+    }
+    /* one core prte_* parameter, and one from each of the two subsystems
+     * prte_register_params() registers on its way out */
+    fprintf(fp, "# written by test_runtime\n");
+    fprintf(fp, "prte_max_msg_size = 55\n");
+    fprintf(fp, "rml_base_radix = 3\n");
+    fprintf(fp, "prte_uniform_nodes = 1\n");
+    fclose(fp);
+    paramfile_written = true;
+
+    /* replace the default list (the developer's own ~/.prte/mca-params.conf
+     * must not be able to influence this) */
+    setenv("PRTE_MCA_prte_param_files", paramfile, 1);
+}
+
+static int test_paramfile_ordering(void)
+{
+    int failures = 0;
+
+    if (!paramfile_written) {
+        fprintf(stderr, "SKIP [paramfile]: could not write %s\n", paramfile);
+        return 0;
+    }
+
+    /* registered in prte_register_params() itself */
+    CHECK("paramfile: a core prte_* param takes the file's value",
+          55 == prte_oob_base.max_msg_size);
+    CHECK("paramfile: a bool param takes the file's value", prte_homo_nodes);
+    /* registered by prte_rml_register(), on the way out of the same call */
+    CHECK("paramfile: an rml param takes the file's value", 3 == prte_rml_base.radix);
+
+    return failures;
+}
+
 static int test_progress_thread_lifecycle(void)
 {
     int failures = 0;
@@ -1274,6 +1373,10 @@ int main(void)
 {
     int rc, failures = 0;
     pmix_status_t prc;
+
+    /* must precede prte_init_util: it is the parameter-file handling inside
+     * prte_init_minimum() that is under test */
+    setup_paramfile();
 
     rc = prte_init_util(PRTE_PROC_MASTER);
     if (PRTE_SUCCESS != rc) {
@@ -1324,6 +1427,11 @@ int main(void)
     failures += test_data_server_range();
     failures += test_progress_thread_cpus();
     failures += test_progress_thread_lifecycle();
+    failures += test_paramfile_ordering();
+
+    if (paramfile_written) {
+        unlink(paramfile);
+    }
 
     (void) pmix_mca_base_framework_close(&prte_ras_base_framework);
     prte_event_base_close();

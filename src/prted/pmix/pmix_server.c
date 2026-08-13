@@ -65,7 +65,7 @@
 #include "src/util/prte_show_help.h"
 
 #include "src/mca/errmgr/errmgr.h"
-#include "src/mca/grpcomm/grpcomm.h"
+#include "src/grpcomm/grpcomm.h"
 #include "src/mca/ras/base/base.h"
 #include "src/mca/state/state.h"
 #include "src/rml/rml_contact.h"
@@ -295,6 +295,7 @@ static prte_regattr_input_t prte_attributes[] = {
                          "PMIX_QUERY_NUM_GROUPS",
                          "PMIX_QUERY_GROUP_NAMES",
                          "PMIX_QUERY_GROUP_MEMBERSHIP",
+                         "PMIX_NUM_SLOTS",
                          NULL}},
     {.function = "PMIx_Query_info_nb",
      .attrs = (char *[]){"PMIX_QUERY_NAMESPACES",
@@ -316,6 +317,7 @@ static prte_regattr_input_t prte_attributes[] = {
                          "PMIX_QUERY_ALLOC_IDS",
                          "PMIX_QUERY_ALLOC_PROPERTIES",
                          "PMIX_QUERY_ALLOC_STATUS",
+                         "PMIX_NUM_SLOTS",
                          NULL}},
     {.function = "PMIx_Log", .attrs = (char *[]){"NONE", NULL}},
     {.function = "PMIx_Log_nb", .attrs = (char *[]){"NONE", NULL}},
@@ -447,6 +449,20 @@ void pmix_server_register_params(void)
                                       "Whether or not to allow client clones",
                                       PMIX_MCA_BASE_VAR_TYPE_BOOL,
                                       &prte_pmix_server_globals.allow_client_clones);
+
+    /* Publish per-proc data only for the procs we host, and derive the rest on
+     * demand.  Every daemon registering a PMIx entry for every proc in the job
+     * is a table that grows with the job while the work on the node does not;
+     * the placement it describes is derivable here from the job object, so the
+     * direct-modex upcall can answer for a proc we do not host without any
+     * wire traffic.  See derive_proc_data() in pmix_server_fence.c. */
+    prte_pmix_server_globals.lazy_procdata = true;
+    (void) pmix_mca_base_var_register("prte", "pmix", NULL, "lazy_procdata",
+                                      "Publish per-proc data to the local PMIx server only "
+                                      "for procs this daemon hosts, deriving data for other "
+                                      "procs on demand",
+                                      PMIX_MCA_BASE_VAR_TYPE_BOOL,
+                                      &prte_pmix_server_globals.lazy_procdata);
 
     /* whether or not to drop a session-level tool rendezvous point */
     prte_pmix_server_globals.session_server = false;

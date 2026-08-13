@@ -130,6 +130,15 @@ The `modify()` path has its own protocol (`prte_ras_base_modify`):
 `modify` requests can be keyed to a single component via `req->key`
 (matched case-insensitively against the component name).
 
+A module that grows the DVM answers `OPERATION_IN_PROGRESS` and lets the grow
+campaign's `PMIX_DVM_IS_READY` be the result, since the nodes are unusable until
+daemons are up on them. `setup_virtual_machine` resolves that event's recipients
+**from the new nodes** — `node->session`, else the session named by the node's
+`PRTE_NODE_ALLOC_ID` — so a module whose nodes join the general pool must record
+`session->requestor` on whatever session tracks the allocation, or neither the
+completion nor a launch failure reaches anyone. A campaign collects every
+distinct requester among its targets: one campaign can cover several grows.
+
 ---
 
 ## Component selection is not "pick one"
@@ -154,7 +163,8 @@ simulator 1000  =  testrm 1000  >  pbs 100  =  gridengine 100  =  flux 100
 available and is tried last, handling `--host`/`--hostfile`/default
 hostfile and (via the base) the ultimate fall-back to a 1-slot local
 node. The RM components make themselves available only when their
-environment is detected (e.g. `slurm` requires `SLURM_JOBID`), so on any
+environment is detected (e.g. `slurm` requires a Slurm job id in the
+environment — see [`common/slurm`](../common/slurm/AGENTS.md)), so on any
 given machine at most one RM answers, then `hosts` closes out the list.
 `simulator`/`testrm` sit at 1000 so that when explicitly configured they
 pre-empt everything.
@@ -493,22 +503,26 @@ prototype here compiles and then mismatches the real library.
 | Live RM | PBS/LSF/Flux discovery still needs a real scheduler; there is no substitute. |
 
 **`ras/slurm`'s `modify` surface is covered in `contrib/dockerswarm`, not
-in the unit test.** Extend, release and cancel shell out to
+in the unit test.
+** Extend, release and cancel shell out to
 `sbatch`/`scontrol` and only mean anything across several nodes, and each
-of them returns `PRTE_ERR_NOT_AVAILABLE` outright unless jansson was
-found — so a `make check` build, which by default has no jansson, cannot
-reach a line of it. The harness is multi-node, and its `build.sh` passes
-`--with-jansson` deliberately, so it is the only automated build anywhere
-that even compiles `ras_slurm_jansson.c`. It supplies the scheduler with
-[`fake-slurm.py`](../../../contrib/dockerswarm/fake-slurm.py) — the
-`SLURM_*` environment plus `sbatch`/`scontrol`/`scancel` stubs on `PATH`
-that hand out real container hostnames, so an extend genuinely launches
-daemons and a release genuinely removes them. `validate_hostname`,
-`prte_ras_slurm_drain_cmd_output` and the JSON parser live on that path
-only and come along with it, as do the paths that exist purely to survive
-a misbehaving scheduler (a failing `scancel`, unparsable JSON, a request
-cancelled while its job is still `PENDING`). See
-[dockerswarm AGENTS.md §11](../../../contrib/dockerswarm/AGENTS.md).
+of them returns `PRTE_ERR_NOT_AVAILABLE` outright unless the component's
+**extensions** were built — which needs jansson *and* SLURM 24.05 or later
+at configure time (`PRTE_HAVE_SLURM_EXTENSIONS`, see
+[`slurm/configure.m4`](slurm/configure.m4) and
+[`slurm/AGENTS.md`](slurm/AGENTS.md)). A `make check` build, which by
+default has no jansson, cannot reach a line of it. Both container
+harnesses pass `--with-jansson` deliberately and are the only automated
+builds anywhere that even compile `ras_slurm_jansson.c` — but only
+[`contrib/slurmswarm`](../../../contrib/slurmswarm/) *runs* it, against ten
+containers holding a real `slurmctld`. `validate_hostname`,
+`prte_ras_slurm_drain_cmd_output` and the JSON parser live on that path only
+and are exercised there, as are the paths that exist purely to survive a
+misbehaving scheduler (a failing `scancel`, unparsable JSON, a request
+cancelled while its job is still `PENDING`) — the last of which a live
+scheduler produces by itself when asked for more nodes than exist, while the
+first two are armed by the wrapper described in
+[slurmswarm AGENTS.md §14](../../../contrib/slurmswarm/AGENTS.md).
 
 The unit test builds the global job/node/session arrays by hand (the
 real ones come from `prte_init()`, which wants a live ESS) — follow that
