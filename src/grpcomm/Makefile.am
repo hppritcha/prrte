@@ -24,7 +24,7 @@ headers += \
     grpcomm/grpcomm.h \
     grpcomm/grpcomm_internal.h
 
-libprrte_la_SOURCES += \
+lib@PRTE_BINARY_PREFIX@prrte_la_SOURCES += \
     grpcomm/grpcomm.c \
     grpcomm/grpcomm_classes.c \
     grpcomm/grpcomm_xcast.c \
