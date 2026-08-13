@@ -31,10 +31,11 @@
 #include "src/util/proc_info.h"
 #include "src/util/session_dir.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 
 #include "src/mca/errmgr/errmgr.h"
 #include "src/mca/filem/filem.h"
-#include "src/mca/grpcomm/grpcomm.h"
+#include "src/grpcomm/grpcomm.h"
 #include "src/mca/iof/base/base.h"
 #include "src/mca/odls/odls_types.h"
 #include "src/mca/plm/base/base.h"
@@ -295,6 +296,24 @@ static void vm_ready(int fd, short args, void *cbdata)
                 PMIX_RELEASE(caddy);
                 return;
             }
+            /* Tell the daemons what jobs are already running in this DVM.
+             * A daemon that just joined has never heard of them, and needs
+             * to resolve their procs' namespaces the moment one of them
+             * talks to a proc of the job about to launch.  This used to ride
+             * in that job's launch message, which made every such launch
+             * message grow with the number of jobs resident in the DVM; it
+             * belongs here, where the DVM's membership is what is being
+             * described.  The job being launched is excluded - it is not
+             * running yet, and it travels in its own launch message. */
+            rc = prte_util_pack_job_catchup(&buf, caddy->jdata);
+            if (PRTE_SUCCESS != rc) {
+                PRTE_ERROR_LOG(rc);
+                PMIX_DATA_BUFFER_DESTRUCT(&buf);
+                PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_FORCED_EXIT);
+                PMIX_RELEASE(caddy);
+                return;
+            }
+
             /* get wireup info for daemons */
             jptr = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
             for (v = 0; v < jptr->procs->size; v++) {
@@ -377,7 +396,7 @@ static void vm_ready(int fd, short args, void *cbdata)
             }
 
             /* goes to all daemons */
-            if (PRTE_SUCCESS != (rc = prte_grpcomm.xcast(PRTE_RML_TAG_WIREUP, &buf))) {
+            if (PRTE_SUCCESS != (rc = prte_grpcomm_xcast(PRTE_RML_TAG_WIREUP, &buf))) {
                 PRTE_ERROR_LOG(rc);
                 PMIX_DATA_BUFFER_DESTRUCT(&buf);
                 /* the whole DVM is being torn down; held jobs will be
@@ -755,7 +774,7 @@ static void check_complete_resume(int fd, short args, void *cbdata)
          * spawned by it. */
         if (report_child_jobs_separately() && 1 != PRTE_LOCAL_JOBID(jdata->nspace)) {
             if (0 != jdata->exit_code) {
-                pmix_show_help("help-state-base.txt", "child-job-status", true,
+                prte_show_help("help-state-base.txt", "child-job-status", true,
                                PRTE_LOCAL_JOBID_PRINT(jdata->nspace), jdata->exit_code);
             }
         } else {
@@ -1007,7 +1026,7 @@ release:
                 ++nprocs;
                 if (1 == nprocs) {
                     // output a warning message that at least one child is being terminated
-                    pmix_show_help("help-state-base.txt", "child-term", true,
+                    prte_show_help("help-state-base.txt", "child-term", true,
                                    jdata->nspace, jptr->nspace);
                 }
             }
@@ -1256,7 +1275,7 @@ static void dvm_notify(int sd, short args, void *cbdata)
 
         /* we have to send the notification to all daemons so that
          * anyone watching for it can receive it */
-        if (PRTE_SUCCESS != (rc = prte_grpcomm.xcast(PRTE_RML_TAG_NOTIFICATION, reply))) {
+        if (PRTE_SUCCESS != (rc = prte_grpcomm_xcast(PRTE_RML_TAG_NOTIFICATION, reply))) {
             PRTE_ERROR_LOG(rc);
             PMIX_DATA_BUFFER_RELEASE(reply);
             PMIX_RELEASE(caddy);
@@ -1291,7 +1310,7 @@ static void dvm_notify(int sd, short args, void *cbdata)
             PMIX_RELEASE(caddy);
             return;
         }
-        prte_grpcomm.xcast(PRTE_RML_TAG_DAEMON, reply);
+        prte_grpcomm_xcast(PRTE_RML_TAG_DAEMON, reply);
         PMIX_DATA_BUFFER_RELEASE(reply);
     }
 

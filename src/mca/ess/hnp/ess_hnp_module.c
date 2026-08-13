@@ -53,7 +53,7 @@
 
 #include "src/mca/errmgr/base/base.h"
 #include "src/mca/filem/base/base.h"
-#include "src/mca/grpcomm/base/base.h"
+#include "src/grpcomm/grpcomm.h"
 #include "src/mca/iof/base/base.h"
 #include "src/mca/odls/base/base.h"
 #include "src/mca/plm/base/base.h"
@@ -72,6 +72,7 @@
 #include "src/util/proc_info.h"
 #include "src/util/session_dir.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 
 #include "src/runtime/prte_globals.h"
 #include "src/runtime/prte_locks.h"
@@ -175,7 +176,7 @@ static int rte_init(int argc, char **argv)
     /* set the schizo personality to "prte" by default */
     jdata->schizo = (struct prte_schizo_base_module_t*)prte_schizo_base_detect_proxy("prte");
     if (NULL == jdata->schizo) {
-        pmix_show_help("help-schizo-base.txt", "no-proxy", true, prte_tool_basename, "prte");
+        prte_show_help("help-schizo-base.txt", "no-proxy", true, prte_tool_basename, "prte");
         error = "select personality";
         ret = PRTE_ERR_SILENT;
         goto error;
@@ -290,16 +291,9 @@ static int rte_init(int argc, char **argv)
     /*
      * Group communications
      */
-    if (PRTE_SUCCESS
-        != (ret = pmix_mca_base_framework_open(&prte_grpcomm_base_framework,
-                                               PMIX_MCA_BASE_OPEN_DEFAULT))) {
+    if (PRTE_SUCCESS != (ret = prte_grpcomm_init())) {
         PRTE_ERROR_LOG(ret);
-        error = "prte_grpcomm_base_open";
-        goto error;
-    }
-    if (PRTE_SUCCESS != (ret = prte_grpcomm_base_select())) {
-        PRTE_ERROR_LOG(ret);
-        error = "prte_grpcomm_base_select";
+        error = "prte_grpcomm_init";
         goto error;
     }
 
@@ -428,7 +422,7 @@ static int rte_init(int argc, char **argv)
 
 error:
     if (PRTE_ERR_SILENT != ret && !prte_report_silent_errors) {
-        pmix_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true, error,
+        prte_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true, error,
                        PRTE_ERROR_NAME(ret), ret);
     }
     if (NULL != jdata) {
@@ -448,7 +442,7 @@ static int rte_finalize(void)
 
     /* close frameworks */
     (void) pmix_mca_base_framework_close(&prte_filem_base_framework);
-    (void) pmix_mca_base_framework_close(&prte_grpcomm_base_framework);
+    prte_grpcomm_finalize();
     (void) pmix_mca_base_framework_close(&prte_iof_base_framework);
     /* mapping is over, so rmaps can go here - the close frees the base's
      * hwloc bitmaps and runs each mapper's finalize. The ras framework we

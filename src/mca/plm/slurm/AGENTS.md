@@ -24,24 +24,28 @@ Files:
 
 | File | Contents |
 |------|----------|
-| `plm_slurm_component.c` | Registration (`plm_slurm_args`), `query` (SLURM detection + `srun --version` parsing → priority 75). |
+| `plm_slurm_component.c` | Registration (`plm_slurm_args`), `query` (SLURM detection + version check via [`common/slurm`](../../common/slurm/AGENTS.md) → priority 75). |
 | `plm_slurm_module.c` | `plm_slurm_init`, `plm_slurm_launch_job` (spawn), `launch_daemons` (build & exec srun), `plm_slurm_start_proc` (fork/exec), `srun_wait_cb`, terminate/signal/finalize. |
-| `plm_slurm.h` | `prte_mca_plm_slurm_component_t` (custom_args, early, ancient, major, minor). |
+| `plm_slurm.h` | `prte_mca_plm_slurm_component_t` (`custom_args` — the version state lives in `common/slurm`, not here). |
 | `help-plm-slurm.txt` | Error text (no-srun, srun-failed, ancient-version, no-hosts-in-list). |
 
 ---
 
 ## When/why selected (`prte_mca_plm_slurm_component_query`)
 
-Offers itself at priority **75** when `SLURM_JOBID` is set. It then runs
-`srun --version` and parses the `major.minor` version, recording two
-flags used later:
+Offers itself at priority **75** when a Slurm job id is in the environment
+(`prte_common_slurm_jobid()`, which knows both spellings). It then asks
+[`common/slurm`](../../common/slurm/AGENTS.md) for the version — that
+library runs the `srun --version` probe **once per process**, so
+`ras/slurm` and `ess/slurm` read the same answer instead of each running
+their own. Two of its flags are used here:
 
 - `ancient` — older than 17.11 (`srun_wait_cb` refuses to run against it).
 - `early` — older than 23.11; controls whether `--external-launcher` is
   passed (added on newer SLURM).
 
-If `srun` can't be run or the version can't be parsed, it declines.
+If no Slurm command can be run, or the version cannot be parsed
+(`!available`), it declines.
 
 ---
 
@@ -76,7 +80,12 @@ If `srun` can't be run or the version can't be parsed, it declines.
    `prte_plm_base_prted_append_basic_args(..., "slurm", &proc_vpid_index)`.
    Substitute `map->daemon_vpid_start` into the vpid slot — SLURM starts
    the tasks and each daemon offsets from this base to compute its own
-   vpid. `prte_plm_base_wrap_args` quotes multi-word args (in case srun is
+   vpid. That base is recomputed by `setup_virtual_machine` on **every**
+   launch, and this component is one of the three reasons it must be: a
+   stale base (left over from DVM formation) tells the daemons of a later
+   `--add-host` launch to claim ranks that live daemons already own. `ssh`
+   never sees it, so the invariant is pinned in `test/unit/plm`, not in
+   the swarm. `prte_plm_base_wrap_args` quotes multi-word args (in case srun is
    wrapped by a script).
 4. Read the prefix(es) from the daemon job object and exec via
    `plm_slurm_start_proc`. Set state `DAEMONS_LAUNCHED`. On any error jump
@@ -109,9 +118,18 @@ meaningless (it's srun's, not the failed proc's). The callback:
 - Refuses to proceed against an `ancient` SLURM (`ancient-version`).
 - On non-zero exit → `srun-failed` help + activate
   `DAEMONS_TERMINATED`.
-- On clean exit of the **primary** srun → fire `DAEMONS_TERMINATED` (set
-  `num_terminated = num_procs` first to avoid a bogus error message) so
-  `prun`/the HNP can exit.
+- On clean exit of the **primary** srun, whether that means the DVM is
+  gone depends on whether the `prted`s daemonized. By default a `prted`
+  forks and detaches (see `src/tools/prted/AGENTS.md`), and its parent —
+  the process srun actually tracks as the task — exits as soon as the
+  real daemon signals it is up, long before the daemon itself does. So a
+  clean exit here is normally just that hand-off, not termination: it is
+  ignored, and real daemon loss is instead caught when the daemon's RML
+  connection to the HNP drops. Only with `--debug-daemons` or
+  `--leave-session-attached` (no forking, `prted` stays attached) does
+  srun genuinely track the daemon's own lifetime, so only then does a
+  clean exit fire `DAEMONS_TERMINATED` (set `num_terminated = num_procs`
+  first to avoid a bogus error message) so `prun`/the HNP can exit.
 
 `plm_slurm_terminate_prteds` similarly special-cases the "we never
 launched additional daemons" case (`primary_pid_set == false`) by firing
@@ -121,11 +139,15 @@ launched additional daemons" case (`primary_pid_set == false`) by firing
 
 ## Key struct and MCA param
 
-`prte_mca_plm_slurm_component_t` (`plm_slurm.h`): `custom_args` (MCA
-`plm_slurm_args`, appended to srun), plus the version-detection fields
-`early`, `ancient`, `major`, `minor` set by `query`. `signal_job` just
-forwards to `prte_plm_base_prted_signal_local_procs` (signals go through
-the daemons, not srun).
+`prte_mca_plm_slurm_component_t` (`plm_slurm.h`) holds one thing:
+`custom_args` (MCA `plm_slurm_args`, appended to srun). The version state
+that used to sit beside it — `early`, `ancient`, `major`, `minor`, filled
+in by `query` from its own popen — now lives in
+[`common/slurm`](../../common/slurm/AGENTS.md), because `ras/slurm` needs
+the same answer and two components deriving it separately is two places
+for it to drift. `signal_job` just forwards to
+`prte_plm_base_prted_signal_local_procs` (signals go through the daemons,
+not srun).
 
 ---
 
@@ -136,23 +158,27 @@ the daemons, not srun).
   `daemon_nodes_assigned_at_launch = false`; don't assume a node↔daemon
   binding before the callback.
 - **Version gates are load-bearing.** `--external-launcher` (23.11+) and
-  the `ancient`/`early` flags come straight from parsed `srun --version`;
-  keep the parsing and the flag semantics in sync.
+  the `ancient`/`early` flags come straight from the version
+  [`common/slurm`](../../common/slurm/AGENTS.md) parsed out of
+  `srun --version`. Change a threshold there, not here — and remember a
+  third component reads the same struct.
 - **Elastic mode changes the kill flags.** `--no-kill
   --kill-on-bad-exit=0` in elastic/recoverable/continuous mode is
   deliberate — a node loss must not kill the whole srun.
 - **Environment purge in the child is mandatory** — SLURM forwards the
   full environment; leaving `PMIX_`/`PRTE_` vars in breaks tool
   connections and duplicates command-line settings.
-- **Known wart: the "are we using the whole allocation?" test compares a
-  count against a capacity.** `map->num_new_daemons < session->nodes->size`
-  reads `size` from a `pmix_pointer_array_t`, which is the *allocated*
-  slot count, not the number of nodes in the session. The effect today is
-  benign (the explicit `--nodes`/`--nodelist` is emitted more often than
-  intended, which srun accepts), but anyone fixing it must re-test the
-  elastic grow path on a real SLURM system — dropping the explicit node
-  list changes which nodes srun picks.
 - Multi-node behavior that does not need SLURM (tree-spawn, throttling,
   the prted command line) is covered by
-  [`contrib/dockerswarm`](../../../../contrib/dockerswarm/); the
-  SLURM-specific paths still require an allocation.
+  [`contrib/dockerswarm`](../../../../contrib/dockerswarm/) — which has no
+  SLURM of any kind, so no DVM over there is launched by this component at
+  all.
+- The SLURM-specific paths need an allocation, and
+  [`contrib/slurmswarm`](../../../../contrib/slurmswarm/) is one: ten
+  containers running a real SLURM, where the daemons really do go out over
+  `srun --jobid=<the allocation>`. It asserts the three things only a live
+  scheduler shows — that the step joins the caller's job rather than
+  queueing a second one, that the srun exit after `prted` daemonizes is
+  read as a hand-off and not a launch failure (and leaves SLURM no dangling
+  step), and that `pterm` does not take the user's allocation down with the
+  DVM.

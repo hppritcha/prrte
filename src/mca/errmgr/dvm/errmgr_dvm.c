@@ -39,7 +39,7 @@
 #include "src/util/pmix_printf.h"
 
 #include "src/mca/ess/ess.h"
-#include "src/mca/grpcomm/grpcomm.h"
+#include "src/grpcomm/grpcomm.h"
 #include "src/mca/iof/base/base.h"
 #include "src/mca/odls/base/base.h"
 #include "src/mca/plm/base/base.h"
@@ -53,6 +53,7 @@
 #include "src/util/name_fns.h"
 #include "src/util/proc_info.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 
 #include "src/runtime/prte_globals.h"
 #include "src/runtime/prte_locks.h"
@@ -184,7 +185,7 @@ static void job_errors(int fd, short args, void *cbdata)
              * daemons fail to start would only bury it. */
             if (PRTE_JOB_STATE_FAILED_TO_START == jdata->state
                 || PRTE_JOB_STATE_FAILED_TO_LAUNCH == jdata->state) {
-                pmix_show_help("help-errmgr-base.txt", "failed-daemon-launch",
+                prte_show_help("help-errmgr-base.txt", "failed-daemon-launch",
                                true, prte_tool_basename);
             }
             prte_routing_is_enabled = false;
@@ -199,7 +200,7 @@ static void job_errors(int fd, short args, void *cbdata)
          * likely already output an error message */
         if (PRTE_JOB_STATE_ABORTED == jobstate && jdata->num_procs != jdata->num_reported) {
             prte_routing_is_enabled = false;
-            pmix_show_help("help-errmgr-base.txt", "failed-daemon", true);
+            prte_show_help("help-errmgr-base.txt", "failed-daemon", true);
         }
         /* there really isn't much else we can do since the problem
          * is in the DVM itself, so best just to terminate */
@@ -240,6 +241,7 @@ static void job_errors(int fd, short args, void *cbdata)
         || PRTE_JOB_STATE_FAILED_TO_LAUNCH == jdata->state
         || PRTE_JOB_STATE_ALLOC_FAILED == jdata->state
         || PRTE_JOB_STATE_MAP_FAILED == jdata->state
+        || PRTE_JOB_STATE_FILES_POSN_FAILED == jdata->state
         || PRTE_JOB_STATE_CANNOT_LAUNCH == jdata->state) {
         PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_TERMINATED);
     }
@@ -431,7 +433,7 @@ static void proc_errors(int fd, short args, void *cbdata)
                      * A daemon we have never placed has no node, and this
                      * message is the last thing that should turn a lost
                      * daemon into a segfault in the HNP */
-                    pmix_show_help("help-errmgr-base.txt", "node-died", true,
+                    prte_show_help("help-errmgr-base.txt", "node-died", true,
                                    PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), prte_process_info.nodename,
                                    PRTE_NAME_PRINT(proc),
                                    NULL == pptr->node ? "unknown" : pptr->node->name);
@@ -850,7 +852,7 @@ static void check_send_notification(prte_job_t *jdata,
     PMIX_INFO_FREE(info, ninfo);
 
     /* xcast it to everyone */
-    if (PRTE_SUCCESS != (rc = prte_grpcomm.xcast(PRTE_RML_TAG_NOTIFICATION, &pbkt))) {
+    if (PRTE_SUCCESS != (rc = prte_grpcomm_xcast(PRTE_RML_TAG_NOTIFICATION, &pbkt))) {
         PRTE_ERROR_LOG(rc);
     }
     PMIX_DATA_BUFFER_DESTRUCT(&pbkt);

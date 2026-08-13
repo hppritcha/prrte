@@ -8,7 +8,7 @@
  * Copyright (c) 2014-2019 Intel, Inc.  All rights reserved.
  * Copyright (c) 2015-2019 Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
- * Copyright (c) 2021-2024 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * Copyright (c) 2026      Sandia National Laboratories  All rights reserved.
  * $COPYRIGHT$
  *
@@ -56,6 +56,8 @@ prte_rml_base_t prte_rml_base = {
     .global_failed_dmns = { .super = PMIX_OBJ_STATIC_INIT(pmix_bitmap_t) },
     .dead_dmns = { .super = PMIX_OBJ_STATIC_INIT(pmix_bitmap_t) },
     .absent_dmns = { .super = PMIX_OBJ_STATIC_INIT(pmix_bitmap_t) },
+    .lateral_links = { .super = PMIX_OBJ_STATIC_INIT(pmix_bitmap_t) },
+    .lateral_lost_cb = NULL,
     .peer_epochs = NULL,
     .peer_epochs_size = 0,
 };
@@ -63,10 +65,22 @@ prte_rml_base_t prte_rml_base = {
 uint64_t prte_rml_boot_epoch = 0;
 
 static int verbosity = 0;
+/* the departed-rank list handed to us on the command line, if any - owned by
+ * the MCA variable system, not by us */
+static char *dead_dmns_spec = NULL;
+
+/* The incarnation table is the one piece of RML state a peer's socket handler
+ * reaches directly, and that handler runs on whichever base is servicing the
+ * peer - one of the OOB progress threads when any were configured (see
+ * prte_oob_base.num_progress_threads).  Two of them arriving at once would
+ * both realloc the array.  The lock is taken only on the bootstrap incarnation
+ * check, which is a handful of instructions per message and uncontended
+ * whenever the OOB is running on the main thread alone. */
+static pmix_mutex_t epoch_lock = PMIX_MUTEX_STATIC_INIT;
 
 /* Grow the per-rank epoch table so index rank is valid, zero-filling new slots
  * (0 = unknown). Ranks are dense and small, so a flat array indexed by rank is
- * ample. Runs only on the progress thread, like all RML state. */
+ * ample. Caller must hold epoch_lock. */
 static void ensure_epoch_slot(pmix_rank_t rank)
 {
     if ((size_t) rank < prte_rml_base.peer_epochs_size) {
@@ -87,27 +101,34 @@ static void ensure_epoch_slot(pmix_rank_t rank)
 
 bool prte_rml_epoch_ok(pmix_rank_t rank, uint64_t epoch)
 {
+    uint64_t known;
+    bool ok = true;
+
     /* an unstamped message (epoch 0) carries no incarnation claim - accept */
     if (0 == epoch) {
         return true;
     }
+    pmix_mutex_lock(&epoch_lock);
     ensure_epoch_slot(rank);
     if ((size_t) rank >= prte_rml_base.peer_epochs_size) {
         /* allocation failed - fail open rather than drop live traffic */
-        return true;
+        goto done;
     }
-    uint64_t known = prte_rml_base.peer_epochs[rank];
+    known = prte_rml_base.peer_epochs[rank];
     if (0 == known) {
         /* first time we have seen this rank - learn its epoch */
         prte_rml_base.peer_epochs[rank] = epoch;
-        return true;
+        goto done;
     }
     if (epoch < known) {
         /* stale incarnation - drop. A newer epoch passes but does not advance
          * the table here; the arbitrated revival advances it authoritatively. */
-        return false;
+        ok = false;
     }
-    return true;
+
+done:
+    pmix_mutex_unlock(&epoch_lock);
+    return ok;
 }
 
 void prte_rml_record_epoch(pmix_rank_t rank, uint64_t epoch)
@@ -115,10 +136,12 @@ void prte_rml_record_epoch(pmix_rank_t rank, uint64_t epoch)
     if (0 == epoch) {
         return;
     }
+    pmix_mutex_lock(&epoch_lock);
     ensure_epoch_slot(rank);
     if ((size_t) rank < prte_rml_base.peer_epochs_size) {
         prte_rml_base.peer_epochs[rank] = epoch;
     }
+    pmix_mutex_unlock(&epoch_lock);
 }
 
 uint64_t prte_rml_get_epoch(pmix_rank_t rank)
@@ -127,6 +150,95 @@ uint64_t prte_rml_get_epoch(pmix_rank_t rank)
         return prte_rml_base.peer_epochs[rank];
     }
     return 0;
+}
+
+char *prte_rml_render_dead_dmns(void)
+{
+    char **entries = NULL;
+    char *result, *tmp;
+    int n, sz, start;
+
+    sz = pmix_bitmap_size(&prte_rml_base.dead_dmns);
+    for (n = 0; n < sz; n++) {
+        if (!pmix_bitmap_is_set_bit(&prte_rml_base.dead_dmns, n)) {
+            continue;
+        }
+        /* Collapse a run into "first:last". A DVM that has shrunk repeatedly
+         * can otherwise put hundreds of numbers onto a command line that is
+         * already measured against _SC_ARG_MAX by every launcher.
+         *
+         * The separator is a colon rather than the dash such a range is
+         * usually written with, because this value goes on a command line:
+         * every released PMIx that PRRTE accepts (>= 6.1.0) refuses an MCA
+         * value whose second character is a dash, reading it as a missing
+         * argument, so "2-3" would fail to launch. The fix for that is on PMIx
+         * master only and in no tag. */
+        start = n;
+        while (n + 1 < sz && pmix_bitmap_is_set_bit(&prte_rml_base.dead_dmns, n + 1)) {
+            ++n;
+        }
+        if (start == n) {
+            pmix_asprintf(&tmp, "%d", start);
+        } else {
+            pmix_asprintf(&tmp, "%d:%d", start, n);
+        }
+        PMIx_Argv_append_nosize(&entries, tmp);
+        free(tmp);
+    }
+
+    if (NULL == entries) {
+        return NULL;
+    }
+    result = PMIx_Argv_join(entries, ',');
+    PMIx_Argv_free(entries);
+    return result;
+}
+
+void prte_rml_load_dead_dmns(const char *spec)
+{
+    char **entries;
+    int n;
+    long r, first, last;
+    char *end;
+    bool ok;
+
+    if (NULL == spec || '\0' == spec[0]) {
+        return;
+    }
+
+    entries = PMIx_Argv_split(spec, ',');
+    if (NULL == entries) {
+        return;
+    }
+    for (n = 0; NULL != entries[n]; n++) {
+        ok = false;
+        end = NULL;
+        first = strtol(entries[n], &end, 10);
+        if (end != entries[n] && 0 <= first) {
+            if (':' == *end) {
+                char *p = end + 1;
+                last = strtol(p, &end, 10);
+                ok = (end != p && last >= first);
+            } else {
+                last = first;
+                ok = true;
+            }
+            /* the whole entry has to be consumed, and a rank outside the DVM's
+             * vpid span is not a hole in it */
+            if (ok && ('\0' != *end || (long) prte_process_info.num_daemons <= last)) {
+                ok = false;
+            }
+        }
+        if (!ok) {
+            pmix_output(0, "PRRTE: ignoring malformed departed-daemon rank \"%s\"",
+                        entries[n]);
+            continue;
+        }
+        for (r = first; r <= last; r++) {
+            pmix_bitmap_set_bit(&prte_rml_base.dead_dmns, (int) r);
+        }
+    }
+    PMIx_Argv_free(entries);
 }
 
 void prte_rml_register(void)
@@ -175,6 +287,19 @@ void prte_rml_register(void)
         prte_rml_base.radix = 2;
     }
 
+    /* The ranks that had already departed the DVM when we were launched. Only
+     * a launcher sets this, on the prted command line: a daemon started into a
+     * DVM that has lost ranks has to know which they are BEFORE it computes its
+     * first routing tree, and no message can tell it - the request would have
+     * to travel over the very tree it has not got right. See prte_rml_open. */
+    dead_dmns_spec = NULL;
+    pmix_mca_base_var_register("prte", "rml", "base", "dead_dmns",
+                               "Comma-separated daemon vpids (ranges as first:last, e.g. \"2,7:9\")"
+                               " that had permanently departed the DVM when this daemon was"
+                               " launched. Set by the launcher; not intended for users",
+                               PMIX_MCA_BASE_VAR_TYPE_STRING,
+                               &dead_dmns_spec);
+
     prte_oob_register();
 
     verbosity = 0;
@@ -200,6 +325,7 @@ void prte_rml_close(void)
     PMIX_DESTRUCT(&prte_rml_base.global_failed_dmns);
     PMIX_DESTRUCT(&prte_rml_base.dead_dmns);
     PMIX_DESTRUCT(&prte_rml_base.absent_dmns);
+    PMIX_DESTRUCT(&prte_rml_base.lateral_links);
     if (NULL != prte_rml_base.peer_epochs) {
         free(prte_rml_base.peer_epochs);
         prte_rml_base.peer_epochs = NULL;
@@ -240,6 +366,12 @@ int prte_rml_open(void)
      * comes back (the unheal path). Initialized once here for the same reason. */
     PMIX_CONSTRUCT(&prte_rml_base.absent_dmns, pmix_bitmap_t);
     pmix_bitmap_init(&prte_rml_base.absent_dmns, prte_process_info.num_daemons);
+    /* lateral_links records the peers we hold a non-tree connection to. Like
+     * the two above it is constructed once and never re-initialized by a
+     * routing recompute: a grow reshapes the tree but does not dissolve the
+     * exchange partners a collective is midway through talking to. */
+    PMIX_CONSTRUCT(&prte_rml_base.lateral_links, pmix_bitmap_t);
+    pmix_bitmap_init(&prte_rml_base.lateral_links, prte_process_info.num_daemons);
 
     /* Capture this process's boot epoch (incarnation): a millisecond wall-clock
      * timestamp taken once here. A departed daemon that reboots into the same
@@ -262,6 +394,16 @@ int prte_rml_open(void)
                   prte_rml_recv_return_request, NULL);
     PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_DAEMON_REVIVED, true,
                   prte_rml_recv_revival_notice, NULL);
+
+    /* Adopt the departed ranks our launcher told us about, BEFORE the first
+     * tree computation below. A daemon launched into a DVM that has already
+     * shrunk starts with an empty dead set, so the raw radix math can hand it a
+     * retired vpid as its parent - and then every message it sends upward,
+     * including the warm-up that asks for the nidmap that would have corrected
+     * the set, is addressed to a rank nothing can contact. The DVM never reuses
+     * a daemon vpid, so the hole is permanent and this is the only moment the
+     * newcomer can learn of it (#2491). */
+    prte_rml_load_dead_dmns(dead_dmns_spec);
 
     /* compute the routing tree - only thing we need to know is the
      * number of daemons in the DVM */
@@ -378,18 +520,43 @@ static void send_cons(prte_rml_send_t *ptr)
     ptr->cbfunc = prte_rml_send_callback;
     ptr->cbdata = NULL;
     ptr->dbuf = NULL;
+    /* an ordinary send owns its own buffer - PMIX_NEW mallocs rather than
+     * zeroing, so leaving this unset would have the destructor release a
+     * garbage pointer as if it were a shared payload */
+    ptr->payload = NULL;
     ptr->seq_num = 0xFFFFFFFF;
     /* Default to this process's own epoch: a message built here originates
      * here. The relay path overrides this with the origin's epoch carried in
      * the received wire header so a relayed message keeps its original stamp. */
     ptr->epoch = prte_rml_boot_epoch;
+    /* routed unless the caller asks otherwise - PMIX_NEW mallocs, it does
+     * not zero, so this field is heap garbage until it is set */
+    ptr->direct = false;
 }
 static void send_des(prte_rml_send_t *ptr)
 {
-    if (ptr->dbuf != NULL)
+    if (NULL != ptr->payload) {
+        /* the buffer belongs to the payload, which may still be in flight to
+         * other destinations - drop our reference and let the last one out
+         * free it */
+        PMIX_RELEASE(ptr->payload);
+    } else if (NULL != ptr->dbuf) {
         PMIX_DATA_BUFFER_RELEASE(ptr->dbuf);
+    }
 }
 PMIX_CLASS_INSTANCE(prte_rml_send_t, pmix_list_item_t, send_cons, send_des);
+
+static void payload_cons(prte_rml_payload_t *ptr)
+{
+    ptr->dbuf = NULL;
+}
+static void payload_des(prte_rml_payload_t *ptr)
+{
+    if (NULL != ptr->dbuf) {
+        PMIX_DATA_BUFFER_RELEASE(ptr->dbuf);
+    }
+}
+PMIX_CLASS_INSTANCE(prte_rml_payload_t, pmix_object_t, payload_cons, payload_des);
 
 static void send_req_cons(prte_rml_send_request_t *ptr)
 {

@@ -85,11 +85,11 @@
 #include "src/util/proc_info.h"
 #include "src/util/session_dir.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 
 #include "src/mca/errmgr/errmgr.h"
 #include "src/mca/ess/base/base.h"
-#include "src/mca/grpcomm/base/base.h"
-#include "src/mca/grpcomm/grpcomm.h"
+#include "src/grpcomm/grpcomm.h"
 #include "src/mca/odls/base/base.h"
 #include "src/mca/plm/plm.h"
 #include "src/mca/ras/ras.h"
@@ -238,6 +238,14 @@ int main(int argc, char *argv[])
     for (i = 0; NULL != pargv[i]; i++) {
         if (0 == strcmp(pargv[i], "--" PRTE_CLI_BOOTSTRAP)) {
             prte_bootstrap_setup = true;
+            /* A bootstrapped DVM is persistent by construction: its daemons
+             * are started independently and stand waiting for work.  There
+             * is also no launcher to tell us so - the HNP appends
+             * prte_persistent to the command lines it builds, and nobody
+             * built ours.  Set it here, ahead of prte_register_params(),
+             * which takes the current value as the parameter's default and
+             * so leaves this in place unless someone overrides it. */
+            prte_persistent = true;
             break;
         }
     }
@@ -275,7 +283,7 @@ int main(int argc, char *argv[])
     /* get our schizo module */
     schizo = prte_schizo_base_detect_proxy(personality);
     if (NULL == schizo) {
-        pmix_show_help("help-schizo-base.txt", "no-proxy", true, prte_tool_basename, personality);
+        prte_show_help("help-schizo-base.txt", "no-proxy", true, prte_tool_basename, personality);
         return 1;
     }
 
@@ -307,7 +315,7 @@ int main(int argc, char *argv[])
     /* Register all global MCA Params */
     if (PRTE_SUCCESS != (ret = prte_register_params())) {
         if (PRTE_ERR_SILENT != ret) {
-            pmix_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true,
+            prte_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true,
                            "prte register params",
                            PRTE_ERROR_NAME(ret), ret);
         }
@@ -323,9 +331,6 @@ int main(int argc, char *argv[])
     }
 
     /* check for debug options */
-    if (pmix_cmd_line_is_taken(&results, PRTE_CLI_DEBUG)) {
-        prte_debug_flag = true;
-    }
     if (pmix_cmd_line_is_taken(&results, PRTE_CLI_DEBUG_DAEMONS)) {
         prte_debug_daemons_flag = true;
     }
@@ -412,7 +417,7 @@ int main(int argc, char *argv[])
                 core = strtoul(cores[i], NULL, 10);
                 if (NULL == (pu = prte_hwloc_base_get_pu(prte_hwloc_topology, false, core))) {
                     /* the message will now come out locally */
-                    pmix_show_help("help-prted.txt", "orted:cannot-bind", true,
+                    prte_show_help("help-prted.txt", "orted:cannot-bind", true,
                                    prte_process_info.nodename, prte_daemon_cores);
                     ret = PRTE_ERR_NOT_SUPPORTED;
                     hwloc_bitmap_free(ours);
@@ -471,11 +476,16 @@ int main(int argc, char *argv[])
     /* setup the primary daemon command receive function */
     PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_DAEMON,
                   PRTE_RML_PERSISTENT, prte_daemon_recv, NULL);
+    /* The launch message rides its own tag so grpcomm can tell it apart from
+     * the commands, but it is the same command stream and the same handler -
+     * prte_daemon_recv ignores the tag it was delivered on. */
+    PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_DAEMON_LAUNCH,
+                  PRTE_RML_PERSISTENT, prte_daemon_recv, NULL);
 
     /* output a message indicating we are alive, our name, and our pid
      * for debugging purposes
      */
-    if (prte_debug_flag) {
+    if (prte_debug_daemons_flag) {
         fprintf(stderr, "Daemon %s checking in as pid %ld on host %s\n",
                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), (long) prte_process_info.pid,
                 prte_process_info.nodename);
@@ -814,7 +824,7 @@ int main(int argc, char *argv[])
     }
 
 bootstrap_wait:
-    if (prte_debug_flag) {
+    if (prte_debug_daemons_flag) {
         pmix_output(0, "%s prted: up and running - waiting for commands!",
                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME));
     }
@@ -858,7 +868,7 @@ DONE:
     /* cleanup the process info */
     prte_proc_info_finalize();
 
-    if (prte_debug_flag) {
+    if (prte_debug_daemons_flag) {
         fprintf(stderr, "exiting with status %d\n", prte_exit_status);
     }
     exit(prte_exit_status);

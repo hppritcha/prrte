@@ -34,6 +34,47 @@
 
 static prte_oob_tcp_peer_t* process_uri(char *uri);
 
+/* Run a send's completion callback on the main progress thread.
+ *
+ * Reached only when a peer's socket is being serviced by one of the OOB
+ * worker progress threads (see PRTE_OOB_COMPLETE_SEND): the callback belongs
+ * to whoever originated the message and touches PRRTE state that only
+ * prte_event_base may touch.  Posting them all through this one handler also
+ * keeps a peer's completions in the order its socket produced them, since
+ * libevent runs a base's active events first-in first-out.
+ */
+void prte_oob_base_complete_send(int fd, short args, void *cbdata)
+{
+    prte_oob_send_t *cd = (prte_oob_send_t *) cbdata;
+    prte_rml_send_t *msg;
+    PRTE_HIDE_UNUSED_PARAMS(fd, args);
+
+    PMIX_ACQUIRE_OBJECT(cd);
+    msg = cd->msg;
+    PMIX_RELEASE(cd);
+
+    PRTE_RML_SEND_COMPLETE(msg);
+}
+
+/* Has this target been launched but not yet said anything?
+ *
+ * rml_uri is written only by prte_plm_base_daemon_callback, i.e. only by the
+ * daemon itself reporting in, which is what makes it the exact test.  Neither
+ * PRTE_PROC_FLAG_ALIVE nor a RUNNING state can serve: plm/ssh sets both when
+ * it *records* the launch, long before the daemon says anything.  errmgr/dvm
+ * decides whether to act on the failure on this same test.
+ */
+static bool daemon_not_yet_reported(const pmix_proc_t *hop)
+{
+    prte_proc_t *dmn;
+
+    if (!PMIX_CHECK_NSPACE(hop->nspace, PRTE_PROC_MY_NAME->nspace)) {
+        return false;
+    }
+    dmn = prte_get_proc_object(hop);
+    return (NULL != dmn && NULL == dmn->rml_uri);
+}
+
 void prte_oob_base_send_nb(int fd, short args, void *cbdata)
 {
     prte_oob_send_t *cd = (prte_oob_send_t *) cbdata;
@@ -76,7 +117,17 @@ void prte_oob_base_send_nb(int fd, short args, void *cbdata)
 
     /* do we have a route to this peer (could be direct)? */
     PMIX_LOAD_NSPACE(hop.nspace, PRTE_PROC_MY_NAME->nspace);
-    hop.rank = prte_rml_get_route(msg->dst.rank);
+    if (msg->direct) {
+        /* The caller asked for the target itself rather than the next hop the
+         * tree would choose.  Everything below is unchanged: the peer lookup
+         * finds or builds a connection from the target's PMIX_PROC_URI exactly
+         * as it does for a tree neighbour, so a direct send costs nothing
+         * beyond the connection itself. */
+        hop.rank = msg->dst.rank;
+    } else {
+        hop.rank = prte_rml_get_route(msg->dst.rank);
+    }
+resolve_hop:
     if (PMIX_RANK_INVALID == hop.rank && PRTE_PROC_MY_HNP->rank != msg->dst.rank) {
         /* The routing tree has no next hop toward this target - it sits behind
          * a hole we cannot get any closer to.  Report that to the sender rather
@@ -144,12 +195,41 @@ void prte_oob_base_send_nb(int fd, short args, void *cbdata)
                 free(synth);
             }
         }
+        if (NULL == peer && msg->direct) {
+            /* We could not reach the target directly - most likely its contact
+             * info has not propagated to us yet.  That is not a reason to fail
+             * the message: fall back to the routing tree, which is slower for a
+             * collective but always available.  Clearing the flag first means
+             * the retry cannot loop, and keeps the relay bookkeeping honest if
+             * this message ends up being forwarded by an intermediate hop. */
+            pmix_output_verbose(4, prte_oob_base.output,
+                                "%s oob:base:send no direct path to %s -"
+                                " falling back to the routed path",
+                                PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                                PRTE_NAME_PRINT(&msg->dst));
+            msg->direct = false;
+            hop.rank = prte_rml_get_route(msg->dst.rank);
+            goto resolve_hop;
+        }
         if (NULL == peer) {
             // unable to send it - as above, complete rather than release so
             // the originator's callback runs with a status
             if (!prte_prteds_term_ordered && !prte_finalizing
                 && !prte_abnormal_term_ordered) {
-                PMIX_ERROR_LOG(rc);
+                /* Not knowing where a daemon is that has not yet reported for
+                 * duty is the expected state, not an error: the routing tree
+                 * is built from the daemon count the moment a grow records
+                 * them, precisely so wireup can route to them, so anything
+                 * broadcast while a launch is in flight is addressed to
+                 * daemons that have no contact info yet.  errmgr/dvm knows
+                 * this and swallows the state below on the same test - see
+                 * the comment there - so logging it here put four PMIX ERROR
+                 * lines on the user's terminal for a grow that was working.
+                 * A daemon that has reported, or anything that is not a
+                 * daemon, still logs. */
+                if (!daemon_not_yet_reported(&hop)) {
+                    PMIX_ERROR_LOG(rc);
+                }
                 PRTE_ACTIVATE_PROC_STATE(&hop, PRTE_PROC_STATE_UNABLE_TO_SEND_MSG);
             }
             msg->status = PRTE_ERR_ADDRESSEE_UNKNOWN;

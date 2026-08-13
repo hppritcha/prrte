@@ -56,7 +56,9 @@ is the default launcher.
    using the full allocation rather than an explicit host list.
 3. **Build the `prted` argv:** `prte_plm_base_setup_prted_cmd`, then
    `prte_plm_base_prted_append_basic_args(..., "pals", &proc_vpid_index)`,
-   substitute `map->daemon_vpid_start` into the vpid slot,
+   substitute `map->daemon_vpid_start` into the vpid slot (recomputed by
+   `setup_virtual_machine` on every launch - a stale base would tell the
+   daemons of a later add-host launch to claim ranks live daemons own),
    `prte_plm_base_wrap_args`.
 4. Copy `prte_launch_environ` (already stripped of `PRTE_`/`PMIX_`
    vars) as the child env; read the prefix(es) from the daemon job
@@ -94,7 +96,7 @@ exit command; `plm_pals_signal_job` signals `palsrun` directly via
 | `priority` (100) | Selection priority (`plm_pals_priority`). |
 | `aprun_cmd` (`"aprun"`) | Launcher command (`plm_pals_aprun`) — override for wrappers. |
 | `custom_args` | Extra aprun args (`plm_pals_args`). |
-| `debug` | Verbose launcher debugging (`plm_pals_debug`); defaults to `prte_debug_flag`. |
+| `debug` | Verbose launcher debugging (`plm_pals_debug`). |
 
 ---
 

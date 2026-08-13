@@ -53,6 +53,7 @@
 #include "src/util/pmix_os_path.h"
 #include "src/util/proc_info.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 #include "src/util/stacktrace.h"
 #include "src/util/sys_limits.h"
 
@@ -68,7 +69,7 @@
 #include "src/mca/ess/base/base.h"
 #include "src/mca/ess/ess.h"
 #include "src/mca/filem/base/base.h"
-#include "src/mca/grpcomm/base/base.h"
+#include "src/grpcomm/grpcomm.h"
 #include "src/mca/iof/base/base.h"
 #include "src/mca/odls/base/base.h"
 #include "src/mca/plm/base/base.h"
@@ -91,7 +92,6 @@
  */
 bool prte_initialized = false;
 bool prte_finalizing = false;
-bool prte_debug_flag = false;
 int prte_debug_verbosity = -1;
 char *prte_prohibited_session_dirs = NULL;
 bool prte_create_session_dirs = true;
@@ -305,28 +305,24 @@ int prte_init_minimum(void)
         return ret;
     }
 
-    /* A bootstrapping daemon must publish the DVM-wide MCA parameters it reads
-     * from prte.conf before those parameters are first registered below (an
-     * MCA variable evaluates its environment only on first registration).  The
-     * install directories - and thus the config-file path - are known by now,
-     * so this is the earliest correct point.  prte_bootstrap_setup is set from
-     * the argument vector in prted before prte_init_util was called. */
-    if (prte_bootstrap_setup) {
-        if (PRTE_SUCCESS != (ret = prte_ess_base_bootstrap_params())) {
-            if (PRTE_ERR_SILENT != ret) {
-                pmix_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true,
-                               "prte bootstrap params", PRTE_ERROR_NAME(ret), ret);
-            }
-            return 1;
-        }
-    }
-
-    /* Register all global MCA Params */
-    if (PRTE_SUCCESS != (ret = prte_register_params())) {
+    /* Registration happens in two phases, and the order below is the whole
+     * point of splitting it: an MCA variable evaluates its environment exactly
+     * once, when it is first registered, and the parameter files are applied
+     * by publishing their contents into the environment.  So anything
+     * registered before that publication would ignore the files entirely -
+     * which is precisely what every prte_* parameter used to do.
+     *
+     * Phase one therefore registers only the parameters that say where the
+     * files are (they cannot come from the files they locate); the files are
+     * then read; and everything else is registered afterwards, so it sees an
+     * environment that already carries the files' values.  The install
+     * directories - and thus the default config-file path - are known by now,
+     * so this is the earliest point at which any of it can run. */
+    ret = prte_register_paramfile_params();
+    if (PRTE_SUCCESS != ret) {
         if (PRTE_ERR_SILENT != ret) {
-            pmix_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true,
-                           "prte register params",
-                           PRTE_ERROR_NAME(ret), ret);
+            prte_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true,
+                           "prte register paramfile params", PRTE_ERROR_NAME(ret), ret);
         }
         return 1;
     }
@@ -339,10 +335,36 @@ int prte_init_minimum(void)
     ret = prte_preload_default_mca_params();
     if (PRTE_SUCCESS != ret) {
         if (PRTE_ERR_SILENT != ret) {
-            pmix_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true,
+            prte_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true,
                            "prte preload mca params", PRTE_ERROR_NAME(ret), ret);
         }
         return ret;
+    }
+
+    /* A bootstrapping daemon must publish the DVM-wide MCA parameters it reads
+     * from prte.conf before those parameters are first registered below.  It
+     * runs after the param files so that its own overwrite=true settings win
+     * over them, as a DVM-wide configuration must.  prte_bootstrap_setup comes
+     * either from the argument vector (prted sets it before prte_init_util was
+     * called) or from the parameter registered in phase one above. */
+    if (prte_bootstrap_setup) {
+        if (PRTE_SUCCESS != (ret = prte_ess_base_bootstrap_params())) {
+            if (PRTE_ERR_SILENT != ret) {
+                prte_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true,
+                               "prte bootstrap params", PRTE_ERROR_NAME(ret), ret);
+            }
+            return 1;
+        }
+    }
+
+    /* Register all global MCA Params */
+    if (PRTE_SUCCESS != (ret = prte_register_params())) {
+        if (PRTE_ERR_SILENT != ret) {
+            prte_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true,
+                           "prte register params",
+                           PRTE_ERROR_NAME(ret), ret);
+        }
+        return 1;
     }
 
     return PRTE_SUCCESS;
@@ -383,7 +405,7 @@ int prte_init_util(prte_proc_type_t flags)
      * doing so twice in cases where the launch agent did it for us
      */
     if (PRTE_SUCCESS != (ret = prte_util_init_sys_limits(&error))) {
-        pmix_show_help("help-prte-runtime.txt", "prte_init:syslimit", false, error);
+        prte_show_help("help-prte-runtime.txt", "prte_init:syslimit", false, error);
         return PRTE_ERR_SILENT;
     }
 
@@ -398,7 +420,7 @@ int prte_init_util(prte_proc_type_t flags)
 
 error:
     if (PRTE_ERR_SILENT != ret) {
-        pmix_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true, error,
+        prte_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true, error,
                        PRTE_ERROR_NAME(ret), ret);
     }
 
@@ -563,7 +585,7 @@ int prte_init(int *pargc, char ***pargv, prte_proc_type_t flags)
 
 error:
     if (PRTE_ERR_SILENT != ret) {
-        pmix_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true, error,
+        prte_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true, error,
                        PRTE_ERROR_NAME(ret), ret);
     }
 
@@ -699,7 +721,7 @@ int prte_preload_default_mca_params(void)
                 PMIX_LIST_FOREACH(fv2, &params, pmix_mca_base_var_file_value_t) {
                     if (0 == strcmp(fv->mbvfv_var, fv2->mbvfv_var)) {
                         if (!prte_suppress_override_warning) {
-                            pmix_show_help("help-pmix-mca-var.txt", "overridden-param-set", true, fv->mbvfv_var);
+                            prte_show_help("help-pmix-mca-var.txt", "overridden-param-set", true, fv->mbvfv_var);
                         }
                         free(fv->mbvfv_var);
                         fv->mbvfv_var = strdup(fv2->mbvfv_var);
@@ -714,7 +736,7 @@ int prte_preload_default_mca_params(void)
                 if (pmix_pmdl_base_check_pmix_param(fv->mbvfv_var)) {
                     pmix_asprintf(&tmp, "PMIX_MCA_%s", fv->mbvfv_var);
                     if (!prte_suppress_override_warning && NULL != getenv(tmp)) {
-                        pmix_show_help("help-pmix-mca-var.txt", "overridden-param-set", true, tmp);
+                        prte_show_help("help-pmix-mca-var.txt", "overridden-param-set", true, tmp);
                     }
                     // set it, and overwrite if they already
                     // have a value in our environment
@@ -723,7 +745,7 @@ int prte_preload_default_mca_params(void)
                 } else {
                     pmix_asprintf(&tmp, "PRTE_MCA_%s", fv->mbvfv_var);
                     if (!prte_suppress_override_warning && NULL != getenv(tmp)) {
-                        pmix_show_help("help-pmix-mca-var.txt", "overridden-param-set", true, tmp);
+                        prte_show_help("help-pmix-mca-var.txt", "overridden-param-set", true, tmp);
                     }
                     // set it, and overwrite if they already
                     // have a value in our environment
@@ -734,7 +756,7 @@ int prte_preload_default_mca_params(void)
                     // the equivalent PMIx value
                     if (check_pmix_overlap(fv->mbvfv_var, fv->mbvfv_value, true) &&
                         !prte_suppress_override_warning) {
-                        pmix_show_help("help-pmix-mca-var.txt", "overridden-param-set", true, fv->mbvfv_var);
+                        prte_show_help("help-pmix-mca-var.txt", "overridden-param-set", true, fv->mbvfv_var);
                     }
                 }
             }

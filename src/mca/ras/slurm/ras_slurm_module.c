@@ -57,8 +57,10 @@
 #include "src/runtime/prte_globals.h"
 #include "src/util/name_fns.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 
 #include "ras_slurm.h"
+#include "src/mca/common/slurm/common_slurm.h"
 #include "src/mca/ras/base/base.h"
 
 #define PRTE_SLURM_DYN_MAX_SIZE 256
@@ -79,7 +81,6 @@ prte_ras_base_module_t prte_ras_slurm_module = {
     .allocate = prte_ras_slurm_allocate,
     .modify = modify,
     .shrink_complete = prte_ras_slurm_shrink_complete,
-    .release_allocation = prte_ras_slurm_release_allocation,
     .finalize = prte_ras_slurm_finalize
 };
 
@@ -90,10 +91,16 @@ static int prte_ras_slurm_parse_range(char *base, char *range, char ***nodelist)
 
 pmix_list_t *prte_slurm_session_stack = NULL;
 
+static void session_stack_item_des(prte_session_stack_item_t *p)
+{
+    if (NULL != p->session) {
+        PMIX_RELEASE(p->session);
+    }
+}
 PMIX_CLASS_INSTANCE(prte_session_stack_item_t,
                     pmix_list_item_t,
                     NULL,
-                    NULL);
+                    session_stack_item_des);
 
 static bool check_taint(char *name, char *evar)
 {
@@ -105,7 +112,7 @@ static bool check_taint(char *name, char *evar)
         }
     }
 
-    pmix_show_help("help-ras-slurm.txt", "tainted-envar", true,
+    prte_show_help("help-ras-slurm.txt", "tainted-envar", true,
                    name, prte_mca_ras_slurm_component.max_length);
     return true;
 }
@@ -133,11 +140,17 @@ static int init(void)
         goto cleanup;
     }
 
+    err = prte_ras_slurm_modify_extend_init();
+    if (PRTE_SUCCESS != err) {
+        goto cleanup;
+    }
+
 cleanup:
 
     if (PRTE_SUCCESS != err) {
         prte_ras_slurm_modify_release_finalize();
         prte_ras_slurm_modify_cancel_finalize();
+        prte_ras_slurm_modify_extend_finalize();
         if (NULL != prte_slurm_session_stack) {
             PMIX_RELEASE(prte_slurm_session_stack);
             prte_slurm_session_stack = NULL;
@@ -162,7 +175,7 @@ static int prte_ras_slurm_allocate(prte_job_t *jdata, pmix_list_t *nodes)
     prte_session_t *session;
     PRTE_HIDE_UNUSED_PARAMS(jdata);
 
-    if (NULL == (slurm_jobid = getenv("SLURM_JOBID"))) {
+    if (NULL == (slurm_jobid = prte_common_slurm_jobid())) {
         return PRTE_ERR_TAKE_NEXT_OPTION;
     }
 
@@ -177,7 +190,7 @@ static int prte_ras_slurm_allocate(prte_job_t *jdata, pmix_list_t *nodes)
 
     regexp = getenv("SLURM_NODELIST");
     if (NULL == regexp) {
-        pmix_show_help("help-ras-slurm.txt", "slurm-env-var-not-found", 1, "SLURM_NODELIST");
+        prte_show_help("help-ras-slurm.txt", "slurm-env-var-not-found", 1, "SLURM_NODELIST");
         return PRTE_ERR_NOT_FOUND;
     }
     // check for length violation - untaint the envar value
@@ -195,7 +208,7 @@ static int prte_ras_slurm_allocate(prte_job_t *jdata, pmix_list_t *nodes)
         tasks_per_node = getenv("SLURM_JOB_CPUS_PER_NODE");
         if (NULL == tasks_per_node) {
             /* couldn't find any version - abort */
-            pmix_show_help("help-ras-slurm.txt", "slurm-env-var-not-found", 1,
+            prte_show_help("help-ras-slurm.txt", "slurm-env-var-not-found", 1,
                            "SLURM_JOB_CPUS_PER_NODE");
             return PRTE_ERR_NOT_FOUND;
         }
@@ -215,7 +228,7 @@ static int prte_ras_slurm_allocate(prte_job_t *jdata, pmix_list_t *nodes)
         tasks_per_node = getenv("SLURM_TASKS_PER_NODE");
         if (NULL == tasks_per_node) {
             /* couldn't find any version - abort */
-            pmix_show_help("help-ras-slurm.txt", "slurm-env-var-not-found", 1,
+            prte_show_help("help-ras-slurm.txt", "slurm-env-var-not-found", 1,
                            "SLURM_TASKS_PER_NODE");
             return PRTE_ERR_NOT_FOUND;
         }
@@ -323,9 +336,13 @@ static pmix_status_t modify(prte_pmix_server_req_t *req)
 
 static int prte_ras_slurm_finalize(void)
 {
+    /* Cancel first: scancel is what gives the resources back, and killing a
+     * salloc child is not */
     prte_ras_slurm_modify_cancel_finalize();
+    prte_ras_slurm_modify_extend_finalize();
     prte_ras_slurm_modify_release_finalize();
     if (NULL != prte_slurm_session_stack) {
+        prte_ras_slurm_drain_session_stack();
         PMIX_RELEASE(prte_slurm_session_stack);
         prte_slurm_session_stack = NULL;
     }
@@ -392,7 +409,7 @@ static int prte_ras_slurm_discover(char *regexp, char *tasks_per_node, pmix_list
         }
         if (i == 0) {
             /* we found a special character at the beginning of the string */
-            pmix_show_help("help-ras-slurm.txt", "slurm-env-var-bad-value", 1, regexp,
+            prte_show_help("help-ras-slurm.txt", "slurm-env-var-bad-value", 1, regexp,
                            tasks_per_node, "SLURM_NODELIST");
             PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
             free(orig);
@@ -409,7 +426,7 @@ static int prte_ras_slurm_discover(char *regexp, char *tasks_per_node, pmix_list
             }
             if (j >= len) {
                 /* we didn't find the end of the range */
-                pmix_show_help("help-ras-slurm.txt", "slurm-env-var-bad-value", 1, regexp,
+                prte_show_help("help-ras-slurm.txt", "slurm-env-var-bad-value", 1, regexp,
                                tasks_per_node, "SLURM_NODELIST");
                 PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
                 free(orig);
@@ -418,7 +435,7 @@ static int prte_ras_slurm_discover(char *regexp, char *tasks_per_node, pmix_list
 
             ret = prte_ras_slurm_parse_ranges(base, base + i + 1, &names);
             if (PRTE_SUCCESS != ret) {
-                pmix_show_help("help-ras-slurm.txt", "slurm-env-var-bad-value", 1, regexp,
+                prte_show_help("help-ras-slurm.txt", "slurm-env-var-bad-value", 1, regexp,
                                tasks_per_node, "SLURM_NODELIST");
                 PRTE_ERROR_LOG(ret);
                 free(orig);
@@ -502,7 +519,7 @@ static int prte_ras_slurm_discover(char *regexp, char *tasks_per_node, pmix_list
         } else if (*endptr == '\0' || j >= num_nodes) {
             break;
         } else {
-            pmix_show_help("help-ras-slurm.txt", "slurm-env-var-bad-value", 1, regexp,
+            prte_show_help("help-ras-slurm.txt", "slurm-env-var-bad-value", 1, regexp,
                            tasks_per_node, "SLURM_TASKS_PER_NODE");
             PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
             free(slots);
@@ -926,6 +943,7 @@ int prte_ras_slurm_assign_new_session(const char *slurm_jobid, const char *user_
         goto cleanup;
     }
 
+    PMIX_RETAIN(session);
     item->session = session;
     item->nodes_in_session = pmix_list_get_size(node_list);
 

@@ -257,6 +257,7 @@ int prte_pmix_server_register_nspace(prte_job_t *jdata,
     prte_pmix_server_pset_t *pset;
     pmix_cpuset_t cpuset;
     uint32_t ui32, *ui32_ptr;
+    uint32_t nodesize;
     prte_job_t *parent = NULL;
     pmix_device_distance_t *distances;
     size_t ndist;
@@ -385,8 +386,15 @@ int prte_pmix_server_register_nspace(prte_job_t *jdata,
             }
             /* pass the node ID */
             PMIX_INFO_LIST_ADD(ret, iarray, PMIX_NODEID, &node->index, PMIX_UINT32);
-            /* add node size */
-            PMIX_INFO_LIST_ADD(ret, iarray, PMIX_NODE_SIZE, &node->num_procs, PMIX_UINT32);
+            /* Add node size. Widen it first: node->num_procs is a
+             * prte_node_rank_t (uint16_t), so handing its address over as
+             * PMIX_UINT32 makes PMIx read four bytes out of a two-byte
+             * field. The extra two are the padding before node->procs -
+             * PMIX_NEW does not zero its allocation - so the value the
+             * client is told is num_procs with heap garbage in its upper
+             * half. */
+            nodesize = node->num_procs;
+            PMIX_INFO_LIST_ADD(ret, iarray, PMIX_NODE_SIZE, &nodesize, PMIX_UINT32);
             /* add local size for this job */
             PMIX_INFO_LIST_ADD(ret, iarray, PMIX_LOCAL_SIZE, &ui32, PMIX_UINT32);
             /* pass the local ldr */
@@ -781,7 +789,7 @@ int prte_pmix_server_register_nspace(prte_job_t *jdata,
                 PMIX_INFO_LIST_ADD(ret, pmap, PMIX_HOSTNAME, pptr->node->name, PMIX_STRING);
             }
             PMIX_INFO_LIST_CONVERT(ret, pmap, &darray);
-            PMIX_INFO_LIST_ADD(ret, info, PMIX_PROC_DATA, &darray, PMIX_DATA_ARRAY);
+            PMIX_INFO_LIST_ADD(ret, info, PMIX_PROC_INFO_ARRAY, &darray, PMIX_DATA_ARRAY);
             PMIX_DATA_ARRAY_DESTRUCT(&darray);
             PMIX_INFO_LIST_RELEASE(pmap);
         }
@@ -851,9 +859,9 @@ int prte_pmix_server_register_tool(prte_pmix_server_req_t *cd,
     int rc;
     uint32_t u32;
     uint16_t u16;
-    prte_job_t *jdata;
+    prte_job_t *jdata, *dmns;
     prte_app_context_t *app;
-    prte_proc_t *proc;
+    prte_proc_t *proc, *dproc;
     prte_node_t *node;
     void *ilist, *joblist;
     pmix_data_array_t darray;
@@ -893,8 +901,20 @@ int prte_pmix_server_register_tool(prte_pmix_server_req_t *cd,
     proc->pid = cd->pid;
     proc->state = PRTE_PROC_STATE_RUNNING;
     pmix_pointer_array_set_item(jdata->procs, 0, proc);
-    // find the node it is on
-    node = (prte_node_t*)pmix_pointer_array_get_item(prte_node_pool, prte_process_info.myproc.rank);
+    // find the node it is on - the tool is on our node, and our node is
+    // whichever one carries our own daemon proc. Our vpid is not a subscript
+    // into the node pool: the pool is indexed by node identity, and in a DVM
+    // that has shrunk the two diverge (a departed daemon's vpid is retired,
+    // its node's pool slot is not).
+    node = NULL;
+    dmns = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
+    if (NULL != dmns) {
+        dproc = (prte_proc_t *) pmix_pointer_array_get_item(dmns->procs,
+                                                            PRTE_PROC_MY_NAME->rank);
+        if (NULL != dproc) {
+            node = dproc->node;
+        }
+    }
     if (NULL == node) {
         PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
         return PRTE_ERR_NOT_FOUND;
