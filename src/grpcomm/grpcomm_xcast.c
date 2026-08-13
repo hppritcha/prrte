@@ -8,7 +8,7 @@
  * Copyright (c) 2014-2020 Intel, Inc.  All rights reserved.
  * Copyright (c) 2014-2017 Research Organization for Information Science
  *                         and Technology (RIST). All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * Copyright (c) 2026      Sandia National Laboratories  All rights reserved.
  * $COPYRIGHT$
  *
@@ -22,6 +22,7 @@
 #include "types.h"
 
 #include <string.h>
+#include <sys/time.h>
 
 #include "src/class/pmix_list.h"
 #include "src/pmix/pmix-internal.h"
@@ -34,11 +35,12 @@
 #include "src/util/nidmap.h"
 #include "src/util/proc_info.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 
-#include "grpcomm_direct.h"
-#include "src/mca/grpcomm/base/base.h"
+#include "grpcomm_internal.h"
+#include "src/grpcomm/grpcomm.h"
 
-#define XCAST prte_mca_grpcomm_direct_component.xcast_ops
+#define XCAST prte_grpcomm_globals.xcast_ops
 
 /* The initiating op created in xcast_nb() is consumed by begin_xcast() (it is
  * packed and relayed to the master, then discarded); the op the master actually
@@ -94,13 +96,13 @@ typedef struct {
     // tag for the underlying user message
     prte_rml_tag_t msg_tag;
     // optional completion callback, fired on the master when the whole DVM has
-    // received this op (see prte_grpcomm_direct_xcast_nb).  NULL when unused.
+    // received this op (see prte_grpcomm_xcast_nb).  NULL when unused.
     prte_grpcomm_xcast_complete_fn_t cbfunc;
     void *cbdata;
 } op_t;
 PMIX_CLASS_DECLARATION(op_t);
 
-// event handler for prte_grpcomm_direct_xcast to safely access global data
+// event handler for prte_grpcomm_xcast to safely access global data
 //   void* = a built op_t*
 static void begin_xcast(int, short, void*);
 // Returns NULL if not found
@@ -111,6 +113,18 @@ static op_t* insert_forwarded_op(signature_t *sig);
 static void forward_op(op_t *op);
 // Forward to specific destination
 static void forward_op_to(op_t *op, pmix_rank_t dest);
+// Pack the forward once, ready to be sent to any number of children.  NULL on
+// failure, already reported
+static prte_rml_payload_t* build_forward_payload(op_t *op);
+// Send an already-packed forward to one destination; the payload is shared,
+// so this takes no ownership of it
+static void forward_payload_to(op_t *op, prte_rml_payload_t *payload,
+                               pmix_rank_t dest);
+// Send-completion callback: a message to a child that never arrives means that
+// subtree's ack is never coming, so stop expecting it
+static void forward_lost(int status, pmix_proc_t *peer,
+                         pmix_data_buffer_t *buffer,
+                         prte_rml_tag_t tag, void *cbdata);
 // Locally process the message being broadcast, if not already done
 static void process_msg(op_t *op);
 // Ack that myself and my full subtree have received this message
@@ -119,9 +133,20 @@ static void send_ack(signature_t* sig, pmix_rank_t ack_id);
 static void request_ack(pmix_rank_t from, signature_t* sig, pmix_rank_t ack_id);
 // Remove local tracking and ack to parent
 static void finish_op(op_t *op);
+// Finish every op that is now both complete and next in op-id order
+static void drive_completions(void);
+// Give up on this op's exchange and get the payload the tree way
+static void tree_whole_forward(op_t *op);
+// How this broadcast will travel - decided by its originator, and only there
+// Is an op ahead of this one in op-id order still waiting on its payload?
 
-// Pack the full xcast message to be forwarded to our children or HNP
+
+// Pack the xcast message forwarded to our children.  Takes no destination:
+// the forward is identical for all of them, which is what lets one packed
+// buffer be shared by every send (see tree_whole_forward)
 static int pack_forward_msg(pmix_data_buffer_t *buffer, op_t *op);
+// Pack the initiating relay from an originator to the controller
+static int pack_relay_msg(pmix_data_buffer_t *buffer, op_t *op);
 // (un)pack components
 static int pack_sig     (pmix_data_buffer_t* buffer, signature_t* sig);
 static int unpack_sig   (pmix_data_buffer_t* buffer, signature_t* sig);
@@ -132,15 +157,15 @@ static int unpack_msg   (pmix_data_buffer_t* buffer, op_t* op);
 static int pack_bool    (pmix_data_buffer_t* buffer, bool* boolean);
 static int unpack_bool  (pmix_data_buffer_t* buffer, bool* boolean);
 
-int prte_grpcomm_direct_xcast(prte_rml_tag_t tag, pmix_data_buffer_t *msg){
-    return prte_grpcomm_direct_xcast_nb(tag, msg, NULL, NULL);
+int prte_grpcomm_xcast(prte_rml_tag_t tag, pmix_data_buffer_t *msg){
+    return prte_grpcomm_xcast_nb(tag, msg, NULL, NULL);
 }
 
-int prte_grpcomm_direct_xcast_nb(prte_rml_tag_t tag, pmix_data_buffer_t *msg,
+int prte_grpcomm_xcast_nb(prte_rml_tag_t tag, pmix_data_buffer_t *msg,
                                  prte_grpcomm_xcast_complete_fn_t cbfunc,
                                  void *cbdata){
-    PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_base_framework.framework_output,
-                         "%s grpcomm:direct:xcast: with %d bytes",
+    PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_globals.output,
+                         "%s grpcomm:xcast: with %d bytes",
                          PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                          (int) msg->bytes_used));
 
@@ -154,12 +179,92 @@ int prte_grpcomm_direct_xcast_nb(prte_rml_tag_t tag, pmix_data_buffer_t *msg,
     op->cbdata = cbdata;
     /* Make a (possibly compressed) copy of this message in a new op - this is
      * non-destructive, so our caller is still responsible for releasing any
-     * memory in the buffer they gave us
-     */
-    op->msg_compressed = (bool) PMIx_Data_compress(
-        (uint8_t*) msg->base_ptr, msg->bytes_used,
-        (uint8_t**) &op->msg.bytes, &op->msg.size
-    );
+     * memory in the buffer they gave us.
+     *
+     * The payload is compressed exactly once, here at the originator, and the
+     * compressed bytes are what every hop forwards; only the local delivery in
+     * process_msg() inflates.  So the sender pays one deflate and each daemon
+     * pays one inflate, off the forwarding path.
+     *
+     * Whether that is worth doing is not a property of the payload's size
+     * alone.  Write M for the payload in bytes, rho for the fraction the
+     * compressor leaves (so 0.5 means it halved it), B for the bandwidth of one
+     * link in bytes/sec, d for the depth of the routing tree and k for its
+     * radix - the number of children a daemon forwards to.  Shrinking the
+     * payload saves (1 - rho) * M / B on every link the broadcast crosses, and
+     * the critical path holds d * k of them, because each of the d levels
+     * serialises k full copies onto one outbound link.  Deflate is linear in M
+     * above a few KB, so writing its cost as M / R for a compressor rate R in
+     * bytes/sec makes M cancel from both sides and leaves
+     *
+     *     compress iff   R  >  B / (d * k * (1 - rho))
+     *
+     * a comparison of two rates, not a size.  A size threshold cannot express
+     * that; it buys only protection from the fixed cost of starting the
+     * compressor and from the poor ratios of tiny inputs, which is worth having
+     * but is the compressor's own business - every pcompress component already
+     * declines an input below its configured limit, and declines any result
+     * that is not actually smaller.  So there is nothing for this layer to add:
+     * hand the payload over and let the component judge it.
+     *
+     * At the scales this runtime is built for the answer is a clear yes.  A
+     * 10000-node DVM at 128 processes per node has d = 3 and k = 64 (the
+     * default radix), so d * k = 192, and its fence release carries the
+     * aggregated modex of 1.28M processes - hundreds of megabytes.  Measured on
+     * a modex-shaped corpus, zstd reaches rho = 0.63 at R = 434 MB/s where
+     * zlib manages 0.65 at 103 MB/s.  Broadcasting 256 MB over 10 Gb/s
+     * (B = 1.25 GB/s): 39 s raw against 20 s compressed, for well under a
+     * second of deflate.  Compression halves it.
+     *
+     * The one thing to keep in mind is that this deflate runs BEFORE the
+     * thread-shift below, so it is serial on the caller's thread - and every
+     * caller is already the progress thread.  At 256 MB the HNP stalls for the
+     * duration, servicing no RML message and no PMIx connection while it works.
+     * The wire time it buys back is larger, so the trade is right, but the cost
+     * lands as one stall rather than as evenly spread bandwidth. */
+    {
+        struct timeval t0, t1;
+        char timing[32];
+
+        timing[0] = '\0';
+        if (prte_grpcomm_globals.enable_timing) {
+            gettimeofday(&t0, NULL);
+        }
+
+        op->msg_compressed = (bool) PMIx_Data_compress(
+            (uint8_t*) msg->base_ptr, msg->bytes_used,
+            (uint8_t**) &op->msg.bytes, &op->msg.size
+        );
+
+        if (prte_grpcomm_globals.enable_timing) {
+            gettimeofday(&t1, NULL);
+            snprintf(timing, sizeof(timing), " in %ld us",
+                     (long) ((t1.tv_sec - t0.tv_sec) * 1000000L
+                             + (t1.tv_usec - t0.tv_usec)));
+        }
+
+        /* What the compressor decided and what it bought - raw size, on-wire
+         * size, and the ratio - for every broadcast, so the line is a complete
+         * census of what a DVM broadcasts rather than only of what it
+         * compressed.  The deflate time is appended only when timing is
+         * enabled; it is the term that has to be weighed against the wire time
+         * saved on every link of the tree. */
+        PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_globals.output,
+                             "%s grpcomm:xcast: tag %u raw %lu wire %lu "
+                             "ratio %.4f %s%s",
+                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                             (unsigned) tag,
+                             (unsigned long) msg->bytes_used,
+                             (unsigned long) (op->msg_compressed ? op->msg.size
+                                                                 : msg->bytes_used),
+                             (0 == msg->bytes_used) ? 1.0
+                                 : (double) (op->msg_compressed ? op->msg.size
+                                                                : msg->bytes_used)
+                                   / (double) msg->bytes_used,
+                             op->msg_compressed ? "compressed" : "uncompressed",
+                             timing));
+    }
+
     if(!op->msg_compressed){
         pmix_data_buffer_t msg_copy;
         PMIx_Data_buffer_construct(&msg_copy);
@@ -186,7 +291,7 @@ int prte_grpcomm_direct_xcast_nb(prte_rml_tag_t tag, pmix_data_buffer_t *msg,
     return PMIX_SUCCESS;
 }
 
-void prte_grpcomm_direct_xcast_recv(
+void prte_grpcomm_xcast_recv(
     int status, pmix_proc_t *sender, pmix_data_buffer_t *buffer,
     prte_rml_tag_t tag, void *cbdata
 ) {
@@ -195,13 +300,20 @@ void prte_grpcomm_direct_xcast_recv(
         // Ignore messages from old parents
         return;
     }
-    PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_base_framework.framework_output,
-                         "%s grpcomm:direct:xcast:recv: with %d bytes",
+    PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_globals.output,
+                         "%s grpcomm:xcast:recv: with %d bytes",
                          PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                          (int) buffer->bytes_used));
 
     signature_t sig;
     if(PMIX_SUCCESS != unpack_sig(buffer, &sig)) return;
+
+    /* An op-id of zero is an originator relaying to the controller, not a
+     * forward down the tree. The distinction decides how the payload that
+     * follows is laid out: the relay always carries it whole, because that hop
+     * is an ordinary point-to-point send even when the broadcast is going to
+     * Capture it before the controller stamps an id
+     * on the signature below. */
 
     // A daemon that has never seen any xcast (op_id_inited == 0) yet is being
     // handed an op is a *late joiner*: a daemon grown into a running DVM, or one
@@ -263,14 +375,12 @@ void prte_grpcomm_direct_xcast_recv(
     op_t* op = find_op(&sig);
     if(NULL == op){
         op = insert_forwarded_op(&sig);
-        if(PMIX_SUCCESS != unpack_msg(buffer, op)){
-            pmix_list_remove_item(&XCAST.ops, &op->super);
-            PMIX_RELEASE(op);
-            return;
-        }
         /* If we are the master and this is one of our own broadcasts, attach the
          * completion callback queued for it in begin_xcast (FIFO).  Remote-origin
-         * broadcasts queue nothing, so they never consume an entry. */
+         * broadcasts queue nothing, so they never consume an entry.  This has to
+         * happen before the unpack below can abandon the op: the FIFO is
+         * positional, so an entry left on it once its broadcast has been dropped
+         * would be handed to the next broadcast the master makes. */
         if(PRTE_PROC_IS_MASTER && NULL != sender &&
            sender->rank == PRTE_PROC_MY_NAME->rank &&
            !pmix_list_is_empty(&XCAST.pending_completions)){
@@ -279,6 +389,11 @@ void prte_grpcomm_direct_xcast_recv(
             op->cbfunc = pc->cbfunc;
             op->cbdata = pc->cbdata;
             PMIX_RELEASE(pc);
+        }
+        if(PMIX_SUCCESS != unpack_msg(buffer, op)){
+            pmix_list_remove_item(&XCAST.ops, &op->super);
+            PMIX_RELEASE(op);
+            return;
         }
     }
 
@@ -290,13 +405,20 @@ void prte_grpcomm_direct_xcast_recv(
 
     if(op->replay_pending_parent){
         forward_op(op);
-        if(0 == prte_rml_base.n_children) finish_op(op);
+        if(op->processed){
+            /* Nothing further to do locally. Settling up may release the op,
+             * so it must be the last thing that touches it - reading
+             * op->processed again afterwards, as this used to, is a read of
+             * freed memory that happened to find the value it wanted. */
+            drive_completions();
+            return;
+        }
     }
     if(op->processed) return;
 
     PMIX_OUTPUT_VERBOSE((
-        1, prte_grpcomm_base_framework.framework_output,
-        "%s grpcomm:direct:xcast:recv: new xcast of tag %u with op_id %lu",
+        1, prte_grpcomm_globals.output,
+        "%s grpcomm:xcast:recv: new xcast of tag %u with op_id %lu",
         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), op->msg_tag, sig.op_id
     ));
 
@@ -316,15 +438,18 @@ void prte_grpcomm_direct_xcast_recv(
     if(process_first){
         process_msg(op);
         forward_op(op);
-        if(0 == prte_rml_base.n_children) finish_op(op);
     } else {
         forward_op(op);
         process_msg(op);
-        if(0 == prte_rml_base.n_children) finish_op(op);
     }
+    /* Settle up last, and never touch the op again: this may finish it, and it
+     * may also finish an op behind it that was waiting on this one's payload.
+     * Under tree_whole it is what the "no children, so ack immediately" call
+     * here always was. */
+    drive_completions();
 }
 
-void prte_grpcomm_direct_xcast_ack(
+void prte_grpcomm_xcast_ack(
     int status, pmix_proc_t *sender, pmix_data_buffer_t *buffer,
     prte_rml_tag_t tag, void *cbdata
 ) {
@@ -365,14 +490,15 @@ void prte_grpcomm_direct_xcast_ack(
         if(NULL == op || op->ack_id_down != ack_id) return;
         op->nreported++;
         if(op->nreported == op->nexpected){
-            finish_op(op);
+            /* The subtree has reported. */
+            drive_completions();
         } else if(op->nreported > op->nexpected){
             PRTE_ERROR_LOG( PRTE_ERR_DUPLICATE_MSG );
         }
     }
 }
 
-void prte_grpcomm_direct_xcast_fault_handler(
+void prte_grpcomm_xcast_fault_handler(
     const prte_rml_recovery_status_t* status
 ) {
     // We must do all xcast handling in the local scope, since reliable xcasts
@@ -383,7 +509,7 @@ void prte_grpcomm_direct_xcast_fault_handler(
         XCAST.op_id_completed_at_promotion =
             XCAST.op_id_completed;
     }
-    if(status->parent_changed || status->promoted){
+    if(status->parent_changed || status->promoted || status->demoted){
         // Avoid confusing new parent by accidentally acking with
         // the valid ack id. They'll tell us what id to use.
         op_t* op;
@@ -391,7 +517,7 @@ void prte_grpcomm_direct_xcast_fault_handler(
             op->ack_id_up = PMIX_RANK_INVALID;
         }
     }
-    if(status->children_changed || status->promoted){
+    if(status->children_changed || status->promoted || status->demoted){
         const pmix_rank_t* prev_children =
             (const pmix_rank_t*) status->prev_children.array;
         const pmix_rank_t* children =
@@ -401,6 +527,9 @@ void prte_grpcomm_direct_xcast_fault_handler(
         op_t* next_op;
         PMIX_LIST_FOREACH_SAFE(op, next_op, &XCAST.ops, op_t){
             if(0 == prte_rml_base.n_children){
+                /* Under tree_whole both tests are constants - every op holds
+                 * its payload and nothing can be blocked - so this is the
+                 * unconditional finish it has always been. */
                 finish_op(op);
                 continue;
             }
@@ -413,9 +542,10 @@ void prte_grpcomm_direct_xcast_fault_handler(
             // If any children have reported back, we have no way of knowing if
             // it was the surviving children or a failed child. So we will need
             // to start a new ack round.
-            // If promoted, avoid late ack arrivals from old children causing
-            // confusion by also starting a new round.
-            bool new_ack_round = op->nreported > 0 || status->promoted;
+            // If promoted/demoted, avoid late ack arrivals from old children
+            // causing confusion by also starting a new round.
+            bool new_ack_round =
+                op->nreported > 0 || status->promoted || status->demoted;
             if(new_ack_round) op->ack_id_down++;
             op->nreported = 0;
 
@@ -431,7 +561,12 @@ void prte_grpcomm_direct_xcast_fault_handler(
             for(size_t i = 0; i < prte_rml_base.children.size; i++){
                 if(PMIX_RANK_INVALID == children[i]){
                     continue;
-                } else if(children[i] != prev_children[i]){
+                } else if(children[i] != prev_children[i] || status->demoted){
+                    // When demoted, we don't know if an old child that followed
+                    // us believed for some short window to have had a different
+                    // parent, which could have caused them to discard the
+                    // original forward. So always replay the op to every child
+                    // when demoted.
                     forward_op_to(op, children[i]);
                 } else if(new_ack_round){
                     request_ack(children[i], &op->sig, op->ack_id_down);
@@ -439,6 +574,18 @@ void prte_grpcomm_direct_xcast_fault_handler(
             }
         }
     }
+
+    /* Any exchange still running has lost a participant, and no rearrangement
+     * of the survivors can produce the block that participant owed. Give up on
+     * it and let the payload come down the repaired tree instead. Done after
+     * the tree work above so the replays it sends go to the new children. */
+    {
+        op_t* op;
+        op_t* next_op;
+        PMIX_LIST_FOREACH_SAFE(op, next_op, &XCAST.ops, op_t){
+        }
+    }
+    drive_completions();
 }
 
 static void begin_xcast(int sd, short args, void* cbdata){
@@ -447,9 +594,10 @@ static void begin_xcast(int sd, short args, void* cbdata){
     op_t* op = (op_t*) cbdata;
     PMIX_ACQUIRE_OBJECT(&op);
 
+
     // setup the payload
     pmix_data_buffer_t *xcast_msg = PMIx_Data_buffer_create();
-    int rc = pack_forward_msg(xcast_msg, op);
+    int rc = pack_relay_msg(xcast_msg, op);
     if (PMIX_SUCCESS != rc) {
         PRTE_ERROR_LOG(rc);
         PMIX_DATA_BUFFER_RELEASE(xcast_msg);
@@ -460,7 +608,7 @@ static void begin_xcast(int sd, short args, void* cbdata){
     /* Record the completion callback for this broadcast now that it is about to
      * go out.  We enqueue one entry per master-originated broadcast, in send
      * order, so the master can pop it (FIFO) when this broadcast is relayed back
-     * to it and it builds the op it tracks (see prte_grpcomm_direct_xcast_recv).
+     * to it and it builds the op it tracks (see prte_grpcomm_xcast_recv).
      * Enqueuing here — immediately before the send, and unwinding on failure —
      * rather than in xcast_nb keeps the FIFO aligned with exactly the broadcasts
      * that were actually emitted, even if a send is abandoned.  This is a general
@@ -510,7 +658,17 @@ static void send_ack_msg(
         return;
     }
 
-    PRTE_RML_SEND(ret, dest, msg, PRTE_RML_TAG_XCAST_ACK);
+    if(is_request){
+        /* A re-poll aimed at a child we cannot reach says exactly what an
+         * undeliverable forward says - no ack is ever coming from that subtree
+         * - so it is tracked the same way.  The upward direction is not: a
+         * failure there is our lifeline, which is the fault machinery's
+         * business and not this op's. */
+        PRTE_RML_SEND_CB(ret, dest, msg, PRTE_RML_TAG_XCAST_ACK,
+                         forward_lost, (void*)(intptr_t) sig->op_id);
+    } else {
+        PRTE_RML_SEND(ret, dest, msg, PRTE_RML_TAG_XCAST_ACK);
+    }
     if(PMIX_SUCCESS != ret){
         PMIX_ERROR_LOG(ret);
         PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_FORCED_EXIT);
@@ -526,6 +684,30 @@ static void send_ack(signature_t* sig, pmix_rank_t ack_id){
 static void request_ack(pmix_rank_t from, signature_t* sig, pmix_rank_t ack_id){
     send_ack_msg(sig, ack_id, true, from);
 }
+
+/* Is this op ready to be settled up - do we hold the payload, and has our
+ * whole subtree reported? */
+static bool op_ready(const op_t* op){
+    return op->nreported >= op->nexpected;
+}
+
+static void drive_completions(void){
+    bool progress = true;
+    while(progress){
+        op_t* op;
+        op_t* next;
+        progress = false;
+        PMIX_LIST_FOREACH_SAFE(op, next, &XCAST.ops, op_t){
+            if(!op_ready(op)) continue;
+            finish_op(op);
+            /* finish_op unlinked and released op, so restart the walk
+             * rather than trust the cursor */
+            progress = true;
+            break;
+        }
+    }
+}
+
 
 static void finish_op(op_t* op) {
     send_ack(&op->sig, op->ack_id_up);
@@ -608,6 +790,16 @@ static int unpack_bool(pmix_data_buffer_t* buffer, bool* boolean){
     return PMIX_SUCCESS;
 }
 
+/* The relay from an originator to the controller.  A point-to-point send; the
+ * receiver tells it from a forward by the op-id, which is zero here and
+ * assigned by the controller. */
+static int pack_relay_msg(pmix_data_buffer_t* buffer, op_t* op){
+    int rc = pack_sig(buffer, &op->sig);
+    if(PMIX_SUCCESS == rc) rc = pack_ack_id(buffer, &op->ack_id_down);
+    if(PMIX_SUCCESS == rc) rc = pack_msg(buffer, op);
+    return rc;
+}
+
 static int pack_forward_msg(pmix_data_buffer_t* buffer, op_t* op){
     int rc = pack_sig(buffer, &op->sig);
     if(PMIX_SUCCESS == rc) rc = pack_ack_id(buffer, &op->ack_id_down);
@@ -649,51 +841,196 @@ static op_t* insert_forwarded_op(signature_t* sig) {
     return op;
 }
 
-static void forward_op(op_t* op){
-    prte_job_t* daemons = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
-    bool skip = prte_get_attribute(&daemons->attributes, PRTE_JOB_DO_NOT_LAUNCH,
-                                   NULL, PMIX_BOOL);
-    if(skip) return;
+/* MOVEMENT: send the whole payload to each routing-tree child.
+ *
+ * Right for a small message, where the cost is the depth of the tree and a
+ * high radix makes that 1 or 2 hops.  Wrong for a large one: a node with r
+ * children serializes r full copies of the payload on its outbound link, at
+ * every level, so the bandwidth term is d*r*M*beta - which is the entire cost
+ * of broadcasting a launch message or a preload chunk at scale.
+ *
+ * The forward is byte-for-byte identical for every child - it carries the
+ * op-id, the ack-id and the payload, none of which depend on the destination -
+ * so it is packed once here and shared by every send.  Packing it per child
+ * cost a full copy of the payload per child, and all of those copies were made
+ * on the progress thread inside this one event callback, before any of them
+ * could reach the wire: at the default radix, 64 copies of a launch message
+ * made and held before the first byte moved.
+ *
+ * That is why pack_forward_msg takes no destination.  If a forward ever does
+ * need to differ per child, this is the loop that has to go back to packing
+ * inside it - the sharing is not an optimization the RML can make on its own. */
+static void tree_whole_forward(op_t* op){
+    pmix_rank_t* children = (pmix_rank_t*) prte_rml_base.children.array;
+    prte_rml_payload_t* payload;
+    size_t i;
+    bool any = false;
 
+    for (i = 0; i < prte_rml_base.children.size; i++) {
+        if (PMIX_RANK_INVALID != children[i]) {
+            any = true;
+            break;
+        }
+    }
+    if (!any) {
+        return;
+    }
+
+    payload = build_forward_payload(op);
+    if (NULL == payload) {
+        return;
+    }
+
+    for (i = 0; i < prte_rml_base.children.size; i++) {
+        if (PMIX_RANK_INVALID == children[i]) {
+            continue;
+        }
+        forward_payload_to(op, payload, children[i]);
+    }
+
+    /* every child that accepted the payload holds its own reference now; drop
+     * ours, so the buffer dies with the last send rather than with this loop */
+    PMIX_RELEASE(payload);
+}
+
+static void forward_op(op_t* op){
+    /* The daemon job object can be gone by the time a broadcast is being
+     * forwarded - teardown retires it while the last xcasts (the halt, the
+     * job-end notifications) are still moving - so this cannot be an
+     * unchecked dereference. Its absence says nothing about whether to
+     * forward; only the do-not-launch attribute does, and without the job
+     * object nobody set it. */
+    prte_job_t* daemons = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
+    if(NULL != daemons &&
+       prte_get_attribute(&daemons->attributes, PRTE_JOB_DO_NOT_LAUNCH,
+                          NULL, PMIX_BOOL)){
+        return;
+    }
+
+    /* A daemon reports its subtree complete once it holds the payload and
+     * all its children have reported. */
     op->replay_pending_parent = false;
     op->nexpected = prte_rml_base.n_children;
     op->nreported = 0;
 
-    /* send the message to each of our children */
-    pmix_rank_t* children = (pmix_rank_t*) prte_rml_base.children.array;
-    for(size_t i = 0; i < prte_rml_base.children.size; i++){
-        if(children[i] == PMIX_RANK_INVALID) continue;
-        forward_op_to(op, children[i]);
-    }
-
-    return;
+    tree_whole_forward(op);
 }
 
-static void forward_op_to(op_t* op, pmix_rank_t dest){
-    pmix_data_buffer_t* xcast_msg = PMIx_Data_buffer_create();
+/* A forward that never arrives is an ack that never comes.
+ *
+ * PRTE_RML_SEND reports only that the message was *queued*: the OOB resolves
+ * the next hop on a later event, and an unreachable one is discovered there
+ * (prte_oob_base_send_nb sets PRTE_ERR_ADDRESSEE_UNKNOWN and completes the
+ * send through this callback).  So the rc check in forward_op_to cannot see
+ * it, and without this the op waits forever on a subtree it never reached.
+ *
+ * That is not a hypothetical.  The routing tree holds daemons that have not
+ * yet reported home - setup_virtual_machine recomputes it at launch
+ * *initiation*, and must, because plm/ssh tree-spawn is driven from it - so
+ * every broadcast issued during a DVM grow forwards to a child there is as yet
+ * no way to reach.  errmgr/dvm deliberately swallows that send failure (it is
+ * not a daemon death), which is right for the daemon and left the op stuck:
+ * the master's op_id_completed stopped advancing, every later broadcast tripped
+ * PRTE_ERR_OUT_OF_ORDER_MSG in finish_op, and anything waiting on the
+ * completion callback - the elastic shrink campaign - waited forever (#2617).
+ *
+ * Dropping the expectation is the answer rather than failing the broadcast,
+ * because a daemon that joins after op N was never going to see op N anyway:
+ * the late-joiner catch-up in insert_forwarded_op has it adopt ops 1..N-1 as
+ * complete when it arrives.  This only makes the sender agree with that.  A
+ * child that genuinely died is a separate story and still takes the fault
+ * handler's path, which recomputes nexpected and starts a fresh ack round. */
+static void forward_lost(int status, pmix_proc_t *peer,
+                         pmix_data_buffer_t *buffer,
+                         prte_rml_tag_t tag, void *cbdata)
+{
+    signature_t sig;
+    op_t *op;
 
-    int rc = pack_forward_msg(xcast_msg, op);
-    if(PMIX_SUCCESS != rc){
-        PRTE_ERROR_LOG(rc);
-        PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_FORCED_EXIT);
-        PMIX_DATA_BUFFER_RELEASE(xcast_msg);
+    sig.op_id = (size_t) (intptr_t) cbdata;
+
+    /* keep the RML's own reporting: what a failed send means for the *daemon*
+     * is the errmgr's call, and unchanged.  We only decide what it means for
+     * this op. */
+    prte_rml_send_callback(status, peer, buffer, tag, NULL);
+
+    if (PRTE_SUCCESS == status) {
+        return;
+    }
+
+    op = find_op(&sig);
+    if (NULL == op) {
+        /* the op finished (or was abandoned) while this send was in flight */
         return;
     }
 
     PMIX_OUTPUT_VERBOSE((
-        5, prte_grpcomm_base_framework.framework_output,
-        "%s grpcomm:direct:send_relay sending relay msg of %d bytes to %s",
-        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), (int) xcast_msg->bytes_used,
-        PRTE_VPID_PRINT(dest)
+        1, prte_grpcomm_globals.output,
+        "%s grpcomm:xcast op %lu never reached %s (%s) - dropping its subtree "
+        "from the ack rollup",
+        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), (unsigned long) sig.op_id,
+        (NULL == peer) ? "someone" : PRTE_NAME_PRINT(peer),
+        PRTE_ERROR_NAME(status)
     ));
 
-    PRTE_RML_SEND(rc, dest, xcast_msg, PRTE_RML_TAG_XCAST);
+    if (0 < op->nexpected) {
+        op->nexpected--;
+    }
+    drive_completions();
+}
+
+/* Pack the forward once.  Returns NULL having already reported the failure -
+ * a forward we cannot build is not something any caller can carry on past. */
+static prte_rml_payload_t* build_forward_payload(op_t* op){
+    pmix_data_buffer_t* xcast_msg = PMIx_Data_buffer_create();
+    prte_rml_payload_t* payload;
+
+    int rc = pack_forward_msg(xcast_msg, op);
     if (PMIX_SUCCESS != rc) {
         PRTE_ERROR_LOG(rc);
         PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_FORCED_EXIT);
         PMIX_DATA_BUFFER_RELEASE(xcast_msg);
+        return NULL;
+    }
+
+    payload = PMIX_NEW(prte_rml_payload_t);
+    payload->dbuf = xcast_msg;
+    return payload;
+}
+
+static void forward_payload_to(op_t* op, prte_rml_payload_t* payload,
+                               pmix_rank_t dest){
+    int rc;
+
+    PMIX_OUTPUT_VERBOSE((
+        5, prte_grpcomm_globals.output,
+        "%s grpcomm:send_relay sending relay msg of %d bytes to %s",
+        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), (int) payload->dbuf->bytes_used,
+        PRTE_VPID_PRINT(dest)
+    ));
+
+    /* The op-id is carried by value rather than by pointer: the send outlives
+     * the op on precisely the paths that matter, so the callback has to be
+     * able to look the op up and find it gone. */
+    PRTE_RML_SEND_PAYLOAD_CB(rc, dest, payload, PRTE_RML_TAG_XCAST,
+                             forward_lost, (void *) (intptr_t) op->sig.op_id);
+    if (PMIX_SUCCESS != rc) {
+        PRTE_ERROR_LOG(rc);
+        PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_FORCED_EXIT);
+        /* a refused send took no reference, so there is nothing to unwind -
+         * the payload is still the caller's to release */
         return;
     }
+}
+
+static void forward_op_to(op_t* op, pmix_rank_t dest){
+    prte_rml_payload_t* payload = build_forward_payload(op);
+
+    if (NULL == payload) {
+        return;
+    }
+    forward_payload_to(op, payload, dest);
+    PMIX_RELEASE(payload);
 }
 
 static void process_wireup(pmix_data_buffer_t *msg){
@@ -702,6 +1039,17 @@ static void process_wireup(pmix_data_buffer_t *msg){
     int ret = prte_util_decode_nidmap(msg);
     if(PMIX_SUCCESS != ret){
        PMIX_ERROR_LOG(ret);
+       PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_FORCED_EXIT);
+       return;
+    }
+
+    /* the jobs already running in this DVM, which we may never have heard of
+     * if we only just joined it. Must be read here, after the nidmap (which
+     * is what binds each daemon to its node) and before the per-daemon
+     * records below, because that loop runs to the end of the buffer. */
+    ret = prte_util_decode_job_catchup(msg);
+    if(PRTE_SUCCESS != ret){
+       PRTE_ERROR_LOG(ret);
        PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_FORCED_EXIT);
        return;
     }
@@ -771,7 +1119,7 @@ static void process_msg(op_t* op){
             (uint8_t**) &decomp_msg.bytes, &decomp_msg.size
         );
         if(!success){
-            pmix_show_help("help-prte-runtime.txt", "failed-to-uncompress",
+            prte_show_help("help-prte-runtime.txt", "failed-to-uncompress",
                            true, prte_process_info.nodename);
             PMIX_BYTE_OBJECT_DESTRUCT(&decomp_msg);
             PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_FORCED_EXIT);

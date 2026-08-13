@@ -37,6 +37,7 @@
 #include "src/util/proc_info.h"
 #include "src/util/session_dir.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 
 #include "src/mca/ess/ess.h"
 #include "src/mca/iof/base/base.h"
@@ -153,7 +154,7 @@ static void prted_abort(int error_code, char *fmt, ...)
     /* use the show-help system to get the message out.  Callers are not
      * required to supply a message, and the help topic has a %s in it, so
      * substitute something printable rather than handing show_help a NULL */
-    pmix_show_help("help-errmgr-base.txt", "simple-message", true,
+    prte_show_help("help-errmgr-base.txt", "simple-message", true,
                    NULL == outmsg ? "(no further information available)" : outmsg);
     if (NULL != outmsg) {
         free(outmsg);
@@ -283,6 +284,13 @@ static void job_errors(int fd, short args, void *cbdata)
 
     switch (jobstate) {
     case PRTE_JOB_STATE_FAILED_TO_START:
+    case PRTE_JOB_STATE_NEVER_LAUNCHED:
+        /* NEVER_LAUNCHED is what odls activates when it could not build this
+         * node's child list at all. The procs it marked failed have no pid
+         * and never will, so they are retired here exactly as a failed start
+         * is - otherwise they sit in prte_local_children forever, and the
+         * daemon's own termination accounting waits on procs that do not
+         * exist. The report below goes out either way. */
         failed_start(jdata);
         break;
     case PRTE_JOB_STATE_COMM_FAILED:

@@ -32,7 +32,7 @@ TCP. If you find such comments, they are cruft — fix them.
 |------|----------------|
 | `rml.h`, `rml_types.h` | Public interface: `PRTE_RML_SEND`/`RECV` macros, RML tags, the `prte_rml_base` global, and the send/recv/posted-recv object types. |
 | `rml.c` | `prte_rml_open`/`close`/`register`; defines the `prte_rml_base` global and all RML class instances; `prte_rml_send_callback`; `prte_rml_is_node_up`. |
-| `rml_send.c` | `prte_rml_send_buffer_nb` (and the `_reliable_nb` variant). Short-circuits sends to self; otherwise hands the message to the OOB. |
+| `rml_send.c` | `prte_rml_send_buffer_nb` (plus the `_reliable_nb` and `_direct_nb` variants). Short-circuits sends to self; otherwise hands the message to the OOB. |
 | `rml_recv.c` | `prte_rml_recv_buffer_nb` / `prte_rml_recv_cancel`. Thread-shifts the request onto the progress thread. |
 | `rml_base_msg_handlers.c` | The heart of matching: `prte_rml_base_post_recv` (add/cancel a posted recv), `prte_rml_base_process_msg` (deliver an arrived message to a posted recv, or hold it in `unmatched_msgs`). |
 | `rml_base_contact.c`, `rml_contact.h` | `prte_rml_parse_uris` — split a contact URI into name + address list. |
@@ -100,6 +100,34 @@ recomputes ancestors, children, and possible self-promotion, packages the delta
 into a `prte_rml_recovery_status_t`, and notifies the RML, grpcomm, filem, and
 relm fault handlers.
 
+### Who tells the errmgr a daemon died — and why depth changes the answer
+
+`PRTE_PROC_STATE_COMM_FAILED` is what makes the HNP act on a departure: mark the
+daemon not-alive, decrement `num_daemons`, print `node-died`, and fail the jobs
+that had procs on it. It is raised in **two** places, and both are needed:
+
+- `prte_mca_oob_tcp_component_lost_connection` — the daemon that actually lost
+  the socket. This is also what drives the HNP's countdown to
+  `DAEMONS_TERMINATED` during a *normal* teardown (the errmgr's
+  `prte_prteds_term_ordered` branch), so it cannot be removed.
+- `prte_rml_recv_failures_notice` — a daemon that only *heard* about the death,
+  for the ranks it had not already recorded.
+
+The second one is easy to think unnecessary, and its absence was a real hang.
+At the default radix a ten-node DVM is **flat**, so the HNP is every daemon's
+parent and is always the one that loses the socket; the first path alone looks
+sufficient. Give the tree any depth and an interior daemon becomes the detector:
+the notice walks up, every daemon (HNP included) correctly marks the rank
+failed — and the HNP, never having lost a socket, never runs the errmgr. The
+dead node's procs are never marked terminated, the job never completes, and its
+tool waits forever. `prun` against a radix-2 DVM hung indefinitely where the
+same DVM at radix 64 released instantly.
+
+Two properties keep the pair from double-reporting: the notice path reports only
+ranks not already in `failed_dmns` (so the detector's own rank, echoed back by
+the HNP's global broadcast, is skipped), and the errmgr independently ignores a
+comm failure for a daemon it has already torn out.
+
 ### The tree layout, precisely
 
 `radix.h` is the whole of the math, and it is worth writing down because the
@@ -158,6 +186,68 @@ is currently failed. Two consequences to keep in mind when editing that helper:
   inheritor, so it can shorten an ancestor list but never grow one — rebuilding
   from base is what makes a revival possible at all.
 
+## Lateral links — sends that deliberately bypass the tree
+
+Everything above describes routed traffic: `prte_rml_get_route` picks the next
+hop and the message walks the tree. That is right for control traffic and
+wrong for a bandwidth-efficient collective, whose exchange partners are chosen
+for their position in the *algorithm* rather than in the tree. At the default
+radix a DVM of ≤65 daemons is flat, so daemon `p` sending to `p+1` would go
+**through the HNP** — funnelling every byte through the one node such an
+algorithm exists to keep out of the path.
+
+`prte_rml_send_buffer_direct_nb()` (macro `PRTE_RML_SEND_DIRECT`) sets a
+`direct` flag on the `prte_rml_send_t`; `prte_oob_base_send_nb` then uses
+`msg->dst` as the hop instead of calling `prte_rml_get_route`. Nothing else
+changes — the peer lookup finds or builds a connection from the target's
+`PMIX_PROC_URI` exactly as it does for a tree neighbour, because the wireup
+xcast gave every daemon every other daemon's URI. If the target's contact info
+is not available the send **falls back to the routed path** rather than
+failing, so a caller never has to handle "no direct route".
+
+Three things about this are load-bearing:
+
+- **A relayed message is never direct.** The relay in
+  `oob_tcp_sendrecv.c` rebuilds the `prte_rml_send_t` field by field, so
+  `direct` stays at its constructor default of `false`. Keep it that way: a
+  message being forwarded by an intermediate hop is by definition being routed.
+- **`send_cons()` must initialise `direct`.** `PMIX_NEW` mallocs, it does not
+  zero, so a field the constructor forgets is heap garbage — here that would be
+  a random subset of messages bypassing the tree.
+- **The fallback clears the flag before retrying**, so it cannot loop, and so
+  the relay bookkeeping stays honest if the message is forwarded later.
+
+### Losing a lateral link is not a routing-tree fault
+
+This is the part that is expensive to get wrong, and it has a single
+choke point. `prte_rml_route_lost` is reached from both
+`prte_mca_oob_tcp_component_lost_connection` and `..._failed_to_connect`, and
+its default action is `prte_rml_repair_routing_tree()` — which marks the peer
+failed, reshapes the tree, and notifies the grpcomm, filem and relm fault
+handlers, ending every in-flight collective in the DVM. Doing that because a
+*lateral* link dropped would be badly wrong: the connection that just died is
+one some collective opened for bandwidth, not a lifeline.
+
+So `prte_rml_base.lateral_links` records the ranks we hold a non-tree link to,
+and `prte_rml_is_lateral_only()` is the single test the fault path uses:
+
+- **Being in the tree wins over being registered.** A collective's exchange
+  partner may happen to *be* our parent or one of our children; losing that
+  connection is a genuine tree fault and must take the repair path. So the
+  predicate answers false for any tree neighbour, registered or not.
+- **A lateral loss is not a death diagnosis.** The gate deregisters the link
+  and tells the registrant (`prte_rml_lateral_set_lost_callback`) so the
+  collective can end or re-plan — and does nothing else. If the peer really
+  died, the daemons for which it *is* a tree neighbour will detect that and the
+  global fault notice arrives the usual way. Declaring it from here would be
+  duplicative, and on a merely dropped socket simply wrong.
+- **`lateral_links` is not re-initialised by `compute_routing_tree`**, for the
+  same reason `dead_dmns` is not: a grow reshapes the tree but does not
+  dissolve the exchange partners a collective is midway through talking to.
+
+`test/unit/rml/test_rml_routing.c::test_lateral_links` pins all of that,
+including the overlap case and survival across a recompute.
+
 ## Elastic DVM and launcher-less bootstrap
 
 The tree is no longer fixed for the life of the DVM. In elastic mode it can
@@ -176,6 +266,28 @@ connection path.
   wipe the failure marks and route to the dead vpid of a shrunk-out daemon
   (#2491). The DVM never reuses a daemon vpid, so a hole in `[0, num_daemons)`
   is permanent.
+
+- **A daemon we LAUNCH is told the departure set on its command line**, by
+  `prte_plm_base_prted_append_basic_args` (`rml_base_dead_dmns`, a
+  range-collapsed list such as `2,7:9` — colon-separated, because every
+  released PMIx refuses an MCA value whose second character is a dash), and
+  adopts it in `prte_rml_open` **before** the first
+  `compute_routing_tree`. That ordering is the whole point and is not a
+  convenience: a newcomer with an empty set computes its lifeline from raw
+  radix math, and if that lands on a retired vpid then everything it sends
+  upward — including the warm-up that requests the nidmap that would correct
+  the set — is addressed to a rank nothing can contact. It never learns, never
+  reports in, and every job placed on it hangs. **So do not "simplify" this
+  into a message.** There is no message early enough; the correction would have
+  to travel over the tree it is meant to correct. `ess_base_num_procs` travels
+  the same way for the same reason — the span and the holes in it are both
+  needed to build the first tree, and both can only arrive at launch.
+
+  Only the daemon whose fault-free parent *is* a retired vpid is stranded, so
+  at the default radix (every daemon's parent is rank 0) nothing goes wrong and
+  the whole class of bug is invisible. The swarm case that covers it therefore
+  forces `rml_base_radix 2` explicitly; a suite run at the default radix does
+  not exercise this at all.
 
 - **A leaving daemon exits on the first lost route.** `prte_rml_route_lost`
   checks `prte_dvm_leaving` first: if this daemon has been named as a shrink
@@ -250,10 +362,21 @@ worth stating rather than re-deriving:
 
 ## Gotchas before you edit
 
-- **Single progress thread.** All RML/OOB state is owned by the progress
-  thread. Cross-thread work uses a *caddy* + `PRTE_PMIX_THREADSHIFT` (see
-  `PRTE_OOB_SEND`, `prte_rml_recv_buffer_nb`). Never read or write shared RML
-  state off that thread, and never block on it.
+- **RML state is owned by the progress thread.** Cross-thread work uses a
+  *caddy* + `PRTE_PMIX_THREADSHIFT` (see `PRTE_OOB_SEND`,
+  `prte_rml_recv_buffer_nb`). Never read or write shared RML state off that
+  thread, and never block on it. The one exception is deliberate and bounded:
+  a peer's *socket* send/recv handlers can be put on a worker progress thread
+  (`prte_oob_progress_threads`, default 0 — off), so that the wire keeps moving
+  while the main thread computes. Everything those handlers hand upward —
+  message delivery, relaying, send completions, the connection state machine —
+  still comes back to `prte_event_base`. See [`oob/AGENTS.md`](oob/AGENTS.md),
+  *Which thread services a peer's socket*, before adding anything to those
+  handlers' reach.
+- **`prte_rml_epoch_ok` runs off the progress thread.** It is called straight
+  from the OOB recv handler, so it - alone in this directory - takes a mutex
+  around the `peer_epochs` table it reallocates. Anything else a socket handler
+  is made to call has to be safe the same way, or has to be thread-shifted.
 - **The wire header is not an ABI.** `prte_oob_tcp_hdr_t` is exchanged only
   among daemons of the *same* DVM, which all run the same build. You may change
   its layout, but every daemon must agree — there is no versioning. It *is*
@@ -289,7 +412,7 @@ There are two layers, and the split is dictated by what needs a live DVM.
 | Binary | Covers |
 |--------|--------|
 | `test_rml` | `prte_oob_split_and_resolve`: turning an if_include/if_exclude string into the interface list the transport binds to. Pure parsing, no socket. |
-| `test_rml_routing` | The radix math (`radix.h`), the routing tree (`compute_routing_tree`, `get_route`, `get_subtree_index`, `get_num_contributors`), the dead/absent-rank restoration across a recompute, the boot-epoch incarnation guard, `prte_rml_purge`, and `prte_rml_parse_uris`. |
+| `test_rml_routing` | The radix math (`radix.h`), the routing tree (`compute_routing_tree`, `get_route`, `get_subtree_index`, `get_num_contributors`), the dead/absent-rank restoration across a recompute, the lateral-link registry and its overlap-with-the-tree rule, the boot-epoch incarnation guard, `prte_rml_purge`, and `prte_rml_parse_uris`. |
 
 `test_rml_routing` stands `prte_rml_base` up by hand rather than calling
 `prte_rml_open` (which would also start listeners), so adding a case is just a

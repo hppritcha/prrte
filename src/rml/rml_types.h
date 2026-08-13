@@ -110,8 +110,24 @@ typedef void (*prte_rml_buffer_callback_fn_t)(int status, pmix_proc_t *peer,
 #define PRTE_RML_TAG_DAEMON_DIED    13
 #define PRTE_RML_TAG_DAEMON_ADOPTED 14
 
+/* The launch message, split off PRTE_RML_TAG_DAEMON so that what a broadcast
+ * IS can be read from its tag.
+ *
+ * It is delivered to the same handler as PRTE_RML_TAG_DAEMON and carries the
+ * same command byte - nothing about the receiving side changes. The tag exists
+ * to make the message's purpose declarable at the point it is sent, because
+ * that is what lets grpcomm choose a data movement by what the message is
+ * rather than by guessing from how big it happens to be. PRTE_RML_TAG_DAEMON
+ * was the only overloaded broadcast tag, and this was the only large thing
+ * on it. */
+#define PRTE_RML_TAG_DAEMON_LAUNCH 18
+
 #define PRTE_RML_TAG_XCAST         15
 #define PRTE_RML_TAG_XCAST_ACK     16
+/* The bulk broadcast's allgather phase, and the request to abandon it.  Kept
+ * off PRTE_RML_TAG_XCAST because these travel over lateral links between
+ * daemons that are not tree neighbours, while everything on the XCAST tag is
+ * from a parent and is discarded if it is not. */
 
 /* For FileM Base */
 #define PRTE_RML_TAG_FILEM_BASE      21
@@ -129,6 +145,10 @@ typedef void (*prte_rml_buffer_callback_fn_t)(int status, pmix_proc_t *peer,
 /* collectives */
 #define PRTE_RML_TAG_FENCE_RELEASE     31
 #define PRTE_RML_TAG_FENCE             33
+/* A fence's lateral allgather.  Separate from PRTE_RML_TAG_FENCE because
+ * these arrive from exchange partners rather than from a routing-tree child,
+ * and the rollup receiver rejects anything that is not in one of its
+ * subtrees. */
 
 /* debugger release */
 #define PRTE_RML_TAG_DEBUGGER_RELEASE 37
@@ -187,6 +207,10 @@ typedef void (*prte_rml_buffer_callback_fn_t)(int status, pmix_proc_t *peer,
 #define PRTE_RML_TAG_DAEMON_RETURNED      80
 #define PRTE_RML_TAG_DAEMON_REVIVED       81
 
+/* a daemon's rendered show_help text, on its way to the HNP - see
+ * src/util/prte_show_help.c for why a prted cannot emit its own */
+#define PRTE_RML_TAG_SHOW_HELP            82
+
 #define PRTE_RML_TAG_MAX                 100
 
 #define PRTE_RML_TAG_NTOH(t) ntohl(t)
@@ -214,6 +238,35 @@ typedef struct {
 } prte_rml_recv_cb_t;
 PMIX_CLASS_DECLARATION(prte_rml_recv_cb_t);
 
+/* A payload that several sends transmit without any of them owning it.
+ *
+ * The ordinary send owns its buffer: exactly one prte_rml_send_t points at a
+ * pmix_data_buffer_t and disposes of it when the send completes.  That is the
+ * right rule for point-to-point traffic and the wrong one for a broadcast,
+ * where the same bytes go to every routing-tree child.  Building one buffer
+ * per child costs a full copy of the payload per child, all of it on the
+ * progress thread and all of it ahead of the first byte reaching the wire -
+ * at the default radix that is 64 identical copies of a launch message the
+ * daemon then sends 64 times.
+ *
+ * A payload is a reference-counted wrapper around one such buffer.  Each send
+ * that accepts it takes its own reference and drops it on completion; the
+ * originator drops the reference it got from PMIX_NEW once it has handed the
+ * payload to everyone it means to.  The buffer dies with the last reference,
+ * whichever send that turns out to be.
+ *
+ * Nothing about the transport had to change to allow this: the OOB reads
+ * base_ptr/bytes_used and keeps all of its per-destination progress
+ * (sdptr/sdbytes/hdr_sent) in the send object, so several sends can read one
+ * buffer concurrently.  The one rule is the obvious one - a shared payload is
+ * immutable from the moment it is first handed to a send.
+ */
+typedef struct {
+    pmix_object_t super;
+    pmix_data_buffer_t *dbuf;
+} prte_rml_payload_t;
+PRTE_EXPORT PMIX_CLASS_DECLARATION(prte_rml_payload_t);
+
 /* structure to send RML messages - used internally */
 typedef struct {
     pmix_list_item_t super;
@@ -229,6 +282,11 @@ typedef struct {
 
     /* data buffer */
     pmix_data_buffer_t *dbuf;
+    /* When non-NULL, dbuf is this payload's buffer and is NOT owned by this
+     * send: the send holds a reference to the payload instead, dropped in the
+     * destructor, and completion hands the callback no buffer to dispose of.
+     * NULL for every ordinary send, which owns its dbuf outright. */
+    prte_rml_payload_t *payload;
     /* msg seq number */
     uint32_t seq_num;
     /* boot epoch (incarnation) of the origin. Defaults to this process's own
@@ -236,6 +294,13 @@ typedef struct {
      * original sender's epoch, copied from the received wire header. Lets a
      * hop drop traffic from a stale incarnation of a rebooted bootstrap rank. */
     uint64_t epoch;
+    /* Send straight to dst rather than to the next hop the routing tree would
+     * pick.  A bandwidth-efficient collective exchanges with partners that are
+     * not its tree neighbours, and routing those exchanges through the tree
+     * would funnel them via the root - which is exactly the bottleneck such a
+     * collective exists to avoid.  Only ever set for a peer whose contact info
+     * we can obtain; the send falls back to the routed path if we cannot. */
+    bool direct;
 } prte_rml_send_t;
 PRTE_EXPORT PMIX_CLASS_DECLARATION(prte_rml_send_t);
 

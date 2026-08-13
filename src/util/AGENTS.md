@@ -34,6 +34,7 @@ linked into `libprrte`. There are no MCA components here.
 | **Tool option values** | `prte_cmd_line.[ch]` | Value interpreters more than one tool needs (`--pid`, `--app`, the daemon umask). See [`src/tools/AGENTS.md`](../tools/AGENTS.md). |
 | **Bootstrap** | `prte_bootstrap.[ch]` | Reading `prte.conf` for a launcher-less DVM. |
 | **Process plumbing** | `daemon_init.c`, `sys_limits.[ch]`, `stacktrace.[ch]`, `ethtool.[ch]` | Daemonizing, `setrlimit`, the crash handler, and the Linux interface-speed ioctl. |
+| **Help delivery** | `prte_show_help.[ch]` | `prte_show_help()` — a drop-in for `pmix_show_help()` that works on a **daemon**. See below. |
 | **Generated** | `prte_show_help_content.c`, `prte-convert-help.py` | Every `help-*.txt` in the tree, compiled in. **Never edit the generated file.** |
 
 ---
@@ -162,6 +163,64 @@ up and PRRTE must not.
 
 ---
 
+## The nidmap
+
+`prte_util_nidmap_create()` packs, and `prte_util_decode_nidmap()` unpacks,
+four lockstep lists — node name, aliases, daemon vpid, and the node's slot in
+the sender's `prte_node_pool` — plus the *span* of the daemon vpid space. It
+is sent to every daemon whenever the DVM's membership changes, so a daemon
+decodes it **many times**, and each decode has to leave the daemon's view
+equal to the master's:
+
+- **The pool slot travels on the wire because it is the node's identity.**
+  It is the `PMIX_NODEID` a daemon hands its local clients, and the subscript
+  the `PMIX_SERVER_URI` query resolves a nodeid through. It is *not* the
+  position in the packed list: the sender skips nodes that have no daemon, so
+  after a shrink the packed sequence is compacted while the pool is not, and
+  a receiver that used the packed position renamed one node's entry into
+  another's and gave two machines one nodeid. It is not the daemon's vpid
+  either — a shrink retires a vpid permanently but leaves the node's slot.
+- **Every decode rebinds, it does not just fill gaps.** A node's daemon
+  changes (grow, shrink, re-grow), so `nd->daemon` and
+  `daemons->procs[vpid]` are (re)established on every pass, releasing the
+  reference the node held. Binding only newly-created entries made every
+  decode after the first a no-op, which is how a daemon that predated a grow
+  never learned the new daemon existed — and `odls` resolves the parent of
+  *every* proc in a job, not just its own, so that daemon launched nothing
+  and the master, which had no such gap, waited forever (#2616).
+- **A node the sender did not name has lost its daemon** and its backpointer
+  is cleared, mirroring what the master did to its own pool on the shrink.
+
+`prte_util_pack_job_catchup()` / `prte_util_decode_job_catchup()` ride in the
+same message, immediately after the nidmap. They carry **the jobs already
+running in the DVM** — a daemon that has just joined never saw their launch
+messages and so cannot resolve their namespaces. They live beside the nidmap
+because they answer the same question, *what does the DVM currently consist
+of*, and because that message is sent on exactly the event that changes the
+answer. Three things about them:
+
+- **The job being launched is excluded.** A daemon that already holds a
+  namespace *drops* the copy in the launch message, so a catch-up entry for
+  a job that has not been mapped yet would leave every daemon holding a
+  procless version of it for good.
+- **The procs' placement comes out of `prte_job_pack`'s own maps.** It
+  packs a node map and a proc map per app, from which the receiver rebuilds
+  each proc's rank and hosting daemon; the catch-up needs nothing of its own
+  for that, and the launch message used to pack the parent vpid a second
+  time alongside. It does mean this decode has to run **after** the nidmap
+  in the same message, since that is what puts the nodes in the pool.
+- **The decode registers each new namespace with the local PMIx server and
+  does not wait.** Nothing later in the message depends on it, and the
+  launch message that might care cannot have been built yet — the master
+  sends this at `VM_READY` and the launch message several states later.
+
+This replaced a block at the head of the launch message, which tied that
+message's size to the number of jobs resident in the DVM and still left a
+daemon added by a bare elastic grow knowing nothing, since a grow launches no
+job and therefore sends no launch message.
+
+---
+
 ## `prte_process_info`
 
 A single global, filled in by `prte_setup_hostname()` and `prte_proc_info()`.
@@ -197,6 +256,54 @@ the modex match the names found locally.
 Not unit-testable, and deliberately left to the live smoke test: `session_dir`
 (creates directories under the real `$TMPDIR`), `stacktrace` (installs signal
 handlers), `daemon_init` (forks), and `nidmap` (needs a populated DVM).
+
+`nidmap` in particular needs a DVM that has **changed size**, and a job that
+**spans a daemon which predates the change** — a one-proc job lands on the
+master, whose copy of the map is authoritative and never decoded. That is the
+elastic grow/shrink/grow case in `contrib/dockerswarm/run-tests.sh`.
+
+---
+
+## `prte_show_help()` — because `pmix_show_help()` does not work on a daemon
+
+`pmix_show_help()` renders correctly everywhere and **delivers nowhere on
+a `prted`.** It hands the rendered text to PMIx's `plog` framework, and
+`plog/stdfd` writes its own `stderr` only when the caller is a PMIx
+*client or tool*. A daemon is a PMIx *server*, so it takes the other
+branch, which passes the text to `PMIx_server_IOF_deliver()` tagged with
+the daemon's own identity — and nothing has an IOF sink for a daemon's
+own output. The message is built and thrown away. The head node looks
+fine only because there the daemon's PMIx server is the one holding the
+tool connection (and under `prterun` it *is* the tool).
+
+`prte_show_help()` has the same signature and the same rendering, and:
+
+- on the **HNP**, on a **tool**, or in an **application**, delivers
+  locally, exactly as `pmix_show_help()` would;
+- on any **other daemon**, renders locally and ships the text to the HNP
+  over `PRTE_RML_TAG_SHOW_HELP`, where `prte_show_help_recv()` delivers
+  it. Aggregation and duplicate suppression then happen **once**, on the
+  HNP, keyed by the same filename/topic — which is what you want anyway
+  when 500 nodes hit the same error.
+- falls back to local delivery if there is no HNP to send to yet (early
+  startup, or teardown), so a message is never simply lost.
+
+**The whole tree is converted** — every one of the ~420 call sites that
+used to say `pmix_show_help(` now says `prte_show_help(`, so a plain
+`grep` for the PMIx spelling in a `.c` file should come back empty. A new
+`pmix_show_help()` is therefore a message that will be invisible off the
+head node, and nothing will tell you: no warning, no error, just silence
+on 999 nodes out of 1000. Use `prte_show_help()` everywhere. It is
+identical outside a daemon, so there is no case where the PMIx spelling
+is the better choice.
+
+(`pmix_show_help_string()` and `pmix_show_help_norender()` are different
+functions with different signatures and are untouched; `prte_show_help()`
+is built on top of them.)
+
+`prte-convert-help.py` recognizes both spellings when it scans for help
+citations, so converting a call site does not remove it from the
+help-file cross-check.
 
 ---
 

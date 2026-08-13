@@ -103,6 +103,9 @@ ONT() { docker exec -e PRTE_ALLOW_RUN_AS_ROOT=1 -e PRTE_ALLOW_RUN_AS_ROOT_CONFIR
 # rendezvous file of its own, and killing it is the point of a teardown.
 SWARM_CLEAN='
     for t in prted prte prterun prun pterm; do pkill -9 -x $t 2>/dev/null; done
+    # the CPU burners the PMIx-churn phases raise (see load_on): harmless if
+    # none are running, and leaving one behind would slow every later phase
+    pkill -9 -x yes 2>/dev/null
     rm -rf /tmp/prte.* /tmp/prted.* /tmp/prtrn.* /tmp/prun.* /tmp/ompi.* \
            /tmp/pmix.* 2>/dev/null
     find /tmp -maxdepth 2 -name "pmix.*" -prune -exec rm -rf {} + 2>/dev/null
@@ -147,24 +150,6 @@ pmix_cap() {
           grep -qs $1 \"\$p/include/pmix_version.h\"" >/dev/null 2>&1
 }
 
-# --- fake-SLURM helpers -----------------------------------------------------
-# ras/slurm reaches its scheduler by shelling out to sbatch/scontrol/scancel,
-# so the harness supplies them: build.sh installs fake-slurm.py into the shared
-# volume under its own prefix, and everything in that phase runs with that
-# prefix FIRST on PATH and the SLURM_* envars exported.  Nothing outside these
-# helpers sees either, which is what keeps the rest of the suite unaffected.
-FS_BIN=/opt/prte/fakeslurm/bin
-# run on the head node inside a faked SLURM allocation
-SL() { docker exec -e PRTE_ALLOW_RUN_AS_ROOT=1 -e PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
-           "${NODE}1" bash -lc ". /opt/prte/env.sh; export PATH=$FS_BIN:\$PATH;
-                                eval \"\$(fake-slurm env)\"; $*"; }
-# run a fake-slurm housekeeping command (no SLURM_* env needed)
-FS() { docker exec "${NODE}1" bash -lc "export PATH=$FS_BIN:\$PATH; fake-slurm $*"; }
-# "node2,node4" -> "2 4", for prted_count
-fs_idx() { echo "$1" | tr ',' '\n' | sed 's/^node//' | tr '\n' ' '; }
-# the sbatch argv that created a given fake job
-fs_args() { FS "args $1" 2>/dev/null; }
-
 # --- bootstrap-DVM helpers --------------------------------------------------
 # A bootstrapped DVM is configured by <sysconfdir>/prte.conf, which lives in the
 # install the swarm shares.  The node containers mount that volume READ-ONLY, so
@@ -195,398 +180,6 @@ bootstrap_start() {
             "$NODE$n" bash -lc '. /opt/prte/env.sh; prted --bootstrap > /tmp/boot.out 2>&1'
     done
     sleep 14
-}
-
-########################################################################
-# ras/slurm, against the fake scheduler (fake-slurm.py)
-########################################################################
-#
-# Everything ras/slurm does beyond reading SLURM_NODELIST is a shell-out --
-# sbatch to grow, "scontrol show job --json" to learn what it got, "scontrol
-# update job ReqNodeList=" to shrink one, scancel to give one back -- so none
-# of it can run on a developer machine and none of it had any coverage.  The
-# unit test covers the half that only reads the environment (query, allocate);
-# this covers the other half.  It is also the only place the ~1000-line JSON
-# parser is even COMPILED: jansson defaults to off, and this harness is the
-# one automated build that passes --with-jansson.
-#
-# The DVM runs in the foreground under "docker exec -d" rather than
-# --daemonize because several cases assert on what the HNP printed (a
-# scheduler error PRRTE captured and reported), and a daemonized HNP detaches
-# from stdio.
-# Allocation semantics: what a scheduler allocation means to the DVM once
-# ras/slurm has read it. Distinct from test_slurm() below, which drives the
-# elastic modify surface -- these cases never grow or shrink anything, they
-# just ask whether an allocation PRRTE was handed is the allocation PRRTE
-# uses. A real scheduler is the only other way to ask, which is why none of
-# this was ever covered.
-#
-# start a DVM on node1 inside the current fake allocation.  $1 = extra args
-slurm_dvm_start() {
-    SL 'rm -f /tmp/prte.out' >/dev/null 2>&1
-    docker exec -d -e PRTE_ALLOW_RUN_AS_ROOT=1 -e PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
-        "${NODE}1" bash -lc ". /opt/prte/env.sh; export PATH=$FS_BIN:\$PATH;
-            eval \"\$(fake-slurm env)\"; cd /root &&
-            prte --prtemca ras_base_verbose 5 $* >/tmp/prte.out 2>&1"
-    sleep 8
-    SL 'pgrep -x prte >/dev/null'
-}
-
-test_slurm_alloc() {
-    local out n
-
-    banner "ras/slurm: a multi-node allocation forms the whole DVM"
-    # Nobody passes --host under a scheduler: the allocation IS the node
-    # list. A DVM that launches only where the user named launches nowhere.
-    cleanup_swarm
-    if ! FS 'init --jobid 1000 --base node1,node2,node3 --tasks 2 \
-                  --pool node4,node5' >/dev/null 2>&1; then
-        skp "fake SLURM stubs missing from the shared volume -- rerun ./build.sh"
-        return
-    fi
-    if ! slurm_dvm_start; then
-        bad "no DVM came up on the 3-node allocation: $(SL 'tail -5 /tmp/prte.out' | tr '\n' ' ')"
-        cleanup_swarm; return
-    fi
-    [ "$(prted_count 2 3)" = 2 ] \
-        && ok "daemons launched on every allocated node, with no --host given" \
-        || bad "the allocation did not form the DVM ($(prted_count 2 3)/2 daemons)"
-    # count DISTINCT nodes: three procs that all landed on node1 is exactly
-    # the failure being tested for, and would pass a line count
-    out=$(SL 'timeout 60 prun -n 3 --map-by node hostname' 2>&1)
-    n=$(echo "$out" | grep -E '^node[0-9]+$' | sort -u | wc -l | tr -d ' ')
-    [ "$n" = 3 ] && ok "a job maps across the whole allocation" \
-                 || bad "job did not spread over the allocation ($n/3 distinct): $(echo "$out" | tr '\n' ' ')"
-
-    banner "ras/slurm: the slot count SLURM gave is the slot count PRRTE uses"
-    # SLURM_TASKS_PER_NODE says 2. A node whose count came from the scheduler
-    # must not be re-sized from its core count -- that is what turns a
-    # 2-slot node into an 8-slot one and hides oversubscription.
-    out=$(SL 'timeout 30 prun --display allocation -n 1 hostname' 2>&1)
-    n=$(echo "$out" | grep -cE '^[[:space:]]*node[123]:[[:space:]]+slots=2[[:space:]]')
-    [ "$n" = 3 ] && ok "all three nodes kept slots=2 from SLURM_TASKS_PER_NODE" \
-                 || bad "slot counts were recomputed ($n/3 kept): $(echo "$out" | grep -E 'node[0-9]+:' | tr '\n' ' ')"
-
-    banner "ras/slurm: --host selects within the allocation, and only within it"
-    out=$(SL 'timeout 30 prun --host node2 -n 1 hostname' 2>&1 | tail -1)
-    [ "$(echo "$out" | tr -d '\r')" = node2 ] \
-        && ok "--host picks an allocated node" \
-        || bad "--host node2 did not run there: $out"
-    # a node outside the allocation must be refused, not silently dropped:
-    # --add-host is the sanctioned way to bring one in
-    out=$(SL 'timeout 30 prun --host node9 -n 1 hostname 2>&1 | tr -d "\0"')
-    echo "$out" | grep -q 'Missing requested host: node9' \
-        && ok "--host outside the allocation is refused, naming the host" \
-        || bad "--host node9 was not refused: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
-    # a bare integer is never a hostname: it names the launch id, so "3"
-    # has to resolve to node3
-    out=$(SL 'timeout 30 prun --host 3 -n 1 hostname' 2>&1 | tail -1)
-    [ "$(echo "$out" | tr -d '\r')" = node3 ] \
-        && ok "--host 3 resolved to node3 by launch id" \
-        || bad "launch-id shorthand did not resolve: $out"
-    SL 'timeout -k 5 30 pterm' >/dev/null 2>&1
-    cleanup_swarm
-
-    banner "ras/slurm: an allocation that excludes the head node"
-    # prte runs on node1, but SLURM allocated node2 and node3 only. The head
-    # node is in the pool (it always is) yet is not usable, so a job must map
-    # only onto the allocation and naming node1 must be an error rather than
-    # a quiet fall-back onto an unallocated machine.
-    FS 'init --jobid 1000 --base node2,node3 --tasks 2 --pool node4,node5' >/dev/null
-    if slurm_dvm_start; then
-        [ "$(prted_count 2 3)" = 2 ] \
-            && ok "daemons launched on the allocation, not on the head node" \
-            || bad "head-node-excluded allocation did not form ($(prted_count 2 3)/2)"
-        out=$(SL 'timeout 60 prun -n 2 --map-by node hostname' 2>&1)
-        n=$(echo "$out" | grep -E '^node[23]$' | sort -u | wc -l | tr -d ' ')
-        { [ "$n" = 2 ] && ! echo "$out" | grep -qE '^node1$'; } \
-            && ok "the job ran only on allocated nodes" \
-            || bad "job leaked onto the unallocated head node: $(echo "$out" | tr '\n' ' ')"
-        out=$(SL 'timeout 30 prun --host node1 -n 1 hostname 2>&1 | tr -d "\0"')
-        echo "$out" | grep -q 'Missing requested host: node1' \
-            && ok "--host naming the unallocated head node is refused" \
-            || bad "the unallocated head node was not refused: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
-        # "+n#" counts the ALLOCATION from zero, so with the head node left
-        # out of it, +n0 is the first node the job was actually given. A
-        # hostfile has to agree with --host about that: the head node still
-        # occupies pool slot 0, and the hostfile filter was the one relative
-        # -index implementation that did not skip it, so every index it
-        # resolved was one node adrift of the same index on the command line.
-        out=$(SL 'timeout 30 prun --host +n0 -n 1 hostname 2>&1 | tr -d "\0"' | grep -E '^node[0-9]+$' | head -1)
-        SL 'printf "+n0\n" > /tmp/relhosts.txt'
-        n=$(SL 'timeout 30 prun --hostfile /tmp/relhosts.txt -n 1 hostname 2>&1 | tr -d "\0"' | grep -E '^node[0-9]+$' | head -1)
-        { [ "$out" = node2 ] && [ "$n" = node2 ]; } \
-            && ok "+n0 is the allocation's first node for both --host and a hostfile" \
-            || bad "relative index disagrees across entry points (--host=$out hostfile=$n, want node2 for both)"
-        SL 'timeout -k 5 30 pterm' >/dev/null 2>&1
-    else
-        bad "no DVM came up on an allocation excluding the head node"
-    fi
-    cleanup_swarm
-}
-
-test_slurm() {
-    local jid nodes idx out n sargs seg
-
-    banner "ras/slurm: faked SLURM allocation discovered at DVM startup"
-    cleanup_swarm
-    if ! FS 'init --jobid 1000 --base node1 --tasks 2 \
-                  --pool node2,node3,node4,node5,node6,node7,node8,node9' >/dev/null 2>&1; then
-        skp "fake SLURM stubs missing from the shared volume -- rerun ./build.sh"
-        return
-    fi
-    SL 'rm -f /tmp/prte.out /tmp/pwned' >/dev/null 2>&1
-    docker exec -d -e PRTE_ALLOW_RUN_AS_ROOT=1 -e PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
-        "${NODE}1" bash -lc ". /opt/prte/env.sh; export PATH=$FS_BIN:\$PATH;
-            eval \"\$(fake-slurm env)\"; cd /root &&
-            prte --prtemca prte_elastic_mode 1 --prtemca ras_base_verbose 5 \
-                 >/tmp/prte.out 2>&1"
-    sleep 8
-    if ! SL 'pgrep -x prte >/dev/null'; then
-        bad "no DVM came up under the faked SLURM allocation: $(SL 'tail -5 /tmp/prte.out' | tr '\n' ' ')"
-        cleanup_swarm; return
-    fi
-    out=$(SL 'timeout 30 prun --display allocation -n 1 hostname' 2>&1)
-    echo "$out" | grep -qE '^[[:space:]]*node1:[[:space:]]+slots=' \
-        && ok "the DVM allocation came from SLURM_NODELIST" \
-        || bad "SLURM allocation not discovered: $(echo "$out" | tr '\n' ' ')"
-    # SLURM_NODELIST=node1 with SLURM_TASKS_PER_NODE="2(x1)": the compressed
-    # form has to expand to one node carrying two slots.  Assert that against
-    # what the component itself reports (ras_base_verbose) rather than the
-    # pool, so a parsing error here is not confused with anything the launch
-    # path does to the number afterwards -- test_slurm_alloc covers that end
-    # of it.
-    SL 'grep -q "discover: adding node node1 (2 slots)" /tmp/prte.out' \
-        && ok "SLURM_TASKS_PER_NODE '2(x1)' expanded to node1 with 2 slots" \
-        || bad "nodelist/tasks-per-node expansion wrong: $(SL 'grep -m3 "adding node" /tmp/prte.out' | tr '\n' ' ')"
-
-    banner "ras/slurm: PMIX_ALLOC_EXTEND runs sbatch and grows the DVM"
-    # PMIX_ALLOC_EXTEND + PMIX_ALLOC_NUM_NODES is the only extend shape this
-    # component accepts: which nodes it gets back is the scheduler's choice,
-    # so the request names a count and the answer comes from the job JSON.
-    out=$(SL 'timeout 120 elastic extend 2' 2>&1)
-    jid=$(echo "$out" | sed -n 's/^>>> ALLOC_ID \([0-9][0-9]*\).*/\1/p' | head -1)
-    if [ -z "$jid" ]; then
-        bad "extend did not report an allocation id: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
-        printf '    HNP: %s\n' "$(SL 'tail -3 /tmp/prte.out' | tr '\n' ' ')"
-        SL 'timeout -k 5 30 pterm' >/dev/null 2>&1; cleanup_swarm; return
-    fi
-    ok "extend accepted and reported PMIX_ALLOC_ID=$jid (RM=slurm)"
-    nodes=$(FS "nodes $jid" | tr -d '\r')
-    idx=$(fs_idx "$nodes")
-    sleep 10
-    # shellcheck disable=SC2086
-    [ "$(prted_count $idx)" = 2 ] \
-        && ok "daemons launched on the nodes SLURM granted ($nodes)" \
-        || bad "no daemons on the granted nodes ($nodes) -- the grow never reached them"
-    # The extend puts its nodes in the GENERAL pool (ras/slurm deliberately
-    # leaves node->session NULL), unlike a reservation-creating grow -- so a
-    # plain prun must be able to map onto them.
-    out=$(SL 'timeout 60 prun -n 3 --map-by node hostname' 2>&1)
-    n=$(echo "$out" | grep -E '^node[0-9]+$' | sort -u | wc -l | tr -d ' ')
-    [ "$n" = 3 ] && ok "a plain prun maps onto the extended allocation (3 nodes)" \
-                 || bad "prun did not reach the extended nodes ($n/3 distinct): $(echo "$out" | tr '\n' ' ')"
-    # Slots come from counting the cores whose status is ALLOCATED (2) times
-    # threads_per_core, capped by cpus.count -- the fake job deliberately
-    # reports an UNALLOCATED core as well and a much larger cpus.count, so
-    # only a parser that reads core statuses arrives at 2.
-    SL "grep -q 'add_modified_resources: discovered node ${nodes%%,*} with 2 slots' /tmp/prte.out" \
-        && ok "slots derived from ALLOCATED cores, capped by cpus.count" \
-        || bad "wrong slot count from the job JSON: $(SL 'grep -m3 discovered.node /tmp/prte.out' | tr '\n' ' ')"
-
-    banner "ras/slurm: the parent job's attributes are propagated onto sbatch"
-    sargs=$(fs_args "$jid")
-    for want in --parsable --exclusive --nodes=2 --account=prrte-test \
-                --partition=debug --qos=normal --chdir=/root --mem=1024 \
-                --time=60 --threads-per-core=1; do
-        echo "$sargs" | grep -qx -- "$want" \
-            && ok "sbatch carried $want" \
-            || bad "sbatch missing $want (got: $(echo "$sargs" | tr '\n' ' '))"
-    done
-    # memory_per_cpu is unset in the parent job, and an unset numeric object
-    # must be omitted rather than sent as a sentinel
-    echo "$sargs" | grep -q -- '--mem-per-cpu' \
-        && bad "sbatch sent --mem-per-cpu for an unset memory_per_cpu" \
-        || ok "an unset numeric field is omitted from the sbatch line"
-
-    banner "ras/slurm: releasing one node shrinks the SLURM job in place"
-    # Removing SOME of a job's nodes keeps the job and resizes it with
-    # "scontrol update job <id> ReqNodeList=<survivors>", then re-reads the
-    # JSON to detach the departed nodes from the session.
-    out=$(SL "timeout 120 elastic shrink ${nodes##*,}" 2>&1)
-    sleep 5
-    echo "$out" | grep -q PMIX_DVM_IS_READY \
-        && ok "partial release completed (PMIX_DVM_IS_READY)" \
-        || bad "partial release never completed: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
-    # shellcheck disable=SC2086
-    [ "$(prted_count $(fs_idx "${nodes##*,}"))" = 0 ] \
-        && ok "daemon gone from the released node (${nodes##*,})" \
-        || bad "daemon still running on the released node"
-    FS audit | grep -q "scontrol update job $jid ReqNodeList=${nodes%%,*}" \
-        && ok "job $jid resized to its survivors via scontrol update" \
-        || bad "no scontrol resize was issued: $(FS audit | tr '\n' ' ' | tail -c 200)"
-    [ "$(FS "nodes $jid" | tr -d '\r')" = "${nodes%%,*}" ] \
-        && ok "the SLURM job kept exactly its surviving node" \
-        || bad "job $jid node list wrong after resize: $(FS "nodes $jid")"
-    [ -z "$(SL 'find / -maxdepth 2 -name "slurm_job_*_resize.*" 2>/dev/null')" ] \
-        && ok "the resize helper scripts SLURM left behind were cleaned up" \
-        || bad "slurm_job_*_resize.* left behind after a shrink"
-
-    banner "ras/slurm: releasing a whole allocation scancels its SLURM job"
-    out=$(SL "timeout 120 elastic release-id $jid" 2>&1)
-    sleep 5
-    echo "$out" | grep -q PMIX_DVM_IS_READY \
-        && ok "release by allocation id completed" \
-        || bad "release-id never completed: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
-    # shellcheck disable=SC2086
-    [ "$(prted_count $idx)" = 0 ] && ok "both granted nodes left the DVM" \
-                                  || bad "a daemon survived the full release"
-    FS audit | grep -q "scancel $jid" && ok "scancel issued for job $jid" \
-                                      || bad "the SLURM job was never cancelled"
-    FS jobs | grep -qx "$jid" && bad "job $jid still exists after scancel" \
-                             || ok "job $jid is gone from the scheduler"
-    out=$(SL 'timeout 30 prun -n 1 hostname' 2>&1 | tail -1)
-    [ "$(echo "$out" | tr -d '\r')" = node1 ] \
-        && ok "DVM still responsive after the release" \
-        || bad "DVM wedged after the release: $out"
-
-    banner "ras/slurm: release by node COUNT picks the newest allocation"
-    # Re-extending reuses the pool entries the release left behind (daemon-less
-    # nodes PRRTE already knows), which is a different code path from the
-    # first-time grant above.
-    out=$(SL 'timeout 120 elastic extend 2' 2>&1)
-    jid=$(echo "$out" | sed -n 's/^>>> ALLOC_ID \([0-9][0-9]*\).*/\1/p' | head -1)
-    nodes=$(FS "nodes $jid" | tr -d '\r'); idx=$(fs_idx "$nodes")
-    sleep 10
-    # shellcheck disable=SC2086
-    [ -n "$jid" ] && [ "$(prted_count $idx)" = 2 ] \
-        && ok "re-extend reused the released node objects ($nodes)" \
-        || bad "re-extend did not bring the nodes back ($nodes)"
-    out=$(SL 'timeout 120 elastic release 2' 2>&1)
-    sleep 5
-    echo "$out" | grep -q PMIX_DVM_IS_READY \
-        && ok "release by count completed" \
-        || bad "release by count never completed: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
-    # shellcheck disable=SC2086
-    [ "$(prted_count $idx)" = 0 ] && ok "the counted release emptied the newest allocation" \
-                                  || bad "a daemon survived the counted release"
-    FS audit | grep -q "scancel $jid" \
-        && ok "the whole SLURM job was cancelled rather than resized" \
-        || bad "count release did not scancel job $jid"
-    # the base allocation must survive: it holds the node PRRTE is running on
-    FS jobs | grep -qx 1000 && ok "the DVM's own SLURM job was left alone" \
-                            || bad "the release took out the base allocation"
-
-    banner "ras/slurm: a pending extend can be cancelled by request id"
-    # PMIX_ALLOC_REQ_CANCEL is served while the extend's poll loop is still
-    # waiting on a PENDING SLURM job: cancelling drops the pending record and
-    # scancels the job, and the next poll turns that into a failed request.
-    FS 'set pending_secs 45' >/dev/null
-    SL 'nohup timeout 120 elastic extend 1 --req-id slow-req \
-            >/tmp/extend.out 2>&1 & sleep 2' >/dev/null 2>&1
-    sleep 6
-    jid=$(FS jobs | grep -v '^1000$' | tail -1 | tr -d '\r')
-    if [ -n "$jid" ]; then
-        ok "extend submitted job $jid and is waiting for it to start"
-        SL 'timeout 60 elastic cancel slow-req' >/dev/null 2>&1
-        sleep 6
-        FS audit | grep -q "scancel $jid" \
-            && ok "the cancelled request scancelled its pending SLURM job" \
-            || bad "cancel did not reach the scheduler"
-        SL 'grep -q "REJECTED\|FAILURE" /tmp/extend.out' \
-            && ok "the waiting extend reported failure to its requester" \
-            || bad "the cancelled extend never answered: $(SL 'tr "\n" " " < /tmp/extend.out' | tail -c 200)"
-    else
-        bad "the pending extend never submitted a job"
-    fi
-    FS 'set pending_secs 0' >/dev/null
-    out=$(SL 'timeout 30 prun -n 1 hostname' 2>&1 | tail -1)
-    [ "$(echo "$out" | tr -d '\r')" = node1 ] \
-        && ok "DVM still responsive after the cancellation" \
-        || bad "DVM wedged after the cancellation: $out"
-
-    banner "ras/slurm: unparsable scheduler JSON fails the request, not the DVM"
-    # The HNP runs this parser, so a malformed scontrol response must come
-    # back as a refused request rather than a dead DVM.
-    FS 'set bad_json 1' >/dev/null
-    out=$(SL 'timeout 60 elastic extend 1' 2>&1)
-    FS 'set bad_json 0' >/dev/null
-    echo "$out" | grep -q 'REJECTED' \
-        && ok "an extend on unparsable JSON was refused" \
-        || bad "malformed scheduler JSON was not refused: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
-    SL 'pgrep -x prte >/dev/null' && ok "HNP survived the malformed JSON" \
-                                  || bad "HNP died parsing malformed JSON"
-
-    banner "ras/slurm: a node name that is not a hostname never reaches a shell"
-    # Every hostname bound for an scontrol/scancel command line goes through
-    # prte_ras_slurm_validate_hostname's allowlist first.  This one carries a
-    # command separator: it must be refused outright, and nothing may run.
-    out=$(SL "timeout 60 elastic shrink 'node9;touch /tmp/pwned'" 2>&1)
-    echo "$out" | grep -q 'REJECTED' \
-        && ok "a release naming a tainted hostname was refused" \
-        || bad "tainted hostname not refused: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
-    SL 'test -e /tmp/pwned' \
-        && bad "the injected command RAN -- hostname validation is not holding" \
-        || ok "the injected command never ran"
-    SL 'pgrep -x prte >/dev/null' && ok "HNP survived the tainted request" \
-                                  || bad "HNP died on a tainted hostname"
-
-    banner "ras/slurm: a failing scancel is reported, truncated, and survived"
-    # prte_ras_slurm_drain_cmd_output() captures the scheduler's complaint
-    # into a fixed buffer and marks it "..." when it does not fit.  The fake
-    # scancel fails with far more output than that buffer holds.
-    FS 'set scancel_fail 1' >/dev/null
-    out=$(SL 'timeout 120 elastic extend 1' 2>&1)
-    jid=$(echo "$out" | sed -n 's/^>>> ALLOC_ID \([0-9][0-9]*\).*/\1/p' | head -1)
-    sleep 8
-    if [ -n "$jid" ]; then
-        SL "timeout 120 elastic release-id $jid" >/dev/null 2>&1
-        sleep 5
-        seg=$(SL "awk '/failed to kill job/,0' /tmp/prte.out")
-        echo "$seg" | grep -q "failed to kill job $jid" \
-            && ok "the scancel failure was reported with the scheduler's text" \
-            || bad "a failing scancel went unreported"
-        { echo "$seg" | grep -q '\.\.\.' && ! echo "$seg" | grep -q '(line 11)'; } \
-            && ok "the oversized scheduler message was truncated with '...'" \
-            || bad "scheduler output was not truncated: $(echo "$seg" | tr '\n' ' ' | tail -c 200)"
-        SL 'pgrep -x prte >/dev/null' && ok "HNP survived a scancel failure" \
-                                      || bad "HNP died when scancel failed"
-    else
-        bad "could not submit the job for the scancel-failure case"
-    fi
-    FS 'set scancel_fail 0' >/dev/null
-    SL 'timeout -k 5 30 pterm' >/dev/null 2>&1
-    cleanup_swarm
-
-    banner "ras/slurm: propagate_* MCA params gate what reaches sbatch"
-    # Each propagated attribute has its own switch; turning two off must drop
-    # exactly those two arguments and leave the rest of the line intact.
-    FS 'init --jobid 1000 --base node1 --tasks 2 --pool node2,node3' >/dev/null
-    docker exec -d -e PRTE_ALLOW_RUN_AS_ROOT=1 -e PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
-        "${NODE}1" bash -lc ". /opt/prte/env.sh; export PATH=$FS_BIN:\$PATH;
-            eval \"\$(fake-slurm env)\"; cd /root &&
-            prte --prtemca prte_elastic_mode 1 --prtemca ras_slurm_propagate_qos 0 \
-                 --prtemca ras_slurm_propagate_time 0 >/tmp/prte.out 2>&1"
-    sleep 8
-    if SL 'pgrep -x prte >/dev/null'; then
-        out=$(SL 'timeout 120 elastic extend 1' 2>&1)
-        jid=$(echo "$out" | sed -n 's/^>>> ALLOC_ID \([0-9][0-9]*\).*/\1/p' | head -1)
-        sargs=$(fs_args "$jid")
-        if [ -n "$jid" ]; then
-            { ! echo "$sargs" | grep -q -- '--qos'; } && { ! echo "$sargs" | grep -q -- '--time'; } \
-                && ok "propagate_qos/propagate_time=0 dropped their sbatch args" \
-                || bad "a disabled attribute still reached sbatch: $(echo "$sargs" | tr '\n' ' ')"
-            echo "$sargs" | grep -qx -- '--account=prrte-test' \
-                && ok "the attributes still enabled were unaffected" \
-                || bad "disabling two attributes disturbed the rest of the line"
-        else
-            bad "extend failed under the propagate_* overrides: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
-        fi
-        SL 'timeout -k 5 30 pterm' >/dev/null 2>&1
-    else
-        bad "could not start a DVM with the propagate_* overrides"
-    fi
-    cleanup_swarm
 }
 
 ########################################################################
@@ -1850,9 +1443,34 @@ test_runtime() {
 # Absolute path -- an app launched into the DVM inherits the daemon PATH,
 # which does not contain the install bindir.  See the note on $DS.
 PT=/opt/prte/prte/bin/proctable
+# ...and the client that asks a peer where it is, for the same reason.
+PI=/opt/prte/prte/bin/peerinfo
+
+# Cross-check one peerinfo run.  Every rank prints a SELF line about itself
+# and a PEER line about each of the others, in the same field order, so the
+# assertion is a string compare: what rank r was told about rank p must be
+# what rank p says about itself.  Prints nothing when the run is consistent,
+# and one line per disagreement otherwise.
+peerinfo_mismatches() {
+    echo "$1" | tr -d '\r' | awk '
+        $1 == "SELF" { r = $2; s = ""; for (i = 3; i <= NF; i++) { s = s " " $i }
+                       self[r] = s; next }
+        $1 == "PEER" { n++; who[n] = $2 " about " $3; tgt[n] = $3;
+                       s = ""; for (i = 4; i <= NF; i++) { s = s " " $i }
+                       got[n] = s; next }
+        END {
+            for (k = 1; k <= n; k++) {
+                if (!(tgt[k] in self)) {
+                    print "rank " who[k] ": that rank printed no SELF line"
+                } else if (got[k] != self[tgt[k]]) {
+                    print "rank " who[k] ": got [" got[k] " ] but it says [" self[tgt[k]] " ]"
+                }
+            }
+        }'
+}
 
 test_pmix() {
-    local out rc n hosts undef
+    local out rc n hosts undef peers lazyout eagerout mism a b vrb
 
     banner "pmix: the queried proc table carries a real state for every proc"
     # PMIX_QUERY_PROC_TABLE is the only caller of prte_pmix_convert_state(),
@@ -1993,7 +1611,11 @@ test_pmix() {
     else
         out=$(PRUN "--host node1:1 -n 1 $PT serveruri node2" 2>&1)
         u=$(echo "$out" | grep -m1 '^URI ' | awk '{print $2}' | tr -d '\r')
-        n2ip=$(docker exec prte-node2 hostname -i 2>/dev/null | awk '{print $1}' | tr -d '\r')
+        # ${NODE}2, not a hardcoded "prte-node2": every global name this
+        # harness claims is derived from $PRTE_SWARM (see docker-compose.yml),
+        # so a literal here asks a DIFFERENT swarm - or nothing at all - for
+        # the address, and the case fails against an unrelated container's IP
+        n2ip=$(docker exec "${NODE}2" hostname -i 2>/dev/null | awk '{print $1}' | tr -d '\r')
         if [ -z "$u" ]; then
             bad "no server URI for node2 with remote connections on: $(echo "$out" | grep -E '^ERR' | tr '\n' ' ' | tail -c 200)"
         elif echo "$u" | grep -q '127\.0\.0\.1'; then
@@ -2050,6 +1672,113 @@ test_pmix() {
             fi
         fi
         RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    fi
+    cleanup_swarm
+
+    banner "pmix: a rank can locate every peer in its job, on any node"
+    # This is the one case in the suite where a process asks about ANOTHER
+    # process's reserved keys.  Everything else either puts its own data and
+    # reads it back, or asks about the job rather than about a peer -- and
+    # both of those are satisfied without the request ever reaching a daemon.
+    #
+    # It matters because of what the daemon may legitimately not have
+    # published.  Registering a PMIx entry for every proc in the job, on every
+    # daemon, builds a table that grows with the whole job on a node that runs
+    # a fixed slice of it, so prte_pmix_lazy_procdata publishes only the procs
+    # this daemon hosts and derives the rest from its own job object when
+    # somebody asks.  The derivation is reached through the direct-modex
+    # up-call, which is a path no single-host run has: on one node every proc
+    # is local and there is nothing to derive.
+    #
+    # The assertion is a cross-check rather than a spot value, because the
+    # interesting failure is not "no answer" but "a plausible wrong answer" --
+    # a derived field taken from the wrong proc still prints.  Every rank says
+    # what it thinks about itself and about each of its peers, and the two
+    # accounts of any given rank must agree word for word.
+    cleanup_swarm
+    if ! RUN "test -x $PI"; then
+        skp "peerinfo client not installed -- re-run ./build.sh"
+    elif ! prted_dvm_start 'node1:2,node2:2,node3:2,node4:2'; then
+        bad "could not start a DVM for the peer-lookup tests"
+        cleanup_swarm
+    else
+        peers="--host node1:2,node2:2,node3:2,node4:2 -n 8 --map-by node"
+        lazyout=$(PRUN "$peers $PI" 2>&1)
+        n=$(echo "$lazyout" | grep -c '^PEERINFO-DONE')
+        [ "$n" = 8 ] \
+            && ok "all 8 ranks completed their peer lookups" \
+            || bad "$n of 8 ranks finished: $(echo "$lazyout" | tr '\n' ' ' | tail -c 400)"
+        n=$(echo "$lazyout" | grep -c '^PEERFAIL')
+        [ "$n" = 0 ] \
+            && ok "...with no lookup failing" \
+            || bad "$n peer lookups failed: $(echo "$lazyout" | grep '^PEERFAIL' | tr '\n' ' ' | tail -c 400)"
+        # 8 ranks each describing the other 7
+        n=$(echo "$lazyout" | grep -c '^PEER ')
+        [ "$n" = 56 ] \
+            && ok "...and all 56 peer descriptions were produced" \
+            || bad "got $n of 56 peer descriptions"
+        # ...and the run has to actually span nodes, or a green result here
+        # says nothing: every answer would have come from local publication.
+        hosts=$(echo "$lazyout" | awk '$1=="SELF"' | tr -d '\r' | awk '{print $(NF-2)}' | sort -u | grep -c '^node')
+        [ "${hosts:-0}" -ge 2 ] \
+            && ok "...across $hosts nodes (so the peers really are remote)" \
+            || bad "the job did not span nodes -- this case would be vacuous"
+        mism=$(peerinfo_mismatches "$lazyout")
+        [ -z "$mism" ] \
+            && ok "...and every rank's account of a peer matches that peer's own" \
+            || bad "peer descriptions disagree: $(echo "$mism" | head -3 | tr '\n' ' ' | tail -c 500)"
+
+        # Note what that comparison already is: a SELF line is what the
+        # proc's OWN daemon published about it -- which a daemon does for
+        # its own procs either way -- while the PEER lines about it are what
+        # other daemons derived.  So the check above is the A/B, run inside
+        # one job where the offsets and the mapping are fixed.  Comparing
+        # two separate runs would not be: a second job has a different
+        # PMIX_GLOBAL_RANK offset, so the tables legitimately differ.
+        #
+        # The same job with the derivation off is therefore a control on the
+        # client rather than a second reading: it must pass here too, or a
+        # failure above says nothing about the derivation.
+        eagerout=$(PRUN "$peers --prtemca prte_pmix_lazy_procdata 0 $PI" 2>&1)
+        mism=$(peerinfo_mismatches "$eagerout")
+        n=$(echo "$eagerout" | grep -c '^PEERFAIL')
+        if [ -z "$mism" ] && [ "$n" = 0 ]; then
+            ok "eager publication (prte_pmix_lazy_procdata 0) passes the same check"
+        else
+            bad "the check fails with the derivation off, so it is not testing the derivation: $(echo "$mism" | head -2 | tr '\n' ' ' | tail -c 400)"
+        fi
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    fi
+    cleanup_swarm
+
+    banner "pmix: the derivation is actually what answered"
+    # Consistency alone cannot tell the two implementations apart -- a
+    # derivation that never ran would leave the eager publication answering
+    # and every check above would still pass.  So watch the daemon say it.
+    # This has to be prterun rather than a prun into a standing DVM: the
+    # verbosity is a daemon-side setting, and only the launch that starts the
+    # daemons can carry it.  --leave-session-attached because a daemonized
+    # prted has no stderr to read.
+    if ! RUN "test -x $PI"; then
+        skp "peerinfo client not installed -- re-run ./build.sh"
+    else
+        vrb="--leave-session-attached --prtemca prte_pmix_server_verbose 2"
+        out=$(RUN "timeout -k 5 150 prterun --host node1:2,node2:2,node3:2,node4:2 \
+                     -n 8 --map-by node $vrb $PI" 2>&1)
+        n=$(echo "$out" | grep -c 'ANSWERED LOCALLY')
+        [ "${n:-0}" -gt 0 ] \
+            && ok "a daemon answered $n peer lookups out of its own job object" \
+            || bad "no lookup was answered by the derivation -- the path did not run: $(echo "$out" | grep -c 'DMODX REQ') dmodex requests seen"
+        n=$(echo "$out" | grep -c '^PEERFAIL')
+        [ "$n" = 0 ] \
+            && ok "...and none of the lookups failed" \
+            || bad "$n lookups failed while the derivation was in use"
+        # ...and with it off, nothing may claim to have derived anything.
+        out=$(RUN "timeout -k 5 150 prterun --host node1:2,node2:2,node3:2,node4:2 \
+                     -n 8 --map-by node $vrb --prtemca prte_pmix_lazy_procdata 0 $PI" 2>&1)
+        echo "$out" | grep -q 'ANSWERED LOCALLY' \
+            && bad "the derivation ran even though prte_pmix_lazy_procdata was 0" \
+            || ok "prte_pmix_lazy_procdata 0 turns the derivation off completely"
     fi
     cleanup_swarm
 }
@@ -3224,6 +2953,7 @@ test_hwloc() {
 
 # Absolute path, deliberately -- see the note above DS.
 GC=/opt/prte/prte/bin/groupcon
+FENCER=/opt/prte/prte/bin/fencer
 
 test_grpcomm() {
     local out n g ranks hosts fails
@@ -3329,6 +3059,45 @@ test_grpcomm() {
     [ "$n" = 3 ] \
         && ok "...and the DVM still launches an ordinary job afterwards" \
         || bad "the DVM did not run a plain job after the group tests ($n of 3)"
+
+    banner "grpcomm: a requested membership order is applied on every daemon"
+    # PMIX_GROUP_FINAL_MEMBERSHIP_ORDER is one of two construct directives
+    # that hand the DVM an array of procs, and that array belongs to the PMIx
+    # server which delivered the upcall -- PMIx frees it, arrays and all, once
+    # the operation completes.  The daemon has to COPY it into the group
+    # signature, whose destructor frees what it holds; pointing at it instead
+    # is a double free of live heap on every daemon that had a local
+    # participant.  So this case is as much about the DVM being alive
+    # afterwards as it is about the order.
+    #
+    # The order asked for is the ranks reversed, because that is the one
+    # answer the DVM cannot arrive at by accident: with no order given it
+    # sorts the membership itself, so a directive that was dropped on the
+    # floor is indistinguishable from the default unless the order is a
+    # permutation the sort would never produce.
+    out=$(PRUN "--host node1:2,node2:2,node3:2,node4:2 -n 8 --map-by node $GC --order g5" 2>&1)
+    n=$(echo "$out" | grep -c 'CONSTRUCT PMIX_SUCCESS')
+    [ "$n" = 8 ] \
+        && ok "all 8 ranks constructed a group with a final order" \
+        || bad "$n of 8 ranks constructed the ordered group: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+    n=$(echo "$out" | awk '$1=="GRP" && $3=="ORDER" {print $4}' | sort -u | wc -l | tr -d ' ')
+    g=$(echo "$out" | awk '$1=="GRP" && $3=="ORDER" {print $4; exit}')
+    if [ "$n" != 1 ]; then
+        bad "daemons returned $n different membership orders"
+    elif [ "$g" = "7,6,5,4,3,2,1,0" ]; then
+        ok "...and every daemon returned the reversed order that was asked for"
+    else
+        bad "the requested order was not applied (got '${g:-nothing}')"
+    fi
+    ranks=$(echo "$out" | grep -c 'CID-OK 8')
+    [ "$ranks" = 8 ] \
+        && ok "...with the whole membership still readable from each rank" \
+        || bad "only $ranks of 8 ranks read back a full set after ordering"
+    out=$(PRUN "--host node1:1,node2:1,node3:1 -n 3 --map-by node hostname" 2>&1)
+    n=$(echo "$out" | grep -c '^node')
+    [ "$n" = 3 ] \
+        && ok "...and every daemon that carried the order is still running" \
+        || bad "the DVM lost a daemon to the ordered construct ($n of 3)"
 
     RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
     cleanup_swarm
@@ -3573,6 +3342,8 @@ test_grpcomm_ft() {
     cleanup_swarm
 }
 
+
+
 ########################################################################
 # src/mca/errmgr -- what happens when a process or a daemon fails.
 #
@@ -3602,6 +3373,157 @@ FLT=/opt/prte/prte/bin/faulty
 # A daemon installs no handlers of its own for those signals, so there is
 # nothing ess-specific left to assert here.
 ########################################################################
+
+PMIXLOOP=/opt/prte/prte/bin/pmixloop
+
+# LOAD IS NOT AN OPTIMIZATION FOR THE TWO PHASES BELOW, IT IS THE EXPERIMENT.
+# Both of them chase a race between one rank opening its next collective and
+# its peers finalizing the last one, and on an idle machine that race simply
+# does not run: measured against a library with BOTH fixes removed, an idle
+# host is clean at 100, 400 and even 800 iterations -- 4 of 4 ranks done, not
+# one bad return, no abort -- while the same library under 3x oversubscription
+# aborts at 100. So iterations cannot substitute for load, and a phase that
+# quietly lost these burners would keep passing while testing nothing.
+#
+# 3x the core count is what the macOS investigation needed too. The burners
+# live on node1 but every container shares the one host kernel, so this loads
+# the whole swarm; SWARM_CLEAN reaps them as a backstop if a phase dies early.
+load_on()  { docker exec -d "${NODE}1" sh -c \
+                 'n=$(nproc); i=0; while [ "$i" -lt $((n*3)) ]; do yes > /dev/null & i=$((i+1)); done'; }
+load_off() { docker exec "${NODE}1" sh -c 'pkill -9 -x yes; true' >/dev/null 2>&1; }
+
+test_pmix_cycling() {
+    local out n bad_n
+
+    banner "PMIx cycling: repeated Init/fence/Finalize stays in step (openpmix#4113)"
+    # A client that cycles PMIx_Init / fence / PMIx_Finalize -- which is what
+    # an MPI Sessions application does, one cycle per MPI_Session_init -- used
+    # to drift apart by whole cycles and eventually wedge.  A rank that
+    # dropped its socket through PMIx_Finalize was recorded on the fence
+    # tracker's "departed" list even though it had NOT left the accounting
+    # (nlocalprocs is deliberately not decremented for it and its peer object
+    # is tombstoned, precisely so it can Init again and contribute).  Counting
+    # it twice let the NEXT cycle's fence complete without it, and from there
+    # the ranks are out of step: mid-run fences return PMIX_ERR_PARTIAL_SUCCESS
+    # / PMIX_ERR_LOST_CONNECTION / PMIX_ERR_INVALID_ARG and the run eventually
+    # hangs outright.  openpmix#4113, fixed by openpmix PR #4124.
+    #
+    # TWO THINGS DECIDE WHETHER THIS CASE HAS TEETH, and both are easy to
+    # "simplify" away:
+    #
+    #  - AT LEAST TWO RANKS MUST SHARE A DAEMON.  The defect is in one PMIx
+    #    server's own tracker accounting: it takes two ranks finalizing cycle N
+    #    to satisfy, between them, the expected count of a fence that a faster
+    #    peer has already opened for cycle N+1.  At one rank per node there is
+    #    no such pair, and the unfixed library passes this case 5 times out of
+    #    5 -- measured, not assumed.  So do NOT rewrite these as --map-by node
+    #    one-per-host.
+    #  - THE MACHINE MUST BE LOADED.  See load_on(): idle, the unfixed library
+    #    passes this at 100, 400 and 800 iterations alike.  Under load it
+    #    fails at 100.  Dropping the burners to speed the suite up would leave
+    #    both phases passing and testing nothing.
+    #
+    # Against the unfixed library and under load, the first shape aborts or
+    # hangs every time, with hundreds of non-success returns -- so this is a
+    # real regression guard rather than a smoke test.
+    cleanup_swarm
+    if ! RUN "test -x $PMIXLOOP"; then
+        skp "pmixloop client not installed -- re-run ./build.sh"
+        return
+    fi
+    load_on
+
+    # 4 ranks on ONE node: every rank is local to one PMIx server, which is
+    # the arrangement the issue was reported against (its own harness runs
+    # under simptest, where that is the only arrangement there is).
+    out=$(RUN "timeout -k 10 240 prterun --host node1:4 -n 4 $PMIXLOOP 100" 2>&1)
+    n=$(echo "$out" | grep -c ALLDONE)
+    [ "$n" = 4 ] \
+        && ok "4 ranks on one node each completed 100 Init/fence/Finalize cycles" \
+        || bad "$n of 4 ranks finished cycling (a hang is the classic symptom): $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+    # Assert on the tally rather than on the absence of an error line: a run
+    # that hung produces no error lines either, and would otherwise pass.
+    bad_n=$(echo "$out" | grep -oE '(fence1_bad|fence2_bad|init_bad|fini_bad)=[0-9]+' \
+            | cut -d= -f2 | awk '{s+=$1} END {print s+0}')
+    [ "$bad_n" = 0 ] \
+        && ok "...with no fence returning a non-success status" \
+        || bad "$bad_n non-success returns from the fences: $(echo "$out" | grep -m3 'rc=-' | tr '\n' ' ')"
+
+    # 8 ranks over two nodes, 4 per node: still two ranks per server, so the
+    # local accounting is exercised exactly as above, but now the fence is a
+    # real PRRTE collective between daemons rather than one PMIx server
+    # talking to itself.  That combination is what no single host can test.
+    out=$(RUN "timeout -k 10 240 prterun --host node1:4,node2:4 -n 8 --map-by node $PMIXLOOP 100" 2>&1)
+    n=$(echo "$out" | grep -c ALLDONE)
+    [ "$n" = 8 ] \
+        && ok "8 ranks over 2 nodes completed cycling with a host-mediated fence" \
+        || bad "$n of 8 ranks finished cycling across nodes: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+    bad_n=$(echo "$out" | grep -oE '(fence1_bad|fence2_bad|init_bad|fini_bad)=[0-9]+' \
+            | cut -d= -f2 | awk '{s+=$1} END {print s+0}')
+    [ "$bad_n" = 0 ] \
+        && ok "...with no fence returning a non-success status" \
+        || bad "$bad_n non-success returns from the fences: $(echo "$out" | grep -m3 'rc=-' | tr '\n' ' ')"
+    load_off
+    cleanup_swarm
+}
+
+test_pmix_server_teardown() {
+    local out rc
+
+    banner "PMIx server teardown: heavy client churn leaves a sane heap (openpmix#4112)"
+    # The subject here is the SERVER, not the client.  A collective the host
+    # never sees is finished by calling the tracker's own completion function,
+    # which only thread-shifts -- so on return the tracker is still on
+    # pmix_server_globals.collectives and still satisfies trk_complete(), and
+    # for that window anything walking the list sees a collective that looks
+    # complete and unclaimed.  A second driver (in practice the
+    # lost-connection sweep, firing as ranks finalize right after a fence)
+    # completes it again: two handlers unlink and release the same tracker,
+    # the second reading and re-releasing what the first freed.  The corrupted
+    # list outlives the event, so the abort surfaces far away -- typically as
+    # an invalid free inside PMIX_LIST_DESTRUCT(&collectives) in
+    # PMIx_server_finalize, which is why openpmix#4112 reads as a teardown bug
+    # and only reproduces after heavy connect/disconnect churn.  Fixed by
+    # openpmix PR #4127.
+    #
+    # THE JOB MUST NOT BE SPREAD ACROSS NODES.  The window exists only for a
+    # collective the host never sees -- a strictly local fence, the ordinary
+    # case under fence_localonly_opt.  Give the job two nodes and the fence
+    # goes up to PRRTE, host_called is set, and the case tests nothing.  That
+    # is the opposite constraint from most of this file, so it is stated here
+    # rather than left to be rediscovered.
+    #
+    # AND THE MACHINE MUST BE LOADED, for the same reason as the phase above
+    # and to the same degree -- see load_on().  Idle, the unfixed library is
+    # clean here however many iterations it is given.
+    #
+    # What is asserted is prterun's own exit and output: the HNP hosts these
+    # ranks itself and finalizes its PMIx server on the way out, so it is the
+    # process that aborts.  Measured against a library with the fix removed
+    # (and under load): 10 of 10 runs abort with "malloc(): unsorted double
+    # linked list corrupted", and under valgrind the invalid free lands in
+    # PMIx_server_finalize at an address inside pmix_server_globals.
+    cleanup_swarm
+    if ! RUN "test -x $PMIXLOOP"; then
+        skp "pmixloop client not installed -- re-run ./build.sh"
+        return
+    fi
+    load_on
+
+    out=$(RUN "timeout -k 10 300 prterun --host node1:4 -n 4 $PMIXLOOP 200" 2>&1)
+    rc=$?
+    [ "$rc" = 0 ] \
+        && ok "prterun survived 800 client connect/disconnect cycles and exited 0" \
+        || bad "prterun exited $rc after heavy client churn (134 = SIGABRT): $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+    # The heap diagnostic is worth asserting separately: glibc aborts only
+    # when its own heuristics happen to catch the bad free, so a corrupted
+    # heap can also surface as a message without a non-zero exit.
+    echo "$out" | grep -qiE 'pointer being freed|free\(\): |double free|corrupted|malloc\(\): ' \
+        && bad "the heap complained during teardown: $(echo "$out" | grep -iEm2 'pointer being freed|free\(\): |double free|corrupted|malloc\(\): ' | tr '\n' ' ')" \
+        || ok "...with no invalid-free or heap-corruption diagnostic"
+    load_off
+    cleanup_swarm
+}
 
 test_ess() {
     local out rc n
@@ -3662,8 +3584,16 @@ test_ess() {
     # controller's rank, so the daemon would adopt the HNP identity and the
     # DVM would come apart later, nowhere near the cause.  A daemon started
     # by hand with a bad vpid must die saying so, and must not join.
+    #
+    # --leave-session-attached is what makes the diagnostic observable at
+    # all: a daemon launched normally detaches from its controlling
+    # terminal before ess init runs (prte_daemon_init_callback), so its
+    # stderr goes nowhere and the message -- which the code does emit --
+    # cannot be read from here. The flag changes nothing about the path
+    # under test, only whether we can see what it wrote.
     cleanup_swarm
-    out=$(ONT 2 'timeout -k 5 20 prted --prtemca ess_base_nspace bogus-dvm \
+    out=$(ONT 2 'timeout -k 5 20 prted --leave-session-attached \
+                     --prtemca ess_base_nspace bogus-dvm \
                      --prtemca ess_base_vpid not-a-number \
                      --prtemca prte_hnp_uri "bogus-dvm.0;tcp://127.0.0.1:1" 2>&1' 2>&1)
     echo "$out" | grep -qi 'not a valid non-negative number' \
@@ -3910,6 +3840,321 @@ test_errmgr() {
     cleanup_swarm
 }
 
+########################################################################
+# src/mca/odls -- the daemon-side launch subsystem.  test/unit/odls covers
+# the structural contract and the pieces that are pure functions
+# (process_envars, the child->parent pipe record, the thread-pool sizing).
+# What lands here is what only exists once a REMOTE daemon has to decode
+# the launch message and fork against it: the environment the app actually
+# ends up with, the exec agent, and the failure paths whose whole purpose
+# is to keep a multi-app launch from stranding the job.
+########################################################################
+# Absolute path, deliberately -- see the note on DS above: an app launched
+# into the DVM inherits the daemon PATH, which does not contain the install
+# bindir.
+ES=/opt/prte/prte/bin/envspawn
+
+test_odls() {
+    local out rc n c ns duri EL
+
+    banner "odls: the envar directives reach the daemon that does the fork"
+    # SET/ADD/UNSET/PREPEND/APPEND have no command-line surface at all: they
+    # arrive on a PMIx_Spawn request, are attached to the job on the HNP,
+    # travel in the launch message, and are applied by
+    # prte_odls_base_process_envars() on whichever daemon forks the process.
+    # envspawn pins its child to node3 while running on node2, so what is
+    # under test is the REMOTE daemon's copy of the job.
+    #
+    # ADD is the one worth the whole apparatus.  It is defined - in
+    # pmix_common.h and again in src/util/attr.h - as "add envar, but do not
+    # overwrite any existing one", and it was being applied exactly like
+    # SET, silently discarding whatever value was already there.
+    cleanup_swarm
+    if prted_dvm_start 'node1:2,node2:2,node3:2,node4:2'; then
+        PRUN "--host node2:1 -n 1 $ES node3" >/dev/null 2>&1
+        # the child wrote its report on its own node; reading it from there
+        # is also how we know that is where the fork happened
+        out=$(ON 3 'cat /tmp/odls-envspawn.out' 2>&1)
+        echo "$out" | grep -q 'ODLS_SET=kept' \
+            && ok "ADD did not overwrite the value SET established" \
+            || bad "ADD overwrote a pre-existing value: $(echo "$out" | grep ODLS_SET)"
+        echo "$out" | grep -q 'ODLS_NEW=added' \
+            && ok "...but ADD does set a name nobody had claimed" \
+            || bad "ADD did not set an absent variable: $(echo "$out" | grep ODLS_NEW)"
+        echo "$out" | grep -q 'ODLS_PATH=front:middle:back' \
+            && ok "PREPEND and APPEND edited the value in list order" \
+            || bad "PREPEND/APPEND wrong: $(echo "$out" | grep ODLS_PATH)"
+        echo "$out" | grep -q 'ODLS_GONE=<unset>' \
+            && ok "UNSET removed the variable it named" \
+            || bad "UNSET did nothing: $(echo "$out" | grep ODLS_GONE)"
+        # ...and prove the fork really happened somewhere else
+        echo "$out" | grep -q 'ODLS_HOST=node3' \
+            && ok "...all of it applied by the daemon on the child's node" \
+            || bad "the child did not run on node3: $(echo "$out" | grep ODLS_HOST)"
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    else
+        bad "could not start a DVM for the envar-directive test"
+    fi
+    cleanup_swarm
+
+    banner "odls: the exec agent wraps every exec, on every node"
+    # odls_base_exec_agent replaces the command spawn_proc hands to the fork
+    # primitive, prepending the agent and pushing the app into its argv.  It
+    # is read from the DAEMON's MCA state, not the job's, so each daemon
+    # applies its own copy -- and a daemon that never picked the parameter
+    # up would launch the app bare, which looks like success.  Use "env" as
+    # the agent: it execs its argument, so the job still runs, and it stamps
+    # a variable we can see in the output to prove it was in the chain.
+    cleanup_swarm
+    out=$(RUN 'timeout -k 5 60 prterun --prtemca odls_base_exec_agent "/usr/bin/env ODLS_AGENT=yes" \
+                   --host node1:1,node2:1,node3:1 -n 3 --map-by node \
+                   sh -c "echo AGENT=\$ODLS_AGENT@\$(hostname)"' 2>&1)
+    n=$(echo "$out" | grep -c 'AGENT=yes@')
+    [ "$n" = 3 ] && ok "every one of the 3 procs was exec'd through the agent" \
+                 || bad "only $n/3 procs went through the exec agent: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    n=$(echo "$out" | grep -o 'AGENT=yes@node[0-9]*' | sort -u | wc -l | tr -d ' ')
+    [ "$n" = 3 ] && ok "...on three distinct nodes, so each daemon applied its own" \
+                 || bad "the agent only took effect on $n nodes"
+    cleanup_swarm
+
+    banner "odls: a bad exec is diagnosed by the daemon that tried it"
+    # The child cannot render its own diagnostic - it is in the
+    # async-signal-safe window between fork() and execve() - so it writes a
+    # fixed-size code+errno record up the pipe and the PARENT daemon renders
+    # it.  On one host that parent is the HNP and the message never crosses
+    # a wire.  Here the failing exec is on node4 and the text has to reach
+    # the tool on node1 through the IOF, which is the whole point.
+    cleanup_swarm
+    out=$(RUN 'timeout -k 5 60 prterun --host node4:1 -n 1 /no/such/executable' 2>&1)
+    rc=$?
+    [ "$rc" != 0 ] && ok "a missing executable fails the job (rc=$rc)" \
+                   || bad "a missing executable exited 0"
+    echo "$out" | grep -q '/no/such/executable' \
+        && ok "...naming the executable it could not run" \
+        || bad "no diagnostic naming the executable: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    c=$(prted_settle 10 1 2 3 4)
+    [ "$c" = 0 ] && ok "...and every daemon came down afterwards" \
+                 || bad "$c stray prted after a failed exec"
+    cleanup_swarm
+
+    # A directory is X_OK on most systems -- it means "searchable" -- so it
+    # sails through the base's check_context_app() and only fails at the
+    # execve, as a bare "Permission denied".  render_child_msg stats the app
+    # in the PARENT to turn that into something a user can act on.
+    #
+    # Deliberately on a REMOTE node, and deliberately checking that the
+    # message names that node.  A prted cannot deliver its own show_help --
+    # plog/stdfd, when the renderer is a PMIx server rather than a client or
+    # tool, hands the text to PMIx_server_IOF_deliver under the daemon's own
+    # identity, which nothing has a sink for -- so every one of these was
+    # silently dropped on every node but the head one.  prte_show_help()
+    # renders on the daemon and relays to the HNP, which is the only place
+    # the delivery machinery works.  "Local host: node4" is the proof that
+    # the round trip happened.
+    cleanup_swarm
+    out=$(RUN 'timeout -k 5 60 prterun --host node4:1 -n 1 /tmp' 2>&1)
+    echo "$out" | grep -qi 'is a directory' \
+        && ok "a directory given as the executable is named as such" \
+        || bad "no directory diagnostic: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    echo "$out" | grep -q 'Local host: *node4' \
+        && ok "...rendered on the remote daemon and relayed to the tool" \
+        || bad "the diagnostic did not come from node4: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    cleanup_swarm
+
+    # ...and the same relay for a message the base emits before the fork,
+    # so this is not just render_child_msg getting through
+    cleanup_swarm
+    out=$(RUN 'timeout -k 5 60 prterun --prtemca odls_base_exec_agent /no/such/agent \
+                   --host node4:1 -n 1 hostname' 2>&1)
+    echo "$out" | grep -q 'The specified fork agent was not found' \
+        && ok "a missing exec agent is reported from the daemon that looked for it" \
+        || bad "no fork-agent diagnostic: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    echo "$out" | grep -q 'Node: *node4' \
+        && ok "...naming that node" \
+        || bad "the fork-agent diagnostic did not name node4"
+    cleanup_swarm
+
+    banner "odls: one bad app in an MPMD launch takes the whole job down"
+    # Every fatal path in launch_local flags the affected app's procs AND
+    # activates PRTE_JOB_STATE_FAILED_TO_LAUNCH, because "goto GETOUT" skips
+    # every LATER app -- whose procs then sit in INIT forever.  A prted only
+    # reports FAILED_TO_LAUNCH once num_terminated == num_local_procs, so
+    # failing just the one app's procs does not fail the job, it HANGS it.
+    # Put the bad app FIRST so there is a later app to strand, and put the
+    # two apps on different nodes so the stranding would be a remote
+    # daemon's.  The observable is that this terminates at all.
+    cleanup_swarm
+    out=$(RUN 'timeout -k 5 45 prterun --host node2:1,node3:1 \
+                   -n 1 /no/such/executable : -n 1 hostname' 2>&1)
+    rc=$?
+    [ "$rc" != 124 ] && ok "the launch terminated rather than hanging (rc=$rc)" \
+                     || bad "an MPMD launch with a bad first app hung until the timeout"
+    [ "$rc" != 0 ] && ok "...and reported failure" \
+                   || bad "the failed MPMD launch exited 0"
+    c=$(prted_settle 10 1 2 3)
+    [ "$c" = 0 ] && ok "...and left no daemon behind" \
+                 || bad "$c stray prted after a failed MPMD launch"
+    cleanup_swarm
+
+    banner "odls: the waitpid decode survives the trip back from a remote node"
+    # wait_local_proc turns a raw wait status into a proc state on the
+    # daemon that owns the child, and the HNP only ever sees the result.  A
+    # signal death becomes signo+128 (shell convention) and a plain non-zero
+    # exit stays itself; both have to reach the tool from node4.
+    cleanup_swarm
+    RUN 'timeout -k 5 60 prterun --host node4:1 -n 1 sh -c "exit 3"' >/dev/null 2>&1
+    rc=$?
+    [ "$rc" = 3 ] && ok "a non-zero exit on a remote node is reported verbatim" \
+                  || bad "expected exit 3 from node4, got $rc"
+    RUN 'timeout -k 5 60 prterun --host node4:1 -n 1 sh -c "kill -TERM \$\$; sleep 5"' >/dev/null 2>&1
+    rc=$?
+    [ "$rc" = 143 ] && ok "...and a SIGTERM death comes back as signo+128 (143)" \
+                    || bad "expected 143 for a SIGTERM death on node4, got $rc"
+    cleanup_swarm
+
+    banner "odls: a signal aimed at a dead rank does not take out the daemon"
+    # prted_comm walks every local child of the named job and asks the odls
+    # to signal each one BY NAME.  The by-name branch had no aliveness gate,
+    # so a rank that was gone - pid reset to 0 - was signaled at pid 0.  The
+    # component turns a pid into a process GROUP, and kill(-0)/kill(0) is
+    # "every process in the DAEMON's own group": the daemon signals itself,
+    # its other children, and (under prterun) the launching tool.
+    #
+    # Set it up so the target job certainly has a dead rank: rank 1 on node3
+    # exits at once while rank 0 on node2 lives on.  Then signal the job.
+    # The observable is that the survivor and both daemons are still there.
+    cleanup_swarm
+    for n in 1 2 3; do docker exec "$NODE$n" sh -c 'pkill -9 -x sleep 2>/dev/null; true'; done
+    if prted_dvm_start 'node1:1,node2:1,node3:1'; then
+        # rank 1 (node3) exits at once; rank 0 (node2) sleeps on.  Once rank
+        # 1 is reaped its pid is 0, but it is still a local child of this job
+        # on node3 - which is exactly the proc prted_comm hands to the odls
+        # by name when the job is signalled.
+        PRUN_BG /tmp/odls-sig.out '--forward-signals SIGUSR1 --host node2:1,node3:1 \
+             -n 2 --map-by node sh -c "if [ \$PMIX_RANK -eq 1 ]; then exit 0; fi; exec sleep 120"'
+        sleep 8
+        n=$(ON 2 'pgrep -c -x sleep' 2>/dev/null | tr -d ' \r')
+        [ "${n:-0}" = 1 ] && ok "rank 0 is alive on node2 while rank 1 has exited" \
+                          || bad "expected 1 sleeping rank on node2, saw ${n:-0}"
+        # Relay a signal to the job.  prun turns this into a job-scoped
+        # PMIX_JOB_CTRL_SIGNAL, and every daemon then signals each of ITS
+        # local children of that job by name - including the dead one on
+        # node3.  SIGURG is ignored by default, so a proc that dies here
+        # died from a pid-0 broadcast, not from the signal itself.
+        bpid=$(RUN 'pgrep -x prun | head -1' 2>/dev/null | tr -d ' \r')
+        RUN "kill -URG $bpid" >/dev/null 2>&1
+        sleep 5
+        # node1 is the HNP and runs "prte", not "prted", so only the two
+        # compute-node daemons are counted here; the HNP is checked next
+        c=$(prted_count 2 3)
+        [ "$c" = 2 ] && ok "...and signaling that job left both compute daemons standing" \
+                     || bad "only $c/2 compute daemons survived signaling a job with a dead rank"
+        c=$(RUN 'pgrep -c -x prte' 2>/dev/null | tr -d ' \r')
+        [ "${c:-0}" = 1 ] && ok "...and the HNP too" \
+                          || bad "the HNP did not survive signaling a job with a dead rank"
+        n=$(ON 2 'pgrep -c -x sleep' 2>/dev/null | tr -d ' \r')
+        [ "${n:-0}" = 1 ] && ok "...and the surviving rank was not collateral either" \
+                          || bad "the live rank on node2 did not survive the signal"
+        RUN 'pkill -f "sleep 120"' >/dev/null 2>&1
+        RUN "timeout -k 5 40 pterm --dvm-uri file:$PRTED_URI" >/dev/null 2>&1
+    else
+        bad "could not start a DVM for the dead-rank signal test"
+    fi
+    cleanup_swarm
+
+    banner "odls: kill escalates past an app that ignores SIGTERM"
+    # kill_local_procs walks SIGCONT -> SIGTERM -> SIGKILL with a pause
+    # between each, so an app that traps SIGTERM still dies.  Run one on
+    # node2 and node3, order the DVM down, and require both daemons to be
+    # gone: a daemon that could not kill its child waits for it forever.
+    cleanup_swarm
+    if prted_dvm_start 'node1:1,node2:1,node3:1'; then
+        # ODLSKILLPROBE is just a marker to find the child by.  Every pgrep
+        # below writes it as ODLSKILL[P]ROBE so the pattern cannot match the
+        # pgrep command line itself -- without that this counts 1 survivor
+        # on every node, including nodes that never ran a child.
+        PRUN_BG /tmp/odls-kill.out '--host node2:1,node3:1 -n 2 --map-by node \
+             sh -c "trap : TERM; while true; do sleep 1; done # ODLSKILLPROBE"'
+        sleep 6
+        n=$(ON 2 'pgrep -f "ODLSKILL[P]ROBE" | wc -l' | tr -d ' \r')
+        [ "${n:-0}" != 0 ] && ok "the SIGTERM-proof child is running on node2" \
+                           || bad "the test child never started on node2"
+        # pterm needs the URI: the backgrounded prun above is holding a
+        # rendezvous file of its own, so a bare pterm finds two and refuses
+        RUN "timeout -k 5 40 pterm --dvm-uri file:$PRTED_URI" >/dev/null 2>&1
+        c=$(prted_settle 20 1 2 3)
+        [ "$c" = 0 ] && ok "...and every daemon shut down anyway" \
+                     || bad "$c daemon(s) still up -- the kill escalation did not finish"
+        n=$(ON 2 'pgrep -f "ODLSKILL[P]ROBE" | wc -l' | tr -d ' \r')
+        [ "${n:-0}" = 0 ] && ok "...and the child itself is gone from node2" \
+                          || bad "the SIGTERM-proof child survived on node2"
+    else
+        bad "could not start a DVM for the kill-escalation test"
+    fi
+    cleanup_swarm
+
+    banner "odls/nidmap: a daemon grown into the DVM learns the jobs already running"
+    # What the launch message no longer carries, and where it went.
+    #
+    # A daemon joining a DVM has never seen the launch messages of the jobs
+    # already running in it, so it cannot resolve their namespaces.  That
+    # used to be patched by packing every other active job in FRONT of the
+    # launch message of whichever job brought the new daemons in -- which
+    # tied that message's size to the number of jobs resident in the DVM
+    # and, worse, did nothing at all for a daemon added by a bare elastic
+    # grow, because a grow launches no job and so sends no launch message.
+    # The jobs now travel with the nidmap at VM_READY, which is sent exactly
+    # when the daemon set changes.
+    #
+    # So the shape here is deliberate, and it is the case the old mechanism
+    # could not reach: grow a node with NO job launch of its own, then ask a
+    # proc on that node about a job that predates it.  The wireup is the
+    # only thing that can have told it.
+    cleanup_swarm
+    if ! RUN 'command -v jobinfo >/dev/null'; then
+        skp "jobinfo client not installed -- re-run ./build.sh"
+    else
+        RUN 'rm -f /tmp/dvm.uri; nohup prte --daemonize --report-uri /tmp/dvm.uri --prtemca prte_elastic_mode 1 >/tmp/prte.out 2>&1 & sleep 8' >/dev/null
+        duri=$(RUN 'head -1 /tmp/dvm.uri' 2>/dev/null | tr -d '\r')
+        if [ -z "$duri" ]; then
+            bad "could not start an elastic DVM for the job-catchup test"
+        else
+            # every elastic call names the DVM: the long-running prun below
+            # leaves a rendezvous handle of its own, and bare discovery then
+            # finds two servers and refuses to choose
+            EL="PRTE_DVM_URI='$duri' timeout 90 elastic"
+            out=$(RUN "$EL grow node2:2" 2>&1)
+            if ! echo "$out" | grep -q PMIX_DVM_IS_READY; then
+                bad "could not grow node2 -- cannot set up the catchup test"
+            else
+                ok "grew node2, which will host the job that predates node3"
+                RUN_BG /tmp/cu-pub.out "prun --dvm-uri file:/tmp/dvm.uri --host node2:2 -n 2 jobinfo publish 240"
+                sleep 10
+                ns=$(RUN 'grep -m1 "^NSPACE " /tmp/cu-pub.out' 2>/dev/null | awk '{print $2}' | tr -d '\r')
+                if [ -z "$ns" ]; then
+                    bad "the pre-existing job never reported its nspace: $(RUN 'cat /tmp/cu-pub.out' 2>&1 | tr '\n' ' ' | tail -c 250)"
+                else
+                    ok "a job is running on node2 (nspace $ns)"
+                    # node3 joins now, with no job launched onto it
+                    out=$(RUN "$EL grow node3:2" 2>&1)
+                    if ! echo "$out" | grep -q PMIX_DVM_IS_READY; then
+                        bad "could not grow node3 -- cannot test the catchup: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+                    else
+                        ok "grew node3 into a DVM that already had a job running"
+                        out=$(RUN "timeout 60 prun --dvm-uri file:/tmp/dvm.uri --host node3:1 -n 1 jobinfo fetch $ns 20" 2>&1)
+                        n=$(echo "$out" | grep -m1 '^JOBSIZE ' | awk '{print $2}' | tr -d '\r')
+                        [ "$n" = 2 ] \
+                            && ok "a proc on the newly-grown node resolved the pre-existing job" \
+                            || bad "the grown node could not resolve a job that predates it (got '$n'): $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+                    fi
+                fi
+            fi
+            RUN "timeout -k 5 30 pterm --dvm-uri file:/tmp/dvm.uri" >/dev/null 2>&1
+        fi
+    fi
+    cleanup_swarm
+}
+
 test_rml() {
     local out rc n c
 
@@ -4072,6 +4317,135 @@ test_rml() {
         RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
     else
         bad "could not start a DVM for the lost-daemon test"
+    fi
+    cleanup_swarm
+
+    banner "rml: a daemon lost BELOW an interior daemon still ends the job"
+    # The case above kills a daemon the HNP is the parent of, which at the
+    # default radix is every daemon -- a ten-node DVM at radix 64 is flat, so
+    # the HNP is always the one that loses the socket and the errmgr always
+    # runs.  Give the tree depth and that stops being true: at radix 2 over
+    # seven nodes, node7 (rank 6) hangs off rank 2, so rank 2 detects the loss
+    # and the HNP only ever hears about it second-hand, through the RML failure
+    # notice.  The notice used to update the routing bitmaps and nothing else,
+    # so the HNP never marked the dead node's procs terminated and prun waited
+    # forever -- a hang that did not exist one radix higher, which is precisely
+    # why nothing caught it.
+    #
+    # The observable is the same as its flat sibling, and it has to be a real
+    # timeout rather than "did it print something": the failure mode is a hang.
+    cleanup_swarm
+    if prted_dvm_start_mca 'node1:1,node2:1,node3:1,node4:1,node5:1,node6:1,node7:1' \
+           '--prtemca rml_base_radix 2'; then
+        PRUN_BG /tmp/rml-deep-longrun.out '--host node7:1 -n 1 sleep 120'
+        sleep 6
+        if ! RUN 'pgrep -x prun' >/dev/null 2>&1; then
+            bad "the long-running job never started on the deep tree: $(RUN 'cat /tmp/rml-deep-longrun.out' 2>&1 | tr '\n' ' ' | tail -c 250)"
+        elif ! ON 7 'pgrep -x prted' >/dev/null 2>&1; then
+            bad "node7 has no daemon to kill -- the job did not land where expected"
+        else
+            ok "a job is running on node7, two levels down a radix-2 tree"
+            ON 7 'pkill -9 -x prted' >/dev/null 2>&1
+            n=0
+            while [ "$n" -lt 45 ]; do
+                RUN 'pgrep -x prun' >/dev/null 2>&1 || break
+                sleep 1; n=$((n+1))
+            done
+            [ "$n" -lt 45 ] \
+                && ok "a loss detected by an interior daemon reached the HNP (${n}s)" \
+                || bad "prun never returned: the HNP never acted on a death it only heard about"
+            RUN 'pgrep -x prte' >/dev/null 2>&1 \
+                && ok "...and the HNP survived it" \
+                || bad "the HNP died along with the lost daemon"
+        fi
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    else
+        bad "could not start a radix-2 DVM for the deep lost-daemon test"
+    fi
+    cleanup_swarm
+
+    banner "rml/oob: peer sockets serviced by dedicated OOB progress threads"
+    # prte_oob_progress_threads (default 0) moves each peer's send/recv socket
+    # events off the main progress thread onto one of N worker bases, chosen
+    # round-robin at peer construction.  The connection state machine, routing,
+    # message delivery and every send completion stay on the main thread.  This
+    # is the only place that threaded path runs at all, so all four things it
+    # could break are checked here rather than assumed.
+    cleanup_swarm
+
+    # (a) the parameter has to reach the *daemons*, not just the HNP -- the
+    # whole point is remote sockets.  oob_base_verbose 5 makes each daemon
+    # announce the pool it built; --leave-session-attached is what gets a
+    # prted's stderr back to us.
+    out=$(RUN 'timeout -k 5 90 prterun --prtemca prte_oob_progress_threads 4 \
+                  --prtemca oob_base_verbose 5 --leave-session-attached \
+                  --host node1:1,node2:1,node3:1 -np 3 --map-by node hostname' 2>&1)
+    n=$(echo "$out" | grep -c 'starting 4 OOB progress threads')
+    [ "$n" -ge 2 ] \
+        && ok "the daemons started their OOB progress-thread pools ($n reported)" \
+        || bad "the thread pool was not built on the daemons: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    cleanup_swarm
+
+    # (b) a relayed tree still delivers.  radix 2 over 7 nodes means every leaf
+    # is reached through an interior daemon, so a message crosses a worker base
+    # on the way in (recv handler) and again on the way out (relay -> send).
+    out=$(RUN 'timeout -k 5 120 prterun --prtemca rml_base_radix 2 \
+                  --prtemca prte_oob_progress_threads 4 \
+                  --host node1:1,node2:1,node3:1,node4:1,node5:1,node6:1,node7:1 \
+                  -np 7 --map-by node hostname' 2>&1); rc=$?
+    n=$(echo "$out" | grep -cE '^node[1-7]$')
+    [ "$rc" = 0 ] && [ "$n" = 7 ] \
+        && ok "7 procs relayed across a radix-2 tree with worker bases" \
+        || bad "worker bases broke the relay (rc=$rc, lines=$n): $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    cleanup_swarm
+
+    # (c) the partial-write/partial-read bookkeeping is per-peer state that a
+    # second thread is exactly what could corrupt, and a byte count is the only
+    # check that catches a corrupted one -- a truncated relay still "runs".
+    out=$(RUN 'timeout -k 5 120 prterun --prtemca rml_base_radix 2 \
+                  --prtemca prte_oob_progress_threads 4 \
+                  --host node1:1,node2:1,node3:1,node4:1,node5:1,node6:1,node7:1 \
+                  -np 7 --map-by node \
+                  sh -c "head -c 500000 /dev/zero | tr \"\\0\" \"x\""' 2>&1)
+    n=$(echo "$out" | tr -cd 'x' | wc -c | tr -d ' ')
+    [ "$n" = 3500000 ] \
+        && ok "3.5 MB relayed intact with the sockets on worker bases" \
+        || bad "worker bases truncated the payload (got $n bytes of 3500000)"
+    cleanup_swarm
+
+    # (d) the race the design is actually exposed to: prte_oob_tcp_peer_close
+    # runs on the main thread while a worker may be inside that peer's send or
+    # recv handler.  Killing a daemon under a live job is what drives it.  A
+    # missed handshake there is a hang, a use-after-free, or a leaked send --
+    # so the observable is that the job is released and the HNP lives.
+    # At the default radix, so that what this case reports is the threading and
+    # nothing else; the deep-tree half of the same scenario is the case above,
+    # which runs it at radix 2 with the threads off.
+    if prted_dvm_start_mca 'node1:1,node2:1,node3:1,node4:1,node5:1,node6:1,node7:1' \
+           '--prtemca prte_oob_progress_threads 4'; then
+        PRUN_BG /tmp/rml-thr-longrun.out '--host node7:1 -n 1 sleep 120'
+        sleep 6
+        if ! RUN 'pgrep -x prun' >/dev/null 2>&1; then
+            bad "the long-running job never started under worker bases: $(RUN 'cat /tmp/rml-thr-longrun.out' 2>&1 | tr '\n' ' ' | tail -c 250)"
+        elif ! ON 7 'pgrep -x prted' >/dev/null 2>&1; then
+            bad "node7 has no daemon to kill -- the job did not land where expected"
+        else
+            ON 7 'pkill -9 -x prted' >/dev/null 2>&1
+            n=0
+            while [ "$n" -lt 45 ]; do
+                RUN 'pgrep -x prun' >/dev/null 2>&1 || break
+                sleep 1; n=$((n+1))
+            done
+            [ "$n" -lt 45 ] \
+                && ok "peer_close raced a worker handler and still released the job (${n}s)" \
+                || bad "prun never returned after its daemon died with worker bases on"
+            RUN 'pgrep -x prte' >/dev/null 2>&1 \
+                && ok "...and the HNP survived" \
+                || bad "the HNP died along with the lost daemon"
+        fi
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    else
+        bad "could not start a DVM with OOB progress threads"
     fi
     cleanup_swarm
 }
@@ -4433,6 +4807,39 @@ gcc -o /root/staged_marker /root/staged_marker.c' >/dev/null 2>&1
                           || bad "expected pf.dat placed as a regular file on node2+node3, got $placed"
     fi
 
+    banner "filem: --preload-files keeps a relative subdirectory"
+    # A relative specification is the name the app will open the file by, so
+    # "sub/pf.dat" has to arrive as "sub/pf.dat" under each rank's working
+    # directory -- with the intermediate directory created for it. This is
+    # the only case that exercises place_file()'s dirpath creation, and the
+    # only one where the received name is not a bare basename.
+    docker exec "${NODE}1" sh -c 'mkdir -p /root/pfsub && echo SUBDIR-DATA-OK > /root/pfsub/pf.dat' >/dev/null 2>&1
+    for n in 2 3; do docker exec "$NODE$n" sh -c 'rm -rf /root/pfsub' >/dev/null 2>&1; done
+    out=$(RUN 'cd /root && prterun --host node2:1,node3:1 -np 2 --map-by node \
+                 --preload-files pfsub/pf.dat -- sh -c "cat pfsub/pf.dat"' 2>&1); rc=$?
+    hits=$(echo "$out" | grep -c 'SUBDIR-DATA-OK')
+    [ "$rc" = 0 ] && [ "$hits" = 2 ] \
+        && ok "a relative subdirectory was recreated in each rank's working directory" \
+        || bad "preload-files subdir failed (rc=$rc, hits=$hits): $(echo "$out" | tr '\n' ' ')"
+    for n in 1 2 3; do docker exec "$NODE$n" sh -c 'rm -rf /root/pfsub' >/dev/null 2>&1; done
+
+    banner "filem: --preload-files keeps a staged file executable"
+    # The chunk stream carries the source file's permissions, so a helper
+    # script staged alongside the job arrives runnable. Nothing else in the
+    # stream describes the file, so before the mode was sent the receiver
+    # had to guess -- and it guessed 0600 for anything not flagged as the
+    # job's own executable, which made "--preload-files helper.sh" deliver a
+    # script the ranks could not run.
+    docker exec "${NODE}1" sh -c 'printf "#!/bin/sh\necho SCRIPT-RAN-OK\n" > /root/helper.sh && chmod 755 /root/helper.sh' >/dev/null 2>&1
+    for n in 2 3; do docker exec "$NODE$n" sh -c 'rm -f /root/helper.sh' >/dev/null 2>&1; done
+    out=$(RUN 'cd /root && prterun --host node2:1,node3:1 -np 2 --map-by node \
+                 --preload-files /root/helper.sh -- ./helper.sh' 2>&1); rc=$?
+    hits=$(echo "$out" | grep -c 'SCRIPT-RAN-OK')
+    [ "$rc" = 0 ] && [ "$hits" = 2 ] \
+        && ok "a staged script arrived executable on both remote nodes" \
+        || bad "staged script not executable (rc=$rc, hits=$hits): $(echo "$out" | tr '\n' ' ')"
+    for n in 1 2 3; do docker exec "$NODE$n" sh -c 'rm -f /root/helper.sh' >/dev/null 2>&1; done
+
     banner "filem: --preload-files refuses to overwrite a different file"
     # The safety rule: a file of that name that is NOT what was to be staged
     # belongs to the user, so the launch is refused rather than clobbering it.
@@ -4460,6 +4867,99 @@ gcc -o /root/staged_marker /root/staged_marker.c' >/dev/null 2>&1
     c=$(prted_settle 10 1 2 3 4 5 6 7 8 9 10)
     [ "$c" = 0 ] && ok "no daemons linger after the refused preload" || bad "$c stray prted after refused preload"
     for n in 1 2 3; do docker exec "$NODE$n" sh -c 'rm -f /root/pf.dat' >/dev/null 2>&1; done
+
+    banner "filem: --preload-files reaches a node grown into the DVM later"
+    # positioned_files remembers what has already been broadcast so a second
+    # job in the same DVM does not resend it. That memory has to know how
+    # much of the DVM it covers: a file staged before a grow never reached
+    # the daemons that joined afterwards, and treating it as positioned
+    # launches procs there with the file simply absent -- no error anywhere,
+    # just an app that cannot open its input. Only an elastic DVM can show
+    # this, and only across two jobs: one job cannot outrun its own staging.
+    cleanup_swarm
+    docker exec "${NODE}1" sh -c 'echo REGROWN-DATA-OK > /root/pg.dat' >/dev/null 2>&1
+    for n in 2 3; do docker exec "$NODE$n" sh -c 'rm -f /root/pg.dat' >/dev/null 2>&1; done
+    RUN 'nohup prte --daemonize --prtemca prte_elastic_mode 1 >/tmp/prte.out 2>&1 & sleep 8' >/dev/null
+    if ! RUN 'pgrep -x prte >/dev/null'; then
+        bad "could not start an elastic DVM for the preload-after-grow test"
+    elif ! pmix_cap PMIX_CAP_TOOL_FINALIZED; then
+        # without it the grown nodes stay reserved to the exited elastic
+        # tool, so a later prun cannot be placed on them by name
+        skp "preload after grow (PMIx predates PMIX_CAP_TOOL_FINALIZED)"
+    else
+        out=$(RUN 'timeout 90 elastic grow node2:1' 2>&1)
+        echo "$out" | grep -q PMIX_DVM_IS_READY \
+            && ok "grow node2 completed" || bad "grow node2 did not complete"
+        sleep 2
+        out=$(RUN 'cd /root && timeout 60 prun --host node2:1 -np 1 \
+                     --preload-files /root/pg.dat -- sh -c "cat pg.dat"' 2>&1)
+        echo "$out" | grep -q REGROWN-DATA-OK \
+            && ok "the file was staged to the DVM as it stood" \
+            || bad "first staging failed: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+        # now widen the DVM and ask for the SAME file on the new node
+        out=$(RUN 'timeout 90 elastic grow node3:1' 2>&1)
+        echo "$out" | grep -q PMIX_DVM_IS_READY \
+            && ok "grow node3 completed" || bad "grow node3 did not complete"
+        sleep 2
+        out=$(RUN 'cd /root && timeout 60 prun --host node3:1 -np 1 \
+                     --preload-files /root/pg.dat -- sh -c "cat pg.dat"' 2>&1); rc=$?
+        echo "$out" | grep -q REGROWN-DATA-OK \
+            && ok "the same file was re-staged to the node grown in afterwards" \
+            || bad "preload did not reach the newly-grown node (rc=$rc): $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    fi
+    cleanup_swarm
+    for n in 1 2 3; do docker exec "$NODE$n" sh -c 'rm -f /root/pg.dat' >/dev/null 2>&1; done
+
+    banner "filem: --preload-files unpacks an archive whose name has a space"
+    # Two things at once, both of which used to fail. The extract and the
+    # listing go through a shell, so an ordinary "my data" reached tar as two
+    # arguments; and the type was read from the FIRST dot in the name, so
+    # "v2.tar.gz" classified as a plain file and was never unpacked at all.
+    # Both are only visible cross-node: the archive's contents already exist
+    # beside the archive on the node it was built on.
+    docker exec "${NODE}1" bash -lc 'rm -rf /root/pfarc && mkdir -p /root/pfarc/inner \
+        && echo ARCHIVED-DATA-OK > /root/pfarc/inner/a.txt \
+        && cd /root/pfarc && tar czf "/root/my run.v2.tar.gz" inner/a.txt' >/dev/null 2>&1
+    for n in 2 3; do docker exec "$NODE$n" sh -c 'rm -rf /root/inner "/root/my run.v2.tar.gz"' >/dev/null 2>&1; done
+    if RUN 'test -f "/root/my run.v2.tar.gz"'; then
+        out=$(RUN 'cd /root && prterun --host node2:1,node3:1 -np 2 --map-by node \
+                     --preload-files "/root/my run.v2.tar.gz" -- sh -c "cat inner/a.txt"' 2>&1); rc=$?
+        hits=$(echo "$out" | grep -c 'ARCHIVED-DATA-OK')
+        [ "$rc" = 0 ] && [ "$hits" = 2 ] \
+            && ok "an archive named with a space and a double suffix was staged and unpacked" \
+            || bad "archive preload failed (rc=$rc, hits=$hits): $(echo "$out" | tr '\n' ' ')"
+    else
+        bad "could not build the test archive on node1 (need tar/gzip in the image)"
+    fi
+    c=$(prted_settle 10 1 2 3 4 5 6 7 8 9 10)
+    [ "$c" = 0 ] && ok "no daemons linger after the archive preload" || bad "$c stray prted after archive preload"
+    for n in 1 2 3; do
+        docker exec "$NODE$n" sh -c 'rm -rf /root/pfarc /root/inner "/root/my run.v2.tar.gz"' >/dev/null 2>&1
+    done
+
+    banner "filem: --preload-files refuses a name that steps out of the directory"
+    # Stripping the LEADING "./" and "../" does not make a name safe: a ".."
+    # further along ("a/../../f") still resolves above the session directory,
+    # where the receive path creates the file with O_TRUNC over whatever is
+    # sitting there -- on every node at once. The request has to be refused
+    # by name rather than resolved.
+    docker exec "${NODE}1" sh -c 'mkdir -p /root/pfesc/inner && echo ESCAPE-PAYLOAD > /root/pfesc/pf.dat' >/dev/null 2>&1
+    for n in 2 3; do docker exec "$NODE$n" sh -c 'rm -rf /root/pfesc' >/dev/null 2>&1; done
+    out=$(RUN 'cd /root && prterun --host node2:1,node3:1 -np 2 --map-by node \
+                 --preload-files pfesc/inner/../../pfesc/pf.dat -- hostname' 2>&1); rc=$?
+    [ "$rc" != 0 ] \
+        && ok "a '..' inside the delivered name was refused" \
+        || bad "a '..' inside the delivered name was accepted (rc=$rc): $(echo "$out" | tr '\n' ' ')"
+    echo "$out" | grep -q '\.\.' \
+        && ok "the refusal named the problem to the user" \
+        || bad "the refusal produced no diagnostic: $(echo "$out" | tr '\n' ' ')"
+    echo "$out" | grep -qi 'unknown error' \
+        && bad "the refusal came back as \"Unknown error\": $(echo "$out" | tr '\n' ' ' | tail -c 250)" \
+        || ok "the refusal was named, not reported as \"Unknown error\""
+    c=$(prted_settle 10 1 2 3 4 5 6 7 8 9 10)
+    [ "$c" = 0 ] && ok "no daemons linger after the refused path" || bad "$c stray prted after refused path"
+    for n in 1 2 3; do docker exec "$NODE$n" sh -c 'rm -rf /root/pfesc' >/dev/null 2>&1; done
 
     banner "iof: stdin forwarded to a REMOTE proc (HNP -> prted -> proc)"
     # Rank 0 is mapped onto node2, not the head node, so every stdin byte must
@@ -4489,6 +4989,17 @@ gcc -o /root/staged_marker /root/staged_marker.c' >/dev/null 2>&1
     RUN 'nohup prte --daemonize --host node1:1,node2:1,node3:1 >/tmp/prte.out 2>&1 & sleep 8' >/dev/null
     if RUN 'pgrep -x prte >/dev/null'; then
         RUN 'head -c 262144 /dev/urandom | base64 > /tmp/iof_stdin_in.txt' >/dev/null 2>&1
+        # A second, deliberately larger input for the flow-control cases below.
+        # Back-pressure is keyed on PRTE_IOF_MAX_INPUT_BUFFERS (50) *queued
+        # chunks*, and the HNP hands stdin over in 8 KB chunks -- so an input
+        # has to exceed 50 * 8192 = 400 KB before the backlog can cross the
+        # threshold AT ALL, no matter how slowly the reader drains it.  The
+        # 256 KB input above is 43 chunks, which is why the XOFF assertions
+        # here used to be unfalsifiable.  1 MB of random, base64'd to ~1.4 MB,
+        # is ~172 chunks.  Do not shrink this without redoing that arithmetic.
+        RUN 'head -c 1048576 /dev/urandom | base64 > /tmp/iof_bulk_in.txt' >/dev/null 2>&1
+        bulksum=$(RUN 'md5sum < /tmp/iof_bulk_in.txt' | awk '{print $1}')
+        bulksz=$(RUN 'wc -c < /tmp/iof_bulk_in.txt' | tr -d ' ')
         out=$(RUN 'cd /tmp && timeout 90 prun --host node2:1 -n 1 \
                      cat < iof_stdin_in.txt > iof_stdin_out.txt 2>iof_stdin_err.txt; echo "rc=$?"')
         rc=$(echo "$out" | sed -n 's/^rc=//p')
@@ -4542,6 +5053,96 @@ gcc -o /root/staged_marker /root/staged_marker.c' >/dev/null 2>&1
             && ok "large stdin ($insz bytes) survived a SLOW remote reader (short writes)" \
             || bad "slow-reader stdin corrupted (rc=$rc, sent=$insz received=$got, md5 $insum vs $outsum): $(RUN 'head -c 200 /tmp/iof_slow_err.txt')"
         ON 2 'rm -f /tmp/iof_slow_out.txt' >/dev/null 2>&1
+
+        # A reader slow enough to push the daemon's stdin backlog past
+        # PRTE_IOF_MAX_INPUT_BUFFERS (50 queued chunks), which is what makes
+        # the daemon send the HNP a flow-control message.
+        #
+        # That message consists of NOTHING but the stream tag -- no proc, no
+        # count, no payload -- and it travels on PRTE_RML_TAG_IOF_HNP, the same
+        # tag forwarded output uses.  The HNP used to unpack the tag and then
+        # reach straight for a proc, which on a tag-only buffer fails, so a
+        # perfectly ordinary slow reader produced a PMIx unpack error on the
+        # user's terminal.  The HNP now screens the XON/XOFF mask first.
+        #
+        # The assertion is on the HNP's own log, so the reader has to be slow
+        # enough for the backlog to actually cross 50: 64 bytes every 4 ms
+        # against a 256 KB payload the HNP hands over as fast as the RML will
+        # carry it.  Delivery must still be exact -- an XOFF is not permission
+        # to drop anything.
+        RUN 'cp /tmp/prte.out /tmp/prte.out.mark 2>/dev/null || : ' >/dev/null 2>&1
+        out=$(RUN 'cd /tmp && timeout 300 prun --host node2:1 -n 1 \
+                     '"$SC"' /tmp/iof_xoff_out.txt 512 2000 < iof_bulk_in.txt \
+                     2>iof_xoff_err.txt; echo "rc=$?"')
+        rc=$(echo "$out" | sed -n 's/^rc=//p')
+        got=$(echo "$out" | sed -n 's/^SLOWCAT-BYTES //p')
+        outsum=$(ON 2 'md5sum < /tmp/iof_xoff_out.txt 2>/dev/null' | awk '{print $1}')
+        [ "$rc" = 0 ] && [ -n "$got" ] && [ "$got" = "$bulksz" ] && [ "$bulksum" = "$outsum" ] \
+            && ok "stdin survived a reader slow enough to trigger XOFF" \
+            || bad "XOFF-triggering stdin corrupted (rc=$rc, sent=$bulksz received=$got, md5 $bulksum vs $outsum): $(RUN 'head -c 200 /tmp/iof_xoff_err.txt')"
+        # ...and the flow-control message did not come back at the user as a
+        # corrupted one.  "prte --daemonize" detaches from stdio, so this is
+        # what the HNP wrote before detaching plus anything pmix_output sent to
+        # the log; a PMIX_ERROR_LOG of an unpack failure names the file.
+        hnplog=$(RUN 'diff /tmp/prte.out.mark /tmp/prte.out 2>/dev/null | grep "^>" \
+                      || cat /tmp/prte.out 2>/dev/null')
+        echo "$hnplog" | grep -qiE 'UNPACK|iof_hnp_receive\.c' \
+            && bad "the HNP reported a flow-control message as corrupt: $(echo "$hnplog" | grep -iE 'UNPACK|iof_hnp_receive' | head -2 | tr '\n' ' ')" \
+            || ok "no unpack error at the HNP while stdin was backed up"
+        ON 2 'rm -f /tmp/iof_xoff_out.txt' >/dev/null 2>&1
+
+        # The same reader again, this time with the iof talking, to assert
+        # that flow control actually engaged AND that every XOFF was paired
+        # with an XON.
+        #
+        # The pairing is the part that matters. PMIx has no status meaning
+        # "resume", so a suspension the HNP asserts and forgets to release
+        # stalls the producer for the life of the job - a hang, not a
+        # slowdown. On the HNP side that release lives in
+        # release_flow_control(), called from every path a backed-up sink
+        # can leave that state by, including the ones where the sink is torn
+        # down rather than drained.
+        #
+        # Counting rather than merely grepping is deliberate: an
+        # implementation that asserts XOFF once and releases once looks
+        # identical to a correct one under a presence test, and so does one
+        # that asserts fifty times and releases once.
+        # Two things this case has to get right before it can assert anything.
+        #
+        # It needs the flow-control API at all: without PMIX_CAP_IOF_FLOW_CONTROL
+        # both the XOFF assert and its matching release are compiled out, and the
+        # HNP simply queues (bounded by iof_base_output_limit).  There is then no
+        # XOFF to pair and nothing to test, so skip rather than fail.
+        #
+        # And it needs to be able to SEE the HNP's log.  The DVM this phase runs
+        # against is started with "prte --daemonize", which detaches stdio before
+        # any of this is emitted -- /tmp/prte.out is empty by construction, so
+        # grepping it can only ever fail.  So this one case drives its own
+        # foreground DVM with prterun and reads that process's stderr directly.
+        # prterun takes its own session-dir prefix (prtrn.<pid>), so it coexists
+        # with the daemonized DVM the rest of the phase is using.
+        if ! pmix_cap PMIX_CAP_IOF_FLOW_CONTROL; then
+            skp "PMIx predates PMIX_CAP_IOF_FLOW_CONTROL -- no XOFF to pair"
+        else
+            out=$(RUN 'cd /tmp && timeout 300 prterun --prtemca iof_base_verbose 1 -n 1 \
+                         '"$SC"' /tmp/iof_pair_out.txt 2048 3000 < iof_bulk_in.txt \
+                         2>iof_pair_err.txt; echo "rc=$?"')
+            rc=$(echo "$out" | sed -n 's/^rc=//p')
+            got=$(echo "$out" | sed -n 's/^SLOWCAT-BYTES //p')
+            pairlog=$(RUN 'cat /tmp/iof_pair_err.txt 2>/dev/null')
+            nxoff=$(echo "$pairlog" | grep -c 'buffer backed up - holding')
+            nxon=$(echo "$pairlog" | grep -c 'releasing stdin flow control')
+            [ "$nxoff" -gt 0 ] \
+                && ok "stdin flow control engaged ($nxoff XOFF)" \
+                || bad "stdin flow control never engaged - reader too fast, or the backlog never crossed PRTE_IOF_MAX_INPUT_BUFFERS (50 chunks of 8K; input is $bulksz bytes)"
+            [ "$nxoff" = "$nxon" ] \
+                && ok "every XOFF was paired with an XON ($nxon)" \
+                || bad "unpaired stdin flow control: $nxoff XOFF vs $nxon XON - a producer is left suspended"
+            [ "$rc" = 0 ] && [ "$got" = "$bulksz" ] \
+                && ok "delivery stayed exact across $nxoff suspensions" \
+                || bad "flow-controlled stdin lost data (rc=$rc, sent=$bulksz received=$got)"
+            RUN 'rm -f /tmp/iof_pair_out.txt' >/dev/null 2>&1
+        fi
 
         # And the same slow reader on the HNP node, where push_stdin writes
         # into the proc sink directly instead of going out over the RML: the
@@ -4826,6 +5427,50 @@ gcc -o /root/staged_marker /root/staged_marker.c' >/dev/null 2>&1
     fi
     cleanup_swarm
 
+    banner "plm: a second launch adds only the daemons that launch needs"
+    # setup_virtual_machine runs on EVERY launch, but the daemon job's map is
+    # persistent - it accumulates the DVM's nodes for the life of the session.
+    # num_new_daemons and daemon_vpid_start describe only the launch about to
+    # happen, so each pass has to recompute them from scratch; carried over,
+    # they make a launcher act on the previous launch's daemons. (ssh
+    # substitutes each node's own vpid per node, so the vpid half of that is
+    # only fatal under an RM launcher - see test/unit/plm - but the count is
+    # what every component keys its "anything to do?" test off.)
+    #
+    # So: form a DVM, then bring in a third node with --add-host and require
+    # that the second pass reports exactly ONE new daemon, not three.
+    # NOTE: the DVM runs in the FOREGROUND under RUN_BG rather than
+    # --daemonize, because a daemonized HNP detaches from its output and the
+    # trace this case reads would go nowhere.
+    cleanup_swarm
+    RUN_BG /tmp/prte.out 'prte --prtemca plm_base_verbose 5 --host node1:1,node2:1'
+    sleep 8
+    if RUN 'pgrep -x prte >/dev/null'; then
+        first=$(RUN 'grep -c "setup_vm add new daemon" /tmp/prte.out' | tr -d '\r')
+        [ "$first" = 1 ] && ok "DVM formation added one daemon (node2)" \
+                         || bad "DVM formation reported $first new daemons (expected 1)"
+        out=$(RUN 'timeout 90 prun --add-host node3:1 --host node1:1,node2:1,node3:1 \
+                     -n 3 --map-by node hostname' 2>&1)
+        n=$(echo "$out" | grep -cE '^node[1-3]$')
+        [ "$n" = 3 ] && ok "--add-host launch ran across all three nodes" \
+                     || bad "--add-host launch produced $n/3 procs: $(echo "$out" | tr '\n' ' ')"
+        [ "$(prted_count 3)" = 1 ] && ok "a daemon was started on the added node" \
+                                   || bad "no daemon on the added node"
+        total=$(RUN 'grep -c "setup_vm add new daemon" /tmp/prte.out' | tr -d '\r')
+        [ "$total" = 2 ] \
+            && ok "the second pass added exactly one daemon (count not carried over)" \
+            || bad "second pass brought the running total to $total new daemons (expected 2)"
+        # and the DVM still routes to everyone afterwards
+        out=$(RUN 'timeout 30 prun -n 3 --map-by node hostname' 2>&1)
+        n=$(echo "$out" | grep -cE '^node[1-3]$')
+        [ "$n" = 3 ] && ok "DVM still spans all three nodes after the grow" \
+                     || bad "post-grow job produced $n/3 procs: $(echo "$out" | tr '\n' ' ')"
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    else
+        bad "could not start a DVM for the second-launch test"
+    fi
+    cleanup_swarm
+
     banner "elastic DVM: grow + shrink (radix 64, flat tree)"
     cleanup_swarm
     RUN 'nohup prte --daemonize --prtemca prte_elastic_mode 1 >/tmp/prte.out 2>&1 & sleep 8' >/dev/null
@@ -4979,6 +5624,107 @@ gcc -o /root/staged_marker /root/staged_marker.c' >/dev/null 2>&1
         RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
     else
         bad "could not start an elastic DVM for the re-grow test"
+    fi
+    cleanup_swarm
+
+    banner "elastic DVM: a job spanning a surviving daemon runs after grow/shrink/grow"
+    # The daemon that was already up when the DVM grew has to learn the new
+    # daemon's vpid, because odls walks EVERY proc of a job -- not just its own
+    # -- to wire each one to its node, and one unresolvable parent throws away
+    # the whole child list, including the process that daemon was about to fork.
+    # prte_util_decode_nidmap() used to record the node->daemon binding only
+    # when it created a new node-pool entry, so on every wireup after its first
+    # a surviving daemon skipped the binding entirely and never heard of the new
+    # daemon; it launched nothing and the HNP, which had no such gap, waited
+    # forever (openpmix/prrte#2616). It also keyed the pool by packing position
+    # while the sender skips daemon-less nodes, so a shrink slid every later
+    # node onto the wrong slot -- which is why the grow does NOT have to reuse
+    # the node that was shrunk out for this to break.
+    #
+    # Only a job that SPANS the survivor shows this: the tests above launch
+    # "prun -n 1", which lands on the HNP alone and passes with the DVM in
+    # exactly this state. Grow, shrink a node, grow a different node, then run
+    # one proc per node and require every node to report.
+    cleanup_swarm
+    RUN 'nohup prte --daemonize --prtemca prte_elastic_mode 1 >/tmp/prte.out 2>&1 & sleep 8' >/dev/null
+    if RUN 'pgrep -x prte >/dev/null'; then
+        RUN 'timeout 90 elastic grow node2:2,node3:2' >/dev/null 2>&1
+        RUN 'timeout 90 elastic shrink node3' >/dev/null 2>&1; sleep 3
+        out=$(RUN 'timeout 90 elastic grow node4:2' 2>&1); sleep 3
+        echo "$out" | grep -q PMIX_DVM_IS_READY && ok "grow after the shrink completed" \
+                                               || bad "grow after the shrink did not complete"
+        # node2 survived both DVM changes; node4 arrived in the second grow
+        out=$(RUN 'timeout 60 prun -n 3 --map-by ppr:1:node hostname' 2>&1)
+        for n in node1 node2 node4; do
+            echo "$out" | grep -qw "$n" && ok "$n ran its proc after grow/shrink/grow" \
+                                        || bad "$n launched nothing after grow/shrink/grow (nidmap rebind)"
+        done
+        # Now re-grow the node that was shrunk OUT. It keeps the pool slot it
+        # always had, so this is the case that a slot-keyed decode cannot fix
+        # by placement alone: the survivor has the node, and only the daemon on
+        # it has changed. Nothing is rebound unless every decode rebinds.
+        RUN 'timeout 90 elastic grow node3:2' >/dev/null 2>&1; sleep 3
+        out=$(RUN 'timeout 60 prun -n 4 --map-by ppr:1:node hostname' 2>&1)
+        for n in node1 node2 node3 node4; do
+            echo "$out" | grep -qw "$n" && ok "$n ran its proc after the shrunk node was re-grown" \
+                                        || bad "$n launched nothing after the re-grow (nidmap rebind)"
+        done
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    else
+        bad "could not start an elastic DVM for the spanning-launch test"
+    fi
+    cleanup_swarm
+
+    banner "elastic DVM: a daemon re-grown into a vpid hole gets a live parent"
+    # The same shape as the case above, but at a radix small enough for the
+    # daemon tree to have depth -- which is the only way this defect is
+    # visible. A daemon launched into a DVM that has already shrunk starts with
+    # an EMPTY departed-rank set, so it computes its first routing tree from
+    # raw radix math and can pick a retired vpid as its parent. Everything it
+    # then sends upward is addressed to a rank nothing can contact, including
+    # the warm-up that asks for the nidmap that would have corrected the set --
+    # so it never learns, never reports in, and every job touching that node
+    # hangs. The launcher therefore carries the departed set on the prted
+    # command line (rml_base_dead_dmns), which is the only moment early enough.
+    #
+    # At the DEFAULT radix every daemon's parent is rank 0, which is always
+    # alive, so the whole thing is invisible -- the case above passes with the
+    # DVM in exactly this state. Hence the explicit radix here: without it this
+    # suite never exercises the fix at all.
+    #
+    # The vpids matter. grow node2,node3 -> shrink node3 -> grow node4 ->
+    # re-grow node3 gives node1=0, node2=1, node3(old)=2 (retired), node4=3,
+    # node3(new)=4 -- and at radix 2 the raw parent of rank 4 is rank 2.
+    cleanup_swarm
+    RUN 'nohup prte --daemonize --prtemca prte_elastic_mode 1 \
+                    --prtemca rml_base_radix 2 >/tmp/prte.out 2>&1 & sleep 8' >/dev/null
+    if RUN 'pgrep -x prte >/dev/null'; then
+        RUN 'timeout 90 elastic grow node2:2,node3:2' >/dev/null 2>&1
+        RUN 'timeout 90 elastic shrink node3' >/dev/null 2>&1; sleep 3
+        RUN 'timeout 90 elastic grow node4:2' >/dev/null 2>&1; sleep 3
+        out=$(RUN 'timeout 90 elastic grow node3:2' 2>&1); sleep 3
+        echo "$out" | grep -q "SUCCESS\|PMIX_DVM_IS_READY" \
+            && ok "the re-grow into the vpid hole completed at radix 2" \
+            || bad "re-grow into the vpid hole did not complete: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+        [ "$(prted_count 3)" = 1 ] && ok "a daemon is running on the re-grown node" \
+                                   || bad "no daemon on the re-grown node"
+        # The proof: a job spanning every node. The re-grown daemon can only
+        # report its procs launched if its lifeline is a rank that still
+        # exists, so a node missing from this output is the stranded daemon.
+        out=$(RUN 'timeout 60 prun -n 4 --map-by ppr:1:node hostname' 2>&1)
+        for n in node1 node2 node3 node4; do
+            echo "$out" | grep -qw "$n" \
+                && ok "$n ran its proc after the deep-tree re-grow" \
+                || bad "$n launched nothing after the deep-tree re-grow (departed set not carried at launch)"
+        done
+        # ...and the DVM is still usable afterwards, so a wedged daemon cannot
+        # pass the above by having merely delayed
+        out=$(RUN 'timeout 60 prun --host node3 -n 1 hostname' 2>&1 | tr -d '\r')
+        [ "$out" = node3 ] && ok "the re-grown node serves a job of its own" \
+                           || bad "the re-grown node is wedged: $out"
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    else
+        bad "could not start an elastic DVM for the deep-tree re-grow test"
     fi
     cleanup_swarm
 
@@ -5164,10 +5910,16 @@ gcc -o /root/staged_marker /root/staged_marker.c' >/dev/null 2>&1
 
     test_errmgr
 
+    test_odls
+
     test_grpcomm
 
-    test_slurm_alloc
-    test_slurm
+    test_pmix_cycling
+
+    test_pmix_server_teardown
+
+
+
 
     banner "bootstrap DVM: daemons come up on their own and agree on their ranks"
     # A bootstrapped DVM has no launcher: prted is started independently on

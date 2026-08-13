@@ -62,6 +62,7 @@
 #include "src/util/name_fns.h"
 #include "src/util/proc_info.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 
 #include "src/mca/errmgr/errmgr.h"
 #include "src/mca/ras/base/base.h"
@@ -210,7 +211,7 @@ static int setup_base(void)
             /* check if prefix matches */
             if (0 == strncmp(prte_process_info.tmpdir_base, list[i], strlen(list[i]))) {
                 /* this is a prohibited location */
-                pmix_show_help("help-prte-runtime.txt", "prte:session:dir:prohibited", true,
+                prte_show_help("help-prte-runtime.txt", "prte:session:dir:prohibited", true,
                                prte_process_info.tmpdir_base, prte_prohibited_session_dirs);
                 PMIx_Argv_free(list);
                 return PRTE_ERR_FATAL;
@@ -264,7 +265,7 @@ int prte_session_dir(pmix_proc_t *proc)
         }
     }
 
-    if (prte_debug_flag) {
+    if (prte_debug_daemons_flag) {
         pmix_output(0, "jobdir: %s", PRTE_PRINTF_FIX_STRING(jdata->session_dir));
         pmix_output(0, "top: %s", PRTE_PRINTF_FIX_STRING(prte_process_info.top_session_dir));
         pmix_output(0, "tmp: %s", PRTE_PRINTF_FIX_STRING(prte_process_info.tmpdir_base));

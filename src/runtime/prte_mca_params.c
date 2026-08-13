@@ -39,6 +39,7 @@
 
 #include "src/mca/base/pmix_mca_base_var.h"
 #include "src/mca/prteinstalldirs/prteinstalldirs.h"
+#include "src/grpcomm/grpcomm.h"
 #include "src/rml/rml.h"
 #include "src/util/pmix_argv.h"
 #include "src/util/pmix_output.h"
@@ -47,12 +48,15 @@
 #include "src/util/proc_info.h"
 #include "src/util/pmix_environ.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 #include "src/mca/errmgr/errmgr.h"
 
 #include "src/runtime/prte_globals.h"
 #include "src/runtime/runtime.h"
+#include "src/runtime/runtime_internals.h"
 
 static bool passed_thru = false;
+static bool paramfiles_passed_thru = false;
 static int prte_progress_thread_debug_level = -1;
 static char *prte_tmpdir_base = NULL;
 static char *prte_local_tmpdir_base = NULL;
@@ -74,6 +78,82 @@ char *prte_param_files = NULL;
 char *prte_override_param_file = NULL;
 bool prte_suppress_override_warning = false;
 
+/* Register the handful of parameters that say where PRRTE's MCA parameter
+ * files are and how they are combined.
+ *
+ * These have to be registered in a phase of their own, ahead of everything
+ * else, because prte_preload_default_mca_params() reads them to find the
+ * files and then publishes each file's contents into the environment - and an
+ * MCA variable evaluates its environment exactly once, when it is first
+ * registered.  Anything registered before the preload therefore reads an
+ * environment that does not yet hold the files' values and silently ignores
+ * them.  Splitting these out lets prte_init_minimum() register them, preload
+ * the files, and only then register everything else in prte_register_params().
+ *
+ * The corollary is that the parameters registered *here* cannot themselves be
+ * set from a parameter file - they are what locates those files - so they
+ * remain settable only from the environment or the command line.
+ */
+int prte_register_paramfile_params(void)
+{
+    char *string = NULL;
+#if PRTE_WANT_HOME_CONFIG_FILES
+    char *home;
+#endif
+
+    /* as with prte_register_params below, only go thru this once */
+    if (paramfiles_passed_thru) {
+        return PRTE_SUCCESS;
+    }
+    paramfiles_passed_thru = true;
+
+#if PRTE_WANT_HOME_CONFIG_FILES
+    home = (char *) pmix_home_directory(geteuid());
+    pmix_asprintf(&prte_param_files,
+                   "%s" PMIX_PATH_SEP ".prte" PMIX_PATH_SEP "mca-params.conf%c%s" PMIX_PATH_SEP
+                   "prte-mca-params.conf",
+                   home, ',', prte_install_dirs.sysconfdir);
+#else
+    /* --disable-per-user-config-files: only the system file is consulted */
+    pmix_asprintf(&prte_param_files, "%s" PMIX_PATH_SEP "prte-mca-params.conf",
+                  prte_install_dirs.sysconfdir);
+#endif
+    /* the var system takes the current value as the default and then hands
+     * back a string of its own, so keep a handle on ours to release - the
+     * same pattern used for every other computed string param here */
+    string = prte_param_files;
+
+    (void) pmix_mca_base_var_register("prte", "prte", NULL, "param_files",
+                                      "Path for MCA configuration files containing "
+                                      "variable values",
+                                      PMIX_MCA_BASE_VAR_TYPE_STRING,
+                                      &prte_param_files);
+    free(string);
+
+    (void) pmix_mca_base_var_register("prte", "prte", NULL, "override_param_file",
+                                      "Variables set in this file will override any value "
+                                      "set in the environment or another configuration file",
+                                      PMIX_MCA_BASE_VAR_TYPE_STRING,
+                                      &prte_override_param_file);
+
+    (void) pmix_mca_base_var_register("prte", "prte", NULL, "suppress_override_warning",
+                                      "Suppress warnings when attempting to set an "
+                                      "overridden value (default: false)",
+                                      PMIX_MCA_BASE_VAR_TYPE_BOOL,
+                                      &prte_suppress_override_warning);
+
+    /* bootstrap belongs in this phase as well: prte_init_minimum() acts on it
+     * (publishing the DVM-wide parameters out of prte.conf) before the rest of
+     * the parameters are registered, so learning it any later than this would
+     * be learning it too late to be obeyed */
+    (void) pmix_mca_base_var_register("prte", "prte", NULL, "bootstrap",
+                                      "Self-construct the DVM based on a configuration file (default: false)",
+                                      PMIX_MCA_BASE_VAR_TYPE_BOOL,
+                                      &prte_bootstrap_setup);
+
+    return PRTE_SUCCESS;
+}
+
 int prte_register_params(void)
 {
     int ret;
@@ -81,9 +161,6 @@ int prte_register_params(void)
     char *string = NULL;
     char *fstype = NULL;
     char cwd[MAXPATHLEN];
-#if PRTE_WANT_HOME_CONFIG_FILES
-    char *home;
-#endif
 
     /* only go thru this once - mpirun calls it twice, which causes
      * any error messages to show up twice
@@ -92,6 +169,13 @@ int prte_register_params(void)
         return PRTE_SUCCESS;
     }
     passed_thru = true;
+
+    /* a caller that reaches us without having gone thru prte_init_minimum()
+     * still needs these; the guard inside makes it a no-op when it has */
+    ret = prte_register_paramfile_params();
+    if (PRTE_SUCCESS != ret) {
+        return ret;
+    }
 
     /*
      * This string is going to be used in prte/util/stacktrace.c
@@ -207,7 +291,7 @@ int prte_register_params(void)
     if (NULL != prte_if_include && NULL != prte_if_exclude) {
         /* Return ERR_NOT_AVAILABLE so that a warning message about
          "open" failing is not printed */
-        pmix_show_help("help-oob-tcp.txt", "include-exclude", true,
+        prte_show_help("help-oob-tcp.txt", "include-exclude", true,
                        prte_if_include, prte_if_exclude);
         return PRTE_ERR_SILENT;
     }
@@ -317,7 +401,7 @@ int prte_register_params(void)
     prte_process_info.shared_fs = pmix_path_nfs(prte_process_info.tmpdir_base, &fstype);
     if (prte_process_info.shared_fs && !prte_silence_shared_fs) {
         // this is a shared file system - warn the user
-        pmix_show_help("help-prte-runtime.txt", "prte:session:dir:shared", true,
+        prte_show_help("help-prte-runtime.txt", "prte:session:dir:shared", true,
                        prte_process_info.tmpdir_base, fstype, prte_tool_basename);
     }
     if (NULL != fstype) {
@@ -540,46 +624,24 @@ int prte_register_params(void)
         return PRTE_ERROR;
     }
 
-#if PRTE_WANT_HOME_CONFIG_FILES
-    home = (char *) pmix_home_directory(geteuid());
-    pmix_asprintf(&prte_param_files,
-                   "%s" PMIX_PATH_SEP ".prte" PMIX_PATH_SEP "mca-params.conf%c%s" PMIX_PATH_SEP
-                   "prte-mca-params.conf",
-                   home, ',', prte_install_dirs.sysconfdir);
-#else
-    /* --disable-per-user-config-files: only the system file is consulted */
-    pmix_asprintf(&prte_param_files, "%s" PMIX_PATH_SEP "prte-mca-params.conf",
-                  prte_install_dirs.sysconfdir);
-#endif
-    /* the var system takes the current value as the default and then hands
-     * back a string of its own, so keep a handle on ours to release - the
-     * same pattern used for every other computed string param here */
-    string = prte_param_files;
+    /* the parameters naming the MCA parameter files, and prte_bootstrap, are
+     * registered ahead of us in prte_register_paramfile_params() - see the
+     * comment there for why they cannot live in this phase */
 
-   (void) pmix_mca_base_var_register("prte", "prte", NULL, "param_files",
-                                      "Path for MCA configuration files containing "
-                                      "variable values",
-                                      PMIX_MCA_BASE_VAR_TYPE_STRING,
-                                      &prte_param_files);
-    free(string);
-    string = NULL;
-
-    (void) pmix_mca_base_var_register("prte", "prte", NULL, "override_param_file",
-                                      "Variables set in this file will override any value "
-                                      "set in the environment or another configuration file",
-                                      PMIX_MCA_BASE_VAR_TYPE_STRING,
-                                      &prte_override_param_file);
-
-    (void) pmix_mca_base_var_register("prte", "prte", NULL, "suppress_override_warning",
-                                      "Suppress warnings when attempting to set an "
-                                      "overridden value (default: false)",
+    /* How a DAEMON learns whether its DVM is persistent. The HNP decides
+     * this for itself in prte() - which runs long after this registration,
+     * so registering it here cannot clobber the HNP's answer - and then
+     * passes it down to every daemon it launches
+     * (prte_plm_base_prted_append_basic_args). A daemon has no other way
+     * to know: it never runs prte(), and before this parameter existed it
+     * simply inherited the global's initializer and believed every DVM was
+     * persistent. */
+    (void) pmix_mca_base_var_register("prte", "prte", NULL, "persistent",
+                                      "DVM is persistent - it outlives the job(s) run against it "
+                                      "(default: false). Set by the HNP on the daemon command "
+                                      "line; not intended to be set by users",
                                       PMIX_MCA_BASE_VAR_TYPE_BOOL,
-                                      &prte_suppress_override_warning);
-
-    (void) pmix_mca_base_var_register("prte", "prte", NULL, "bootstrap",
-                                      "Self-construct the DVM based on a configuration file (default: false)",
-                                      PMIX_MCA_BASE_VAR_TYPE_BOOL,
-                                      &prte_bootstrap_setup);
+                                      &prte_persistent);
 
     (void) pmix_mca_base_var_register("prte", "prte", "elastic", "mode",
                                       "Allow DVM to expand and contract as directed (default: false)",
@@ -588,6 +650,10 @@ int prte_register_params(void)
 
     /* pickup the RML params */
     prte_rml_register();
+
+    /* and grpcomm's - it is no longer an MCA framework, so nothing
+     * registers its verbosity parameter on its behalf */
+    prte_grpcomm_register();
 
     return PRTE_SUCCESS;
 }

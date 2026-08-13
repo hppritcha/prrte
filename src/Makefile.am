@@ -82,3 +82,4 @@ include pmix/Makefile.am
 include event/Makefile.am
 include hwloc/Makefile.am
 include rml/Makefile.am
+include grpcomm/Makefile.am
