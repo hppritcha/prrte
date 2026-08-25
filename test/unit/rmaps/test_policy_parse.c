@@ -283,6 +283,222 @@ int test_policy_parse(void)
     free(sval);
     PMIX_RELEASE(app);
 
+    /* --- device= is per-app for the same reason: which devices one app of
+     * an MPMD job is placed against is its own business --- */
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "device=gpu");
+    CHECK("mapby device=gpu: rc", PRTE_SUCCESS == rc);
+    u16 = get_u16(&app->attributes, PRTE_APP_MAPBY);
+    CHECK("mapby device=gpu: policy", PRTE_MAPPING_BYDEVICE == PRTE_GET_MAPPING_POLICY(u16));
+    sval = get_str(&app->attributes, PRTE_APP_MAP_DEVICE);
+    CHECK("mapby device=gpu: spec", NULL != sval && 0 == strcmp(sval, "gpu"));
+    free(sval);
+    PMIX_RELEASE(app);
+
+    /* Every class is carried the same way, so a new one costs a value and
+     * not a code path.  The parser stores the spelling verbatim; which
+     * devices it names is the enumerator's question, and the qualifiers
+     * below apply to whatever the value turned out to be. */
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "device=nic:ndev=2:shared");
+    CHECK("mapby device=nic: rc", PRTE_SUCCESS == rc);
+    u16 = get_u16(&app->attributes, PRTE_APP_MAPBY);
+    CHECK("mapby device=nic: policy", PRTE_MAPPING_BYDEVICE == PRTE_GET_MAPPING_POLICY(u16));
+    sval = get_str(&app->attributes, PRTE_APP_MAP_DEVICE);
+    CHECK("mapby device=nic: spec", NULL != sval && 0 == strcmp(sval, "nic"));
+    free(sval);
+    CHECK("mapby device=nic: ndev qualifier",
+          2 == get_u16(&app->attributes, PRTE_APP_MAP_NDEV));
+    CHECK("mapby device=nic: shared qualifier",
+          prte_get_attribute(&app->attributes, PRTE_APP_MAP_SHARED, NULL, PMIX_BOOL));
+    PMIX_RELEASE(app);
+
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "device=fabric:interleave=numa");
+    CHECK("mapby device=fabric: rc", PRTE_SUCCESS == rc);
+    sval = get_str(&app->attributes, PRTE_APP_MAP_DEVICE);
+    CHECK("mapby device=fabric: spec", NULL != sval && 0 == strcmp(sval, "fabric"));
+    free(sval);
+    sval = get_str(&app->attributes, PRTE_APP_MAP_INTERLEAVE);
+    CHECK("mapby device=fabric: interleave qualifier",
+          NULL != sval && 0 == strcmp(sval, "numa"));
+    free(sval);
+    PMIX_RELEASE(app);
+
+    /* the value is read after the "=", not at a fixed offset past the full
+     * spelling - the directive may be abbreviated to any unambiguous prefix */
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "dev=mlx5_0");
+    CHECK("mapby dev=mlx5_0: rc", PRTE_SUCCESS == rc);
+    u16 = get_u16(&app->attributes, PRTE_APP_MAPBY);
+    CHECK("mapby dev=mlx5_0: policy", PRTE_MAPPING_BYDEVICE == PRTE_GET_MAPPING_POLICY(u16));
+    sval = get_str(&app->attributes, PRTE_APP_MAP_DEVICE);
+    CHECK("mapby dev=mlx5_0: spec read after the =",
+          NULL != sval && 0 == strcmp(sval, "mlx5_0"));
+    free(sval);
+    PMIX_RELEASE(app);
+
+    /* "device" with nothing after the "=" names no device at all */
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "device=");
+    CHECK("mapby device= with no value: refused", PRTE_SUCCESS != rc);
+    PMIX_RELEASE(app);
+
+    /* --- the interleave qualifier reorders a device list --- */
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "device=gpu:interleave");
+    CHECK("mapby interleave: rc", PRTE_SUCCESS == rc);
+    sval = get_str(&app->attributes, PRTE_APP_MAP_INTERLEAVE);
+    CHECK("mapby interleave: defaults to package",
+          NULL != sval && 0 == strcmp(sval, "package"));
+    free(sval);
+    PMIX_RELEASE(app);
+
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "device=gpu:interleave=numa");
+    CHECK("mapby interleave=numa: rc", PRTE_SUCCESS == rc);
+    sval = get_str(&app->attributes, PRTE_APP_MAP_INTERLEAVE);
+    CHECK("mapby interleave=numa: level honored",
+          NULL != sval && 0 == strcmp(sval, "numa"));
+    free(sval);
+    PMIX_RELEASE(app);
+
+    /* "node" is refused: interleaving across nodes is what SPAN expresses,
+     * and one behavior with two names composes into nonsense */
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "device=gpu:interleave=node");
+    CHECK("mapby interleave=node: refused", PRTE_SUCCESS != rc);
+    PMIX_RELEASE(app);
+
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "device=gpu:interleave=bogus");
+    CHECK("mapby interleave=bogus: refused", PRTE_SUCCESS != rc);
+    PMIX_RELEASE(app);
+
+    /* it reorders a DEVICE list, so it means nothing on any other map */
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "numa:interleave");
+    CHECK("mapby numa:interleave: refused", PRTE_SUCCESS != rc);
+    PMIX_RELEASE(app);
+
+    /* --- shared: a device may be given to more than one proc --- */
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "device=gpu:shared");
+    CHECK("mapby shared: rc", PRTE_SUCCESS == rc);
+    CHECK("mapby shared: recorded",
+          prte_get_attribute(&app->attributes, PRTE_APP_MAP_SHARED, NULL, PMIX_BOOL));
+    PMIX_RELEASE(app);
+
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "device=gpu:shared=true");
+    CHECK("mapby shared=true: recorded",
+          PRTE_SUCCESS == rc
+          && prte_get_attribute(&app->attributes, PRTE_APP_MAP_SHARED, NULL, PMIX_BOOL));
+    PMIX_RELEASE(app);
+
+    /* false is the default, so it records nothing - and must not be an error */
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "device=gpu:shared=false");
+    CHECK("mapby shared=false: accepted", PRTE_SUCCESS == rc);
+    CHECK("mapby shared=false: not recorded",
+          !prte_get_attribute(&app->attributes, PRTE_APP_MAP_SHARED, NULL, PMIX_BOOL));
+    PMIX_RELEASE(app);
+
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "device=gpu:shared=maybe");
+    CHECK("mapby shared=maybe: refused", PRTE_SUCCESS != rc);
+    PMIX_RELEASE(app);
+
+    /* it says devices may be shared, so it means nothing without devices */
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "numa:shared");
+    CHECK("mapby numa:shared: refused", PRTE_SUCCESS != rc);
+    PMIX_RELEASE(app);
+
+    /* The same prefix hazard as interleave, against a different neighbour:
+     * "shared" and "span" both begin with 's', and ":s" has meant SPAN for
+     * as long as there has been one.  The shared arm sits after it. */
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "device=gpu:s");
+    CHECK("mapby ':s' : rc", PRTE_SUCCESS == rc);
+    CHECK("mapby ':s' still means SPAN, not shared",
+          !prte_get_attribute(&app->attributes, PRTE_APP_MAP_SHARED, NULL, PMIX_BOOL));
+    u16 = get_u16(&app->attributes, PRTE_APP_MAPBY);
+    CHECK("mapby ':s' set the SPAN directive",
+          0 != (PRTE_MAPPING_SPAN & PRTE_GET_MAPPING_DIRECTIVE(u16)));
+    PMIX_RELEASE(app);
+
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "device=gpu:sh");
+    CHECK("mapby ':sh' is shared",
+          PRTE_SUCCESS == rc
+          && prte_get_attribute(&app->attributes, PRTE_APP_MAP_SHARED, NULL, PMIX_BOOL));
+    PMIX_RELEASE(app);
+
+    /* --- ndev: several devices to each proc --- */
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "device=gpu:ndev=2");
+    CHECK("mapby ndev=2: rc", PRTE_SUCCESS == rc);
+    u16 = get_u16(&app->attributes, PRTE_APP_MAP_NDEV);
+    CHECK("mapby ndev=2: value", 2 == u16);
+    PMIX_RELEASE(app);
+
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "device=gpu:ndev");
+    CHECK("mapby ndev with no value: refused", PRTE_SUCCESS != rc);
+    PMIX_RELEASE(app);
+
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "device=gpu:ndev=0");
+    CHECK("mapby ndev=0: refused", PRTE_SUCCESS != rc);
+    PMIX_RELEASE(app);
+
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "device=gpu:ndev=two");
+    CHECK("mapby ndev=two: refused", PRTE_SUCCESS != rc);
+    PMIX_RELEASE(app);
+
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "numa:ndev=2");
+    CHECK("mapby numa:ndev: refused", PRTE_SUCCESS != rc);
+    PMIX_RELEASE(app);
+
+    /* THE regression that matters: "interleave" and "inherit" share a first
+     * letter, and the option matcher has no view of the other options - the
+     * first arm of the chain that prefix-matches wins. ":i" has meant
+     * INHERIT for as long as there has been one, so an interleave arm tested
+     * before the inherit arm would silently change what a working command
+     * line does. No error, no warning, a different mapping. */
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "device=gpu:i");
+    CHECK("mapby device=gpu:i : rc", PRTE_SUCCESS == rc);
+    CHECK("mapby ':i' still means INHERIT, not interleave",
+          !prte_get_attribute(&app->attributes, PRTE_APP_MAP_INTERLEAVE, NULL, PMIX_STRING));
+    PMIX_RELEASE(app);
+
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "device=gpu:in");
+    CHECK("mapby device=gpu:in : rc", PRTE_SUCCESS == rc);
+    CHECK("mapby ':in' still means INHERIT",
+          !prte_get_attribute(&app->attributes, PRTE_APP_MAP_INTERLEAVE, NULL, PMIX_STRING));
+    PMIX_RELEASE(app);
+
+    /* ...while ":int" is unambiguously interleave */
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "device=gpu:int");
+    CHECK("mapby ':int' is interleave",
+          PRTE_SUCCESS == rc
+          && prte_get_attribute(&app->attributes, PRTE_APP_MAP_INTERLEAVE, NULL, PMIX_STRING));
+    PMIX_RELEASE(app);
+
+    /* there is deliberately no bare "gpu" spelling: the class is the
+     * directive's VALUE, which is what lets a new class be supported by
+     * adding a value rather than a directive */
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "gpu");
+    CHECK("mapby bare gpu: refused", PRTE_SUCCESS != rc);
+    PMIX_RELEASE(app);
+
     /* the value is validated here, not left for the mapper to trip over */
     app = PMIX_NEW(prte_app_context_t);
     rc = prte_rmaps_base_set_app_mapping_policy(app, "pe-list=0-3-5");

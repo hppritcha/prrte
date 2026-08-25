@@ -65,6 +65,7 @@
 #include "src/util/prte_show_help.h"
 
 #include "src/mca/errmgr/errmgr.h"
+#include "src/mca/odls/base/base.h"
 #include "src/grpcomm/grpcomm.h"
 #include "src/mca/ras/base/base.h"
 #include "src/mca/state/state.h"
@@ -137,257 +138,327 @@ typedef struct {
     char **attrs;
 } prte_regattr_input_t;
 
+/* The attributes PRRTE - acting as the PMIx *host* environment - genuinely
+ * reads.  PMIx keeps them on its "host" level, so a caller asking
+ * PMIX_QUERY_ATTRIBUTE_SUPPORT about the runtime gets this table back.
+ *
+ * Three rules keep it truthful:
+ *
+ * - list an attribute only where this code base actually acts on it.  What
+ *   the PMIx client or server library consumes on our behalf - the fence's
+ *   PMIX_COLLECT_DATA, PMIX_EMBED_BARRIER, the PMIx_Process_monitor
+ *   directives - is registered by PMIx at its own levels, and echoing it
+ *   here would claim it twice;
+ * - where PRRTE accepts a deprecated spelling alongside the current one
+ *   (PMIX_TAG_OUTPUT for PMIX_IOF_TAG_OUTPUT, and its siblings), advertise
+ *   only the current one.  The old spelling still works; it is simply not
+ *   something to recommend.  A deprecated attribute with no successor -
+ *   PMIX_HWLOC_XML_V1, PMIX_PROC_URI, PMIX_IOF_STOP - is listed, because it
+ *   is the only spelling that works;
+ * - "NONE" means the API is supported but takes no host attribute; "N/A"
+ *   that it takes no attributes at all.
+ *
+ * A blocking API and its non-blocking twin reach the same code, so they name
+ * the same array.  Spelling each pair out separately is what let the Spawn
+ * and Query lists drift apart from one another.
+ *
+ * Nothing checks this table against the code.  When you teach a server
+ * upcall to honor a new directive - or stop honoring one - update it in the
+ * same commit: a stale entry is worse than a missing one, since it promises
+ * behavior that is not there.
+ */
+
+static char *prte_attrs_none[] = {"NONE", NULL};
+static char *prte_attrs_na[] = {"N/A", NULL};
+
+/* PMIx_Get: the direct-modex upcall.  No PMIX_TIMEOUT - PMIx deliberately
+ * sets no timeout on a host request, and we honor none of our own. */
+static char *prte_attrs_get[] = {"PMIX_GET_REFRESH_CACHE",
+                                 "PMIX_REQUIRED_KEY",
+                                 NULL};
+
+/* PMIx_Fence, and the connect/disconnect operations built on it */
+static char *prte_attrs_fence[] = {"PMIX_TIMEOUT",
+                                   "PMIX_LOCAL_COLLECTIVE_STATUS",
+                                   NULL};
+
+static char *prte_attrs_connect[] = {"PMIX_TIMEOUT",
+                                     "PMIX_LOCAL_COLLECTIVE_STATUS",
+                                     "PMIX_PROC_INFO_ARRAY",
+                                     "PMIX_JOB_INFO_ARRAY",
+                                     NULL};
+
+/* the publish/lookup family - served by the DVM's data server */
+static char *prte_attrs_publish[] = {"PMIX_RANGE",
+                                     "PMIX_PERSISTENCE",
+                                     "PMIX_ACCESS_PERMISSIONS",
+                                     "PMIX_ACCESS_USERIDS",
+                                     "PMIX_ACCESS_GRPIDS",
+                                     NULL};
+
+static char *prte_attrs_lookup[] = {"PMIX_RANGE",
+                                    "PMIX_WAIT",
+                                    "PMIX_TIMEOUT",
+                                    NULL};
+
+static char *prte_attrs_unpublish[] = {"PMIX_RANGE", NULL};
+
+static char *prte_attrs_spawn[] = {"PMIX_PERSONALITY",
+                                   /* where it runs */
+                                   "PMIX_HOST",
+                                   "PMIX_HOSTFILE",
+                                   "PMIX_ADD_HOST",
+                                   "PMIX_ADD_HOSTFILE",
+                                   "PMIX_PREFIX",
+                                   "PMIX_WDIR",
+                                   "PMIX_WDIR_USER_SPECIFIED",
+                                   "PMIX_SET_SESSION_CWD",
+                                   "PMIX_PRELOAD_BIN",
+                                   "PMIX_PRELOAD_FILES",
+                                   "PMIX_EXEC_AGENT",
+                                   /* environment */
+                                   "PMIX_SET_ENVAR",
+                                   "PMIX_ADD_ENVAR",
+                                   "PMIX_UNSET_ENVAR",
+                                   "PMIX_PREPEND_ENVAR",
+                                   "PMIX_APPEND_ENVAR",
+                                   "PMIX_ENVARS_HARVESTED",
+                                   "PMIX_FWD_ENVIRONMENT",
+                                   /* mapping, ranking, binding */
+                                   "PMIX_PPR",
+                                   "PMIX_MAPBY",
+                                   "PMIX_RANKBY",
+                                   "PMIX_BINDTO",
+                                   "PMIX_CPUS_PER_PROC",
+                                   "PMIX_CPU_LIST",
+                                   "PMIX_NO_PROCS_ON_HEAD",
+                                   "PMIX_NO_OVERSUBSCRIBE",
+                                   "PMIX_COLOCATE_PROCS",
+                                   "PMIX_COLOCATE_NPERPROC",
+                                   "PMIX_COLOCATE_NPERNODE",
+                                   "PMIX_PSET_NAME",
+                                   /* what to display about the placement */
+                                   "PMIX_DISPLAY_MAP",
+                                   "PMIX_DISPLAY_MAP_DETAILED",
+                                   "PMIX_DISPLAY_ALLOCATION",
+                                   "PMIX_DISPLAY_TOPOLOGY",
+                                   "PMIX_DISPLAY_PROCESSORS",
+                                   "PMIX_DISPLAY_PARSEABLE_OUTPUT",
+                                   "PMIX_REPORT_BINDINGS",
+                                   "PMIX_REPORT_PHYSICAL_CPUS",
+                                   /* how the job behaves */
+                                   "PMIX_RUNTIME_OPTIONS",
+                                   "PMIX_ABORT_NON_ZERO_TERM",
+                                   "PMIX_DO_NOT_LAUNCH",
+                                   "PMIX_SHOW_LAUNCH_PROGRESS",
+                                   "PMIX_SPAWN_CHILD_SEP",
+                                   "PMIX_INDEX_ARGV",
+                                   "PMIX_NON_PMI",
+                                   "PMIX_GPU_SUPPORT",
+                                   "PMIX_JOB_RECOVERABLE",
+                                   "PMIX_MAX_RESTARTS",
+                                   "PMIX_JOB_CONTINUOUS",
+                                   "PMIX_NOTIFY_COMPLETION",
+                                   /* who asked, and against what allocation */
+                                   "PMIX_PARENT_ID",
+                                   "PMIX_REQUESTOR_IS_TOOL",
+                                   "PMIX_SPAWN_TOOL",
+                                   "PMIX_SESSION_ID",
+                                   "PMIX_ALLOC_ID",
+                                   "PMIX_ALLOC_REQ_ID",
+                                   "PMIX_SPAWN_TARGET",
+                                   "PMIX_SPAWN_ALLOC",
+                                   /* debugger support */
+                                   "PMIX_DEBUG_STOP_ON_EXEC",
+                                   "PMIX_DEBUG_STOP_IN_INIT",
+                                   "PMIX_DEBUG_STOP_IN_APP",
+                                   "PMIX_DEBUGGER_DAEMONS",
+                                   "PMIX_DEBUG_TARGET",
+                                   "PMIX_DEBUG_DAEMONS_PER_NODE",
+                                   "PMIX_DEBUG_DAEMONS_PER_PROC",
+                                   /* output handling */
+                                   "PMIX_IOF_TAG_OUTPUT",
+                                   "PMIX_IOF_TAG_DETAILED_OUTPUT",
+                                   "PMIX_IOF_TAG_FULLNAME_OUTPUT",
+                                   "PMIX_IOF_RANK_OUTPUT",
+                                   "PMIX_IOF_TIMESTAMP_OUTPUT",
+                                   "PMIX_IOF_XML_OUTPUT",
+                                   "PMIX_IOF_OUTPUT_RAW",
+                                   "PMIX_IOF_OUTPUT_TO_FILE",
+                                   "PMIX_IOF_OUTPUT_TO_DIRECTORY",
+                                   "PMIX_IOF_FILE_PATTERN",
+                                   "PMIX_IOF_FILE_ONLY",
+                                   "PMIX_IOF_MERGE_STDERR_STDOUT",
+                                   "PMIX_STDIN_TGT",
+                                   "PMIX_LOG_AGG",
+                                   "PMIX_AGGREGATE_HELP",
+                                   /* timeouts */
+                                   "PMIX_TIMEOUT",
+                                   "PMIX_SPAWN_TIMEOUT",
+                                   "PMIX_JOB_TIMEOUT",
+                                   "PMIX_TIMEOUT_STACKTRACES",
+                                   "PMIX_TIMEOUT_REPORT_STATE",
+                                   NULL};
+
+/* PMIx_Query_info: the keys we answer, followed by the qualifiers that
+ * scope an answer */
+static char *prte_attrs_query[] = {"PMIX_QUERY_NAMESPACES",
+                                   "PMIX_QUERY_NAMESPACE_INFO",
+                                   "PMIX_QUERY_SPAWN_SUPPORT",
+                                   "PMIX_QUERY_DEBUG_SUPPORT",
+                                   "PMIX_QUERY_PROC_TABLE",
+                                   "PMIX_QUERY_LOCAL_PROC_TABLE",
+                                   "PMIX_QUERY_NUM_PSETS",
+                                   "PMIX_QUERY_PSET_NAMES",
+                                   "PMIX_QUERY_PSET_MEMBERSHIP",
+                                   "PMIX_QUERY_NUM_GROUPS",
+                                   "PMIX_QUERY_GROUP_NAMES",
+                                   "PMIX_QUERY_GROUP_MEMBERSHIP",
+                                   "PMIX_QUERY_RESOLVE_PEERS",
+                                   "PMIX_QUERY_RESOLVE_NODE",
+                                   "PMIX_QUERY_ALLOCATION",
+#ifdef PMIX_QUERY_ALLOC_IDS
+                                   "PMIX_QUERY_ALLOC_IDS",
+#endif
+#ifdef PMIX_QUERY_ALLOC_PROPERTIES
+                                   "PMIX_QUERY_ALLOC_PROPERTIES",
+#endif
+                                   "PMIX_QUERY_AVAILABLE_SLOTS",
+                                   "PMIX_NUM_SLOTS",
+                                   "PMIX_JOB_SIZE",
+                                   "PMIX_HWLOC_XML_V1",
+                                   "PMIX_HWLOC_XML_V2",
+                                   "PMIX_PROC_URI",
+                                   "PMIX_SERVER_URI",
+                                   /* qualifiers */
+                                   "PMIX_NSPACE",
+                                   "PMIX_GROUP_ID",
+                                   "PMIX_HOSTNAME",
+                                   "PMIX_NODEID",
+                                   "PMIX_PSET_NAME",
+                                   "PMIX_SESSION_ID",
+                                   "PMIX_ALLOC_ID",
+#ifdef PMIX_ALLOC_PROPERTY
+                                   "PMIX_ALLOC_PROPERTY",
+#endif
+                                   NULL};
+
+static char *prte_attrs_jobctrl[] = {"PMIX_JOB_CTRL_KILL",
+                                     "PMIX_JOB_CTRL_TERMINATE",
+                                     "PMIX_JOB_CTRL_SIGNAL",
+                                     "PMIX_JOB_CTRL_DEFINE_PSET",
+                                     "PMIX_GROUP_ASSIGN_CONTEXT_ID",
+                                     NULL};
+
+/* every group operation is parsed by one routine in grpcomm, so construct
+ * and destruct take the same directives */
+static char *prte_attrs_group[] = {"PMIX_GROUP_ASSIGN_CONTEXT_ID",
+                                   "PMIX_GROUP_BOOTSTRAP",
+                                   "PMIX_GROUP_ADD_MEMBERS",
+                                   "PMIX_GROUP_INFO",
+                                   "PMIX_GROUP_FINAL_MEMBERSHIP_ORDER",
+#if PRTE_PMIX_HAVE_GROUP_FT
+                                   "PMIX_GROUP_FT_COLLECTIVE",
+#endif
+                                   "PMIX_PROC_INFO_ARRAY",
+                                   "PMIX_LOCAL_COLLECTIVE_STATUS",
+                                   "PMIX_TIMEOUT",
+                                   NULL};
+
+/* An allocation request is passed to whichever ras component owns the
+ * allocation; only these reach a module that can act on them.  PMIX_HOST and
+ * PMIX_HOSTFILE name the nodes of a PMIX_ALLOC_ACTIVATE request, which the
+ * ras base serves itself. */
+static char *prte_attrs_alloc[] = {"PMIX_ALLOC_ID",
+                                   "PMIX_ALLOC_REQ_ID",
+                                   "PMIX_ALLOC_NUM_NODES",
+                                   "PMIX_ALLOC_NODE_LIST",
+#if defined(PMIX_ALLOC_ACTIVATE)
+                                   "PMIX_HOST",
+                                   "PMIX_HOSTFILE",
+#endif
+                                   NULL};
+
+static char *prte_attrs_session[] = {"PMIX_SESSION_CTRL_ID",
+                                     "PMIX_REQUESTOR",
+                                     "PMIX_SESSION_INSTANTIATE",
+                                     "PMIX_SESSION_RESOURCES",
+                                     "PMIX_SESSION_JOB",
+                                     "PMIX_SESSION_APP",
+                                     "PMIX_SESSION_PAUSE",
+                                     "PMIX_SESSION_RESUME",
+                                     "PMIX_SESSION_TERMINATE",
+                                     "PMIX_SESSION_COMPLETE",
+                                     "PMIX_SESSION_PREEMPT",
+                                     "PMIX_SESSION_RESTORE",
+                                     "PMIX_SESSION_SIGNAL",
+                                     "PMIX_SESSION_EXTEND",
+                                     "PMIX_SESSION_SEP",
+                                     "PMIX_ALLOC_ID",
+                                     "PMIX_ALLOC_REQ_ID",
+                                     "PMIX_ALLOC_NODE_LIST",
+                                     "PMIX_ALLOC_TIME",
+#if defined(PMIX_ALLOC_INHERITANCE)
+                                     "PMIX_ALLOC_INHERITANCE",
+#endif
+                                     "PMIX_PERSONALITY",
+                                     "PMIX_USERID",
+                                     "PMIX_GRPID",
+                                     "PMIX_NSPACE",
+                                     "PMIX_TIMEOUT",
+                                     NULL};
+
+/* the one directive our IOF pull upcall reads; the channels themselves are
+ * a parameter of the call, not an attribute */
+static char *prte_attrs_iofpull[] = {"PMIX_IOF_STOP", NULL};
+
 static prte_regattr_input_t prte_attributes[] = {
-    {.function = "PMIx_Init", .attrs = (char *[]){"NONE", NULL}},
-    {.function = "PMIx_Finalize", .attrs = (char *[]){"PMIX_EMBED_BARRIER", NULL}},
-    {.function = "PMIx_Abort", .attrs = (char *[]){"N/A", NULL}},
-    {.function = "PMIx_Fence", .attrs = (char *[]){"NONE", NULL}},
-    {.function = "PMIx_Fence_nb", .attrs = (char *[]){"NONE", NULL}},
-    {.function = "PMIx_Get",
-     .attrs = (char *[]){"PMIX_GET_REFRESH_CACHE", "PMIX_REQUIRED_KEY", "PMIX_TIMEOUT", NULL}},
-    {.function = "PMIx_Get_nb",
-     .attrs = (char *[]){"PMIX_GET_REFRESH_CACHE", "PMIX_REQUIRED_KEY", "PMIX_TIMEOUT", NULL}},
-    {.function = "PMIx_Publish", .attrs = (char *[]){"PMIX_RANGE", "PMIX_TIMEOUT", NULL}},
-    {.function = "PMIx_Publish_nb", .attrs = (char *[]){"PMIX_RANGE", "PMIX_TIMEOUT", NULL}},
-    {.function = "PMIx_Lookup", .attrs = (char *[]){"PMIX_RANGE", "PMIX_TIMEOUT", NULL}},
-    {.function = "PMIx_Lookup_nb", .attrs = (char *[]){"PMIX_RANGE", "PMIX_TIMEOUT", NULL}},
-    {.function = "PMIx_Unpublish", .attrs = (char *[]){"PMIX_RANGE", "PMIX_TIMEOUT", NULL}},
-    {.function = "PMIx_Unpublish_nb", .attrs = (char *[]){"PMIX_RANGE", "PMIX_TIMEOUT", NULL}},
-    {.function = "PMIx_Spawn",
-     .attrs = (char *[]){"PMIX_HOST",
-                         "PMIX_HOSTFILE",
-                         "PMIX_ADD_HOSTFILE",
-                         "PMIX_ADD_HOST",
-                         "PMIX_PREFIX",
-                         "PMIX_WDIR",
-                         "PMIX_PRELOAD_BIN",
-                         "PMIX_PRELOAD_FILES",
-                         "PMIX_SET_ENVAR",
-                         "PMIX_ADD_ENVAR",
-                         "PMIX_UNSET_ENVAR",
-                         "PMIX_PREPEND_ENVAR",
-                         "PMIX_APPEND_ENVAR",
-                         "PMIX_ENVARS_HARVESTED",
-                         "PMIX_PSET_NAME",
-                         "PMIX_PERSONALITY",
-                         "PMIX_DISPLAY_MAP",
-                         "PMIX_PPR",
-                         "PMIX_MAPBY",
-                         "PMIX_RANKBY",
-                         "PMIX_BINDTO",
-                         "PMIX_CPUS_PER_PROC",
-                         "PMIX_NO_PROCS_ON_HEAD",
-                         "PMIX_NO_OVERSUBSCRIBE",
-                         "PMIX_REPORT_BINDINGS",
-                         "PMIX_CPU_LIST",
-                         "PMIX_JOB_RECOVERABLE",
-                         "PMIX_MAX_RESTARTS",
-                         "PMIX_JOB_CONTINUOUS",
-                         "PMIX_NON_PMI",
-                         "PMIX_PARENT_ID",
-                         "PMIX_REQUESTOR_IS_TOOL",
-                         "PMIX_NOTIFY_COMPLETION",
-                         "PMIX_DEBUG_STOP_ON_EXEC",
-                         "PMIX_DEBUG_STOP_IN_INIT",
-                         "PMIX_DEBUG_STOP_IN_APP",
-                         "PMIX_TAG_OUTPUT",
-                         "PMIX_IOF_TAG_OUTPUT",
-                         "PMIX_TIMESTAMP_OUTPUT",
-                         "PMIX_IOF_TIMESTAMP_OUTPUT",
-                         "PMIX_IOF_XML_OUTPUT",
-                         "PMIX_OUTPUT_TO_FILE",
-                         "PMIX_IOF_OUTPUT_TO_FILE",
-                         "PMIX_OUTPUT_TO_DIRECTORY",
-                         "PMIX_IOF_OUTPUT_TO_DIRECTORY",
-                         "PMIX_OUTPUT_NOCOPY",
-                         "PMIX_IOF_FILE_ONLY",
-                         "PMIX_MERGE_STDERR_STDOUT",
-                         "PMIX_IOF_MERGE_STDERR_STDOUT",
-                         "PMIX_STDIN_TGT",
-                         "PMIX_INDEX_ARGV",
-                         "PMIX_DEBUGGER_DAEMONS",
-                         "PMIX_SPAWN_TOOL",
-                         "PMIX_DEBUG_TARGET",
-                         "PMIX_DEBUG_DAEMONS_PER_NODE",
-                         "PMIX_DEBUG_DAEMONS_PER_PROC",
-                         "PMIX_TIMEOUT",
-                         "PMIX_TIMEOUT_STACKTRACES",
-                         "PMIX_TIMEOUT_REPORT_STATE",
-                         NULL}},
-    {.function = "PMIx_Spawn_nb",
-     .attrs = (char *[]){"PMIX_HOST",
-                         "PMIX_HOSTFILE",
-                         "PMIX_ADD_HOSTFILE",
-                         "PMIX_ADD_HOST",
-                         "PMIX_PREFIX",
-                         "PMIX_WDIR",
-                         "PMIX_PRELOAD_BIN",
-                         "PMIX_PRELOAD_FILES",
-                         "PMIX_SET_ENVAR",
-                         "PMIX_ADD_ENVAR",
-                         "PMIX_UNSET_ENVAR",
-                         "PMIX_PREPEND_ENVAR",
-                         "PMIX_APPEND_ENVAR",
-                         "PMIX_ENVARS_HARVESTED",
-                         "PMIX_PSET_NAME",
-                         "PMIX_PERSONALITY",
-                         "PMIX_DISPLAY_MAP",
-                         "PMIX_PPR",
-                         "PMIX_MAPBY",
-                         "PMIX_RANKBY",
-                         "PMIX_BINDTO",
-                         "PMIX_CPUS_PER_PROC",
-                         "PMIX_NO_PROCS_ON_HEAD",
-                         "PMIX_NO_OVERSUBSCRIBE",
-                         "PMIX_REPORT_BINDINGS",
-                         "PMIX_CPU_LIST",
-                         "PMIX_JOB_RECOVERABLE",
-                         "PMIX_MAX_RESTARTS",
-                         "PMIX_JOB_CONTINUOUS",
-                         "PMIX_NON_PMI",
-                         "PMIX_PARENT_ID",
-                         "PMIX_REQUESTOR_IS_TOOL",
-                         "PMIX_NOTIFY_COMPLETION",
-                         "PMIX_DEBUG_STOP_ON_EXEC",
-                         "PMIX_DEBUG_STOP_IN_INIT",
-                         "PMIX_DEBUG_STOP_IN_APP",
-                         "PMIX_TAG_OUTPUT",
-                         "PMIX_IOF_TAG_OUTPUT",
-                         "PMIX_TIMESTAMP_OUTPUT",
-                         "PMIX_IOF_TIMESTAMP_OUTPUT",
-                         "PMIX_IOF_XML_OUTPUT",
-                         "PMIX_OUTPUT_TO_FILE",
-                         "PMIX_IOF_OUTPUT_TO_FILE",
-                         "PMIX_OUTPUT_TO_DIRECTORY",
-                         "PMIX_IOF_OUTPUT_TO_DIRECTORY",
-                         "PMIX_OUTPUT_NOCOPY",
-                         "PMIX_IOF_FILE_ONLY",
-                         "PMIX_MERGE_STDERR_STDOUT",
-                         "PMIX_IOF_MERGE_STDERR_STDOUT",
-                         "PMIX_STDIN_TGT",
-                         "PMIX_INDEX_ARGV",
-                         "PMIX_DEBUGGER_DAEMONS",
-                         "PMIX_SPAWN_TOOL",
-                         "PMIX_DEBUG_TARGET",
-                         "PMIX_DEBUG_DAEMONS_PER_NODE",
-                         "PMIX_DEBUG_DAEMONS_PER_PROC",
-                         "PMIX_TIMEOUT",
-                         "PMIX_TIMEOUT_STACKTRACES",
-                         "PMIX_TIMEOUT_REPORT_STATE",
-                         NULL}},
-    {.function = "PMIx_Connect", .attrs = (char *[]){"NONE", NULL}},
-    {.function = "PMIx_Connect_nb", .attrs = (char *[]){"NONE", NULL}},
-    {.function = "PMIx_Disconnect", .attrs = (char *[]){"NONE", NULL}},
-    {.function = "PMIx_Disconnect_nb", .attrs = (char *[]){"NONE", NULL}},
-    {.function = "PMIx_Query_info",
-     .attrs = (char *[]){"PMIX_QUERY_NAMESPACES",
-                         "PMIX_QUERY_NAMESPACE_INFO",
-                         "PMIX_QUERY_SPAWN_SUPPORT",
-                         "PMIX_QUERY_DEBUG_SUPPORT",
-                         "PMIX_HWLOC_XML_V1",
-                         "PMIX_HWLOC_XML_V2",
-                         "PMIX_PROC_URI",
-                         "PMIX_QUERY_PROC_TABLE",
-                         "PMIX_QUERY_LOCAL_PROC_TABLE",
-                         "PMIX_QUERY_NUM_PSETS",
-                         "PMIX_QUERY_PSET_NAMES",
-                         "PMIX_JOB_SIZE",
-                         "PMIX_QUERY_NUM_GROUPS",
-                         "PMIX_QUERY_GROUP_NAMES",
-                         "PMIX_QUERY_GROUP_MEMBERSHIP",
-                         "PMIX_NUM_SLOTS",
-                         NULL}},
-    {.function = "PMIx_Query_info_nb",
-     .attrs = (char *[]){"PMIX_QUERY_NAMESPACES",
-                         "PMIX_QUERY_NAMESPACE_INFO",
-                         "PMIX_QUERY_SPAWN_SUPPORT",
-                         "PMIX_QUERY_DEBUG_SUPPORT",
-                         "PMIX_HWLOC_XML_V1",
-                         "PMIX_HWLOC_XML_V2",
-                         "PMIX_PROC_URI",
-                         "PMIX_QUERY_PROC_TABLE",
-                         "PMIX_QUERY_LOCAL_PROC_TABLE",
-                         "PMIX_QUERY_NUM_PSETS",
-                         "PMIX_QUERY_PSET_NAMES",
-                         "PMIX_JOB_SIZE",
-                         "PMIX_QUERY_NUM_GROUPS",
-                         "PMIX_QUERY_GROUP_NAMES",
-                         "PMIX_QUERY_GROUP_MEMBERSHIP",
-                         "PMIX_QUERY_ALLOCATION",
-                         "PMIX_QUERY_ALLOC_IDS",
-                         "PMIX_QUERY_ALLOC_PROPERTIES",
-                         "PMIX_QUERY_ALLOC_STATUS",
-                         "PMIX_NUM_SLOTS",
-                         NULL}},
-    {.function = "PMIx_Log", .attrs = (char *[]){"NONE", NULL}},
-    {.function = "PMIx_Log_nb", .attrs = (char *[]){"NONE", NULL}},
-    {.function = "PMIx_Job_control",
-     .attrs = (char *[]){"PMIX_JOB_CTRL_KILL",
-                         "PMIX_JOB_CTRL_TERMINATE",
-                         "PMIX_JOB_CTRL_SIGNAL",
-                         NULL}},
-    {.function = "PMIx_Job_control_nb",
-     .attrs = (char *[]){"PMIX_JOB_CTRL_KILL",
-                         "PMIX_JOB_CTRL_TERMINATE",
-                         "PMIX_JOB_CTRL_SIGNAL",
-                         NULL}},
-    {.function = "PMIx_Group_construct",
-     .attrs = (char *[]){"PMIX_GROUP_ASSIGN_CONTEXT_ID",
-                         "PMIX_EMBED_BARRIER",
-                         "PMIX_GROUP_ENDPT_DATA",
-                         NULL}},
-    {.function = "PMIx_Group_construct_nb",
-     .attrs = (char *[]){"PMIX_GROUP_ASSIGN_CONTEXT_ID",
-                         "PMIX_EMBED_BARRIER",
-                         "PMIX_GROUP_ENDPT_DATA",
-                         NULL}},
-    {.function = "PMIx_Group_invite", .attrs = (char *[]){"NONE", NULL}},
-    {.function = "PMIx_Group_invite_nb", .attrs = (char *[]){"NONE", NULL}},
-    {.function = "PMIx_Group_join", .attrs = (char *[]){"NONE", NULL}},
-    {.function = "PMIx_Group_join_nb", .attrs = (char *[]){"NONE", NULL}},
-    {.function = "PMIx_Group_leave", .attrs = (char *[]){"NONE", NULL}},
-    {.function = "PMIx_Group_leave_nb", .attrs = (char *[]){"NONE", NULL}},
-    {.function = "PMIx_Group_destruct", .attrs = (char *[]){"PMIX_EMBED_BARRIER", NULL}},
-    {.function = "PMIx_Group_destruct_nb", .attrs = (char *[]){"PMIX_EMBED_BARRIER", NULL}},
-    {.function = "PMIx_Register_event_handler", .attrs = (char *[]){"NONE", NULL}},
-    {.function = "PMIx_Deregister_event_handler", .attrs = (char *[]){"N/A", NULL}},
-    {.function = "PMIx_Notify_event", .attrs = (char *[]){"NONE", NULL}},
-    {.function = "PMIx_Allocate_resources",
-     .attrs = (char *[]){"PMIX_ALLOC_REQ_ID",
-                         "PMIX_ALLOC_NUM_NODES",
-                         "PMIX_ALLOC_NODE_LIST",
-                         "PMIX_ALLOC_NUM_CPUS",
-                         "PMIX_ALLOC_NUM_CPU_LIST",
-                         "PMIX_ALLOC_CPU_LIST",
-                         "PMIX_ALLOC_MEM_SIZE",
-                         "PMIX_ALLOC_TIME",
-                         "PMIX_ALLOC_QUEUE",
-                         "PMIX_ALLOC_PREEMPTIBLE",
-                         NULL}},
-    {.function = "PMIx_Session_control",
-     .attrs = (char *[]){"PMIX_SESSION_CTRL_ID",
-                         "PMIX_REQUESTOR",
-                         "PMIX_SESSION_INSTANTIATE",
-                         "PMIX_SESSION_RESOURCES",
-                         "PMIX_SESSION_JOB",
-                         "PMIX_SESSION_APP",
-                         "PMIX_SESSION_PAUSE",
-                         "PMIX_SESSION_RESUME",
-                         "PMIX_SESSION_TERMINATE",
-                         "PMIX_SESSION_PREEMPT",
-                         "PMIX_SESSION_RESTORE",
-                         "PMIX_SESSION_SIGNAL",
-                         "PMIX_SESSION_EXTEND",
-                         "PMIX_SESSION_SEP",
-                         "PMIX_ALLOC_ID",
-                         "PMIX_ALLOC_REQ_ID",
-                         "PMIX_ALLOC_NODE_LIST",
-                         "PMIX_ALLOC_TIME",
-                         "PMIX_PERSONALITY",
-                         "PMIX_USERID",
-                         "PMIX_NSPACE",
-                         "PMIX_TIMEOUT",
-                         NULL}},
+    {.function = "PMIx_Init", .attrs = prte_attrs_none},
+    {.function = "PMIx_Finalize", .attrs = prte_attrs_none},
+    {.function = "PMIx_Abort", .attrs = prte_attrs_na},
+    {.function = "PMIx_Fence", .attrs = prte_attrs_fence},
+    {.function = "PMIx_Fence_nb", .attrs = prte_attrs_fence},
+    {.function = "PMIx_Get", .attrs = prte_attrs_get},
+    {.function = "PMIx_Get_nb", .attrs = prte_attrs_get},
+    {.function = "PMIx_Publish", .attrs = prte_attrs_publish},
+    {.function = "PMIx_Publish_nb", .attrs = prte_attrs_publish},
+    {.function = "PMIx_Lookup", .attrs = prte_attrs_lookup},
+    {.function = "PMIx_Lookup_nb", .attrs = prte_attrs_lookup},
+    {.function = "PMIx_Unpublish", .attrs = prte_attrs_unpublish},
+    {.function = "PMIx_Unpublish_nb", .attrs = prte_attrs_unpublish},
+    {.function = "PMIx_Spawn", .attrs = prte_attrs_spawn},
+    {.function = "PMIx_Spawn_nb", .attrs = prte_attrs_spawn},
+    {.function = "PMIx_Connect", .attrs = prte_attrs_connect},
+    {.function = "PMIx_Connect_nb", .attrs = prte_attrs_connect},
+    {.function = "PMIx_Disconnect", .attrs = prte_attrs_fence},
+    {.function = "PMIx_Disconnect_nb", .attrs = prte_attrs_fence},
+    {.function = "PMIx_Query_info", .attrs = prte_attrs_query},
+    {.function = "PMIx_Query_info_nb", .attrs = prte_attrs_query},
+    {.function = "PMIx_Log", .attrs = prte_attrs_none},
+    {.function = "PMIx_Log_nb", .attrs = prte_attrs_none},
+    {.function = "PMIx_Job_control", .attrs = prte_attrs_jobctrl},
+    {.function = "PMIx_Job_control_nb", .attrs = prte_attrs_jobctrl},
+    {.function = "PMIx_Process_monitor", .attrs = prte_attrs_none},
+    {.function = "PMIx_Process_monitor_nb", .attrs = prte_attrs_none},
+    {.function = "PMIx_Group_construct", .attrs = prte_attrs_group},
+    {.function = "PMIx_Group_construct_nb", .attrs = prte_attrs_group},
+    {.function = "PMIx_Group_invite", .attrs = prte_attrs_none},
+    {.function = "PMIx_Group_invite_nb", .attrs = prte_attrs_none},
+    {.function = "PMIx_Group_join", .attrs = prte_attrs_none},
+    {.function = "PMIx_Group_join_nb", .attrs = prte_attrs_none},
+    {.function = "PMIx_Group_leave", .attrs = prte_attrs_none},
+    {.function = "PMIx_Group_leave_nb", .attrs = prte_attrs_none},
+    {.function = "PMIx_Group_destruct", .attrs = prte_attrs_group},
+    {.function = "PMIx_Group_destruct_nb", .attrs = prte_attrs_group},
+    {.function = "PMIx_Register_event_handler", .attrs = prte_attrs_none},
+    {.function = "PMIx_Deregister_event_handler", .attrs = prte_attrs_na},
+    {.function = "PMIx_Notify_event", .attrs = prte_attrs_none},
+    {.function = "PMIx_IOF_pull", .attrs = prte_attrs_iofpull},
+    {.function = "PMIx_IOF_deregister", .attrs = prte_attrs_none},
+    {.function = "PMIx_IOF_push", .attrs = prte_attrs_none},
+    {.function = "PMIx_Allocation_request", .attrs = prte_attrs_alloc},
+    {.function = "PMIx_Allocation_request_nb", .attrs = prte_attrs_alloc},
+    {.function = "PMIx_Session_control", .attrs = prte_attrs_session},
     {.function = ""},
 };
 
@@ -435,6 +506,17 @@ void pmix_server_register_params(void)
                                       "Whether or not to support remote connections",
                                       PMIX_MCA_BASE_VAR_TYPE_BOOL,
                                       &prte_pmix_server_globals.remote_connections);
+
+    /* whether a failure that terminates one job of a connected assemblage
+     * terminates the rest of it.  The PMIx definition of "connected" asks a
+     * host that terminates an application when one of its processes fails to
+     * do the same to the whole assemblage; this is a switch because it
+     * changes the fate of a job the failure did not happen in. */
+    prte_pmix_server_globals.terminate_connected = true;
+    (void) pmix_mca_base_var_register("prte", "pmix", NULL, "terminate_connected",
+                                      "Terminate every job in a connected assemblage when a failure terminates one of them",
+                                      PMIX_MCA_BASE_VAR_TYPE_BOOL,
+                                      &prte_pmix_server_globals.terminate_connected);
 
     /* whether or not to require client pid to match */
     prte_pmix_server_globals.require_pid_match = false;
@@ -568,6 +650,14 @@ void prte_pmix_server_clear(pmix_proc_t *pname)
     for (n = 0; n < prte_pmix_server_globals.remote_reqs.size; n++) {
         req = (prte_pmix_server_req_t*)pmix_pointer_array_get_item(&prte_pmix_server_globals.remote_reqs, n);
         if (NULL != req) {
+            /* Only requests that name a target proc are ours to clear.
+             * A monitor request does not set tproc at all, and an empty
+             * nspace is PMIx's wildcard - it matches everything - so
+             * without this guard every job that ended took the outstanding
+             * monitor requests with it. */
+            if (PMIX_NSPACE_INVALID(req->tproc.nspace)) {
+                continue;
+            }
             if (!PMIX_CHECK_NSPACE(req->tproc.nspace, pname->nspace) ||
                 !PMIX_CHECK_RANK(req->tproc.rank, pname->rank)) {
                 continue;
@@ -582,6 +672,14 @@ void prte_pmix_server_clear(pmix_proc_t *pname)
             }
             pmix_pointer_array_set_item(&prte_pmix_server_globals.remote_reqs, n, NULL);
             if (!req->inprogress) {
+                /* Somebody is still waiting on the other end of this, and
+                 * dropping it in silence leaves them waiting forever.  The
+                 * proc it asked about is gone and its data with it, which is
+                 * not an error - it is a question that no longer has an
+                 * answer, so say exactly that.  A request that IS in progress
+                 * is answered by whoever holds it. */
+                send_error(PRTE_ERR_NOT_FOUND, &req->tproc, &req->proxy,
+                           req->remote_index);
                 /* if the request is in progress, then someone (host or PMIx server
                  * library) has the req object - so we cannot release it yet.
                  * We'll take care of it once the current holder returns.
@@ -787,7 +885,9 @@ int pmix_server_init(void)
 
     /* setup the server's state variables */
     PMIX_CONSTRUCT(&prte_pmix_server_globals.psets, pmix_list_t);
+    PMIX_CONSTRUCT(&prte_pmix_server_globals.departed_jobs, pmix_list_t);
     PMIX_CONSTRUCT(&prte_pmix_server_globals.groups, pmix_list_t);
+    PMIX_CONSTRUCT(&prte_pmix_server_globals.connections, pmix_list_t);
     PMIX_CONSTRUCT(&prte_pmix_server_globals.local_reqs, pmix_pointer_array_t);
     pmix_pointer_array_init(&prte_pmix_server_globals.local_reqs, 128, INT_MAX, 2);
     PMIX_CONSTRUCT(&prte_pmix_server_globals.remote_reqs, pmix_pointer_array_t);
@@ -796,7 +896,8 @@ int pmix_server_init(void)
     prte_pmix_server_globals.server = *PRTE_NAME_INVALID;
     prte_pmix_server_globals.scheduler_connected = false;
     prte_pmix_server_globals.scheduler_lookup_done = false;
-    prte_pmix_server_globals.scheduler_set_as_server = false;
+    prte_pmix_server_globals.primary_server = *PRTE_NAME_INVALID;
+    prte_pmix_server_globals.primary_server_set = false;
 
     PMIX_INFO_LIST_START(ilist);
 
@@ -1232,6 +1333,11 @@ void pmix_server_start(void)
         /* setup recv for scheduler requests */
         PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_SCHED,
                       PRTE_RML_PERSISTENT, pmix_server_sched, NULL);
+        /* setup recv for the membership of connected assemblages, which is
+         * held here because we are the one process that sees every proc in
+         * the DVM terminate */
+        PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_CONNECTED,
+                      PRTE_RML_PERSISTENT, prte_pmix_server_connection_recv, NULL);
     }
 }
 
@@ -1259,6 +1365,7 @@ void pmix_server_finalize(void)
     if (PRTE_PROC_IS_MASTER) {
         PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_LOGGING);
         PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_SCHED);
+        PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_CONNECTED);
     }
 
     /* finalize our local data server */
@@ -1283,7 +1390,9 @@ void pmix_server_finalize(void)
     PMIX_DESTRUCT(&prte_pmix_server_globals.local_reqs);
     PMIX_LIST_DESTRUCT(&prte_pmix_server_globals.notifications);
     PMIX_LIST_DESTRUCT(&prte_pmix_server_globals.psets);
+    PMIX_LIST_DESTRUCT(&prte_pmix_server_globals.departed_jobs);
     PMIX_LIST_DESTRUCT(&prte_pmix_server_globals.groups);
+    PMIX_LIST_DESTRUCT(&prte_pmix_server_globals.connections);
 
     /* shutdown the local server */
     prte_pmix_server_globals.initialized = false;
@@ -1322,6 +1431,51 @@ static void send_error(int status, pmix_proc_t *idreq, pmix_proc_t *remote, int 
         PRTE_ERROR_LOG(prc);
         PMIX_DATA_BUFFER_RELEASE(reply);
     }
+}
+
+
+/* How many departed jobs to remember.  A request can only arrive for one of
+ * these if it was already in flight when the job ended, so the window is
+ * short; the bound is here because a persistent DVM runs jobs without end
+ * and this list would otherwise grow with all of them. */
+#define PRTE_MAX_DEPARTED_JOBS 32
+
+void prte_pmix_server_job_departed(const pmix_nspace_t nspace)
+{
+    prte_namelist_t *nm;
+
+    /* an assemblage this job belonged to may now have nobody left in it */
+    prte_pmix_server_connection_purge(nspace);
+
+    if (prte_pmix_server_job_has_departed(nspace)) {
+        return;
+    }
+    while (PRTE_MAX_DEPARTED_JOBS <= pmix_list_get_size(&prte_pmix_server_globals.departed_jobs)) {
+        nm = (prte_namelist_t *) pmix_list_remove_first(&prte_pmix_server_globals.departed_jobs);
+        /* answers NULL for an empty list, and the loop bound above is the
+         * only thing that says this one is not - screen it rather than hand
+         * a NULL to the reference count */
+        if (NULL == nm) {
+            break;
+        }
+        PMIX_RELEASE(nm);
+    }
+    nm = PMIX_NEW(prte_namelist_t);
+    PMIX_LOAD_PROCID(&nm->name, nspace, PMIX_RANK_WILDCARD);
+    pmix_list_append(&prte_pmix_server_globals.departed_jobs, &nm->super);
+}
+
+bool prte_pmix_server_job_has_departed(const pmix_nspace_t nspace)
+{
+    prte_namelist_t *nm;
+
+    PMIX_LIST_FOREACH(nm, &prte_pmix_server_globals.departed_jobs, prte_namelist_t)
+    {
+        if (PMIX_CHECK_NSPACE(nm->name.nspace, nspace)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static void _mdxresp(int sd, short args, void *cbdata)
@@ -1478,6 +1632,66 @@ static void modex_resp(pmix_status_t status, char *data, size_t sz, void *cbdata
     prte_event_active(&(cd->ev), PRTE_EV_WRITE, 1);
 }
 
+/* Answer a direct modex out of the job object.
+ *
+ * The keys this covers are the ones the DVM itself decided when it mapped
+ * the job - see prte_pmix_server_derivable_key() - and none of them is data
+ * the process publishes.  Asking our own PMIx server for them instead is
+ * what used to hang the requester: that path parks the request until the
+ * proc commits something, and a proc that only ever calls PMIx_Get commits
+ * nothing, ever.  Both entry points into this file's dmodex service - the
+ * receive and the retry it can defer to - therefore try this first.
+ *
+ * Returns true if the request has been answered and disposed of. */
+static bool answer_from_job(prte_job_t *jdata, prte_proc_t *proc,
+                            pmix_proc_t *pproc, const char *key,
+                            pmix_proc_t *sender, int remote_index)
+{
+    prte_pmix_server_req_t *rq;
+    pmix_data_buffer_t dbuf;
+    pmix_byte_object_t bo;
+    pmix_status_t prc;
+
+    if (NULL == key || !prte_pmix_server_derivable_key(key)) {
+        return false;
+    }
+    /* The bindings arrive separately from the rest of the launch message,
+     * and until ours land we cannot say where our own procs are bound -
+     * deriving now would answer "nowhere", which is a different thing.
+     * Returning false parks the request on the retry cycle, which comes
+     * back through here once the slice has been applied. */
+    if ((PMIx_Check_key(key, PMIX_CPUSET) || PMIx_Check_key(key, PMIX_LOCALITY_STRING)) &&
+        NULL == proc->cpuset && prte_odls_base_awaiting_cpusets(jdata->nspace)) {
+        return false;
+    }
+    PMIX_DATA_BUFFER_CONSTRUCT(&dbuf);
+    prc = prte_pmix_server_derive_proc_data(jdata, proc, &dbuf);
+    if (PMIX_SUCCESS != prc) {
+        /* we could not build it - let the caller do this the ordinary way,
+         * which at worst leaves the asker where it was before */
+        PMIX_DATA_BUFFER_DESTRUCT(&dbuf);
+        return false;
+    }
+    PMIX_DATA_BUFFER_UNLOAD(&dbuf, bo.bytes, bo.size);
+    pmix_output_verbose(2, prte_pmix_server_globals.output,
+                        "%s dmdx: key %s for %s:%u ANSWERED FROM THE JOB (%lu bytes)",
+                        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), key,
+                        pproc->nspace, pproc->rank, (unsigned long) bo.size);
+
+    rq = PMIX_NEW(prte_pmix_server_req_t);
+    pmix_asprintf(&rq->operation, "DMDX: %s:%d", __FILE__, __LINE__);
+    rq->proxy = *sender;
+    memcpy(&rq->tproc, pproc, sizeof(pmix_proc_t));
+    rq->remote_index = remote_index;
+    rq->pstatus = PMIX_SUCCESS;
+    rq->data = (char *) bo.bytes;
+    rq->sz = bo.size;
+    /* _mdxresp clears our slot as it sends, so we must occupy one */
+    rq->local_index = pmix_pointer_array_add(&prte_pmix_server_globals.remote_reqs, rq);
+    _mdxresp(0, 0, rq);
+    return true;
+}
+
 static void dmdx_check(int sd, short args, void *cbdata)
 {
     prte_pmix_server_req_t *req = (prte_pmix_server_req_t*)cbdata;
@@ -1491,6 +1705,18 @@ static void dmdx_check(int sd, short args, void *cbdata)
     /* do we know about this job? */
     jdata = prte_get_job_data_object(req->tproc.nspace);
     if (NULL == jdata) {
+        /* it may have arrived and departed while we were waiting for it -
+         * see the same test in dmdx_recv */
+        if (prte_pmix_server_job_has_departed(req->tproc.nspace)) {
+            send_error(PRTE_ERR_NOT_FOUND, &req->tproc, &req->proxy, req->remote_index);
+            if (req->event_active) {
+                prte_event_del(&req->ev);
+            }
+            pmix_pointer_array_set_item(&prte_pmix_server_globals.remote_reqs,
+                                        req->local_index, NULL);
+            PMIX_RELEASE(req);
+            return;
+        }
         /* wait some more */
         pmix_output_verbose(2, prte_pmix_server_globals.output,
                             "%s dmdx:recv dmdx_check cannot find job object - delaying",
@@ -1521,6 +1747,19 @@ static void dmdx_check(int sd, short args, void *cbdata)
             prte_event_del(&req->ev);
         }
         pmix_pointer_array_set_item(&prte_pmix_server_globals.remote_reqs, req->local_index, NULL);
+        PMIX_RELEASE(req);
+        return;
+    }
+
+    /* a placement key is ours to answer, and nothing about the process will
+     * ever make the check below succeed for one - see answer_from_job() */
+    if (answer_from_job(jdata, proc, &req->tproc, req->key,
+                        &req->proxy, req->remote_index)) {
+        if (req->event_active) {
+            prte_event_del(&req->ev);
+        }
+        pmix_pointer_array_set_item(&prte_pmix_server_globals.remote_reqs,
+                                    req->local_index, NULL);
         PMIX_RELEASE(req);
         return;
     }
@@ -1668,6 +1907,23 @@ static void pmix_server_dmdx_recv(int status, pmix_proc_t *sender,
     /* do we know about this job? */
     jdata = prte_get_job_data_object(pproc.nspace);
     if (NULL == jdata) {
+        /* Two things look like this, and they want opposite answers.  If the
+         * job has already been and gone from here - our share of it finished
+         * and we released it - then nothing will ever make this answerable,
+         * and waiting means the asker waits forever. */
+        if (prte_pmix_server_job_has_departed(pproc.nspace)) {
+            pmix_output_verbose(2, prte_pmix_server_globals.output,
+                                "%s dmdx:recv request for departed job %s - not found",
+                                PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), pproc.nspace);
+            send_error(PRTE_ERR_NOT_FOUND, &pproc, sender, index);
+            if (NULL != info) {
+                PMIX_INFO_FREE(info, ninfo);
+            }
+            if (NULL != key) {
+                free(key);
+            }
+            return;
+        }
         /* not having the jdata means that we haven't unpacked the
          * the launch message for this job yet - this is a race
          * condition, so just log the request and we will fill
@@ -1729,6 +1985,19 @@ static void pmix_server_dmdx_recv(int status, pmix_proc_t *sender,
         if (NULL != key) {
           free(key);
         }
+        return;
+    }
+
+    /* If what they are asking for is something this DVM decided when it
+     * mapped the job, answer it out of the job object and do not go near our
+     * PMIx server.  We host this proc - the check above says so - so we hold
+     * the placement and the binding, and neither of them is data the process
+     * publishes. */
+    if (answer_from_job(jdata, proc, &pproc, key, sender, index)) {
+        if (NULL != info) {
+            PMIX_INFO_FREE(info, ninfo);
+        }
+        free(key);
         return;
     }
 
@@ -2303,6 +2572,14 @@ static void send_alloc_resp(pmix_status_t status,
     PRTE_PMIX_THREADSHIFT(cd, prte_event_base, _send_alloc_resp);
 }
 
+/* release the one-element context-id result once it has been packed */
+static void ctxid_relfn(void *cbdata)
+{
+    pmix_info_t *results = (pmix_info_t *) cbdata;
+
+    PMIX_INFO_FREE(results, 1);
+}
+
 static void pmix_server_sched(int status, pmix_proc_t *sender,
                               pmix_data_buffer_t *buffer,
                               prte_rml_tag_t tg, void *cbdata)
@@ -2313,9 +2590,10 @@ static void pmix_server_sched(int status, pmix_proc_t *sender,
     size_t ninfo = 0;
     pmix_alloc_directive_t allocdir;
     uint32_t sessionID;
-    pmix_info_t *info = NULL;
+    pmix_info_t *info = NULL, *ctxinfo;
     pmix_proc_t source;
     prte_pmix_server_req_t *req = NULL;
+    size_t ctxid;
     int refid;
     PRTE_HIDE_UNUSED_PARAMS(status, tg, cbdata);
 
@@ -2353,7 +2631,7 @@ static void pmix_server_sched(int status, pmix_proc_t *sender,
             PMIX_ERROR_LOG(rc);
             goto reply;
         }
-    } else {
+    } else if (PRTE_PMIX_SESSION_CTRL == cmd) {
         /* session control request */
         cnt = 1;
         rc = PMIx_Data_unpack(NULL, buffer, &sessionID, &cnt, PMIX_UINT32);
@@ -2362,6 +2640,8 @@ static void pmix_server_sched(int status, pmix_proc_t *sender,
             goto reply;
         }
     }
+    /* a group context-id request carries no field of its own - see the
+     * matching pack in prte_server_send_request() */
 
    /* unpack the number of info */
    cnt = 1;
@@ -2390,6 +2670,43 @@ static void pmix_server_sched(int status, pmix_proc_t *sender,
     }
     PMIX_INFO_LOAD(&info[ninfo], PMIX_REQUESTOR, &source, PMIX_PROC);
     ++ninfo;
+
+    if (PRTE_PMIX_GROUP_CTXID == cmd) {
+        /* A group formed by PMIx_Group_invite has no collective through which
+         * to ask for a context id, so its leader asks through job control -
+         * which lands on whichever daemon hosts the leader. The pool lives
+         * only here on the master, so that daemon relayed it to us. Mint one
+         * and answer; there is nothing asynchronous about it. */
+        req = PMIX_NEW(prte_pmix_server_req_t);
+        pmix_asprintf(&req->operation, "GROUPCTXID");
+        req->remote_index = refid;
+        req->copy = true;
+        req->info = info;
+        req->ninfo = ninfo;
+        PMIX_PROC_LOAD(&req->proxy, sender->nspace, sender->rank);
+        PMIX_PROC_LOAD(&req->tproc, source.nspace, source.rank);
+        /* as on the session-control branch below, being on the tracker array
+         * is not a reference - send_alloc_resp takes the second one that its
+         * two releases consume */
+        req->local_index = pmix_pointer_array_add(&prte_pmix_server_globals.local_reqs, req);
+        req->infocbfunc = send_alloc_resp;
+        req->cbdata = req;
+        rc = prte_grpcomm_assign_context_id(&ctxid);
+        if (PRTE_SUCCESS != rc) {
+            send_alloc_resp(prte_pmix_convert_rc(rc), NULL, 0, req, NULL, NULL);
+            return;
+        }
+        PMIX_INFO_CREATE(ctxinfo, 1);
+        if (NULL == ctxinfo) {
+            send_alloc_resp(PMIX_ERR_NOMEM, NULL, 0, req, NULL, NULL);
+            return;
+        }
+        PMIX_INFO_LOAD(&ctxinfo[0], PMIX_GROUP_CONTEXT_ID, &ctxid, PMIX_SIZE);
+        /* the reply is packed after a thread shift, so the array is handed
+         * over with a release function rather than freed here */
+        send_alloc_resp(PMIX_SUCCESS, ctxinfo, 1, req, ctxid_relfn, ctxinfo);
+        return;
+    }
 
     if (PRTE_PMIX_ALLOC_REQ == cmd) {
         req = PMIX_NEW(prte_pmix_server_req_t);
@@ -2600,6 +2917,8 @@ static void rqcon(prte_pmix_server_req_t *p)
     p->range = PMIX_RANGE_SESSION;
     p->proxy = *PRTE_NAME_INVALID;
     p->target = *PRTE_NAME_INVALID;
+    p->procs = NULL;
+    p->nprocs = 0;
     p->jdata = NULL;
     PMIX_DATA_BUFFER_CONSTRUCT(&p->msg);
     p->timeout = prte_pmix_server_globals.timeout;
@@ -2617,6 +2936,9 @@ static void rqdes(prte_pmix_server_req_t *p)
 {
     if (NULL != p->operation) {
         free(p->operation);
+    }
+    if (NULL != p->procs) {
+        PMIX_PROC_FREE(p->procs, p->nprocs);
     }
     if (NULL != p->info && p->copy) {
         PMIX_INFO_FREE(p->info, p->ninfo);

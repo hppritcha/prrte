@@ -17,6 +17,7 @@
 #include "src/util/pmix_output.h"
 #include "src/mca/state/state.h"
 
+#include "src/grpcomm/grpcomm.h"
 #include "src/rml/radix.h"
 #include "src/rml/rml.h"
 #include "src/runtime/prte_globals.h"
@@ -54,11 +55,320 @@ static void shrink_ranks(pmix_data_array_t* arr){
     resize_ranks(arr, size);
 }
 
+/* Do two rank arrays hold the same sequence? */
+static bool ranks_differ(const pmix_data_array_t* a, const pmix_data_array_t* b)
+{
+    if (a->size != b->size) {
+        return true;
+    }
+    for (size_t i = 0; i < a->size; i++) {
+        if (((pmix_rank_t*)a->array)[i] != ((pmix_rank_t*)b->array)[i]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Record one inferred ancestor death, marking the rank failed so that the next
+ * pass of prte_rml_update_ancestors walks past it. Returns false, and sets
+ * *why, when this rank must not be inferred dead at all:
+ *
+ *  - An out-of-range rank. PMIX_RANK_INVALID is the value an ancestor slot
+ *    holds when the walk found no living inheritor at all, and setting a bit
+ *    at that index would ask the bitmap to grow to UINT32_MAX bits.
+ *
+ *  - The root. Rank 0 is every daemon's first ancestor and has no inheritor to
+ *    be routed around, which is why update_ancestors starts its walk at index
+ *    1; losing the HNP is fatal by construction, not something to recover from.
+ *    A well-formed report can never ask for it -- every ancestor list begins
+ *    with 0, so index 0 never differs -- but a malformed one that stripped down
+ *    to nothing would fall into the tail loop and, because update_ancestors
+ *    never revisits index 0, hypothesise the root's death over and over: the
+ *    unit test for this hangs rather than failing.
+ *
+ *  - A rank we already believe dead. Nothing can be *inferred* about one --
+ *    update_ancestors would have walked past it before we ever compared -- so
+ *    seeing it here means the walk is not converging. This is what bounds the
+ *    walk: every accepted inference marks a living rank dead, so there can be
+ *    at most one per daemon.
+ *
+ *  - A rank that has RETURNED. A report is a snapshot of the sender's view at
+ *    the moment it sent, and a revival travels as its own xcast, so a notice
+ *    that crossed with one carries a lineage predating the return. Burying a
+ *    daemon that is alive and talking to us is much worse than converging a
+ *    beat later on a death somebody actually observed, so the whole
+ *    reconciliation is abandoned rather than the one rank skipped.
+ */
+static bool record_inference(pmix_data_array_t* inferred, size_t* n,
+                             pmix_rank_t ancestor, prte_rml_ancestry_t* why)
+{
+    if (ancestor >= prte_rml_base.n_dmns || 0 == ancestor) {
+        *why = PRTE_RML_ANCESTRY_INCONSISTENT;
+        return false;
+    }
+    if (pmix_bitmap_is_set_bit(&prte_rml_base.failed_dmns, ancestor)) {
+        *why = PRTE_RML_ANCESTRY_INCONSISTENT;
+        return false;
+    }
+    if (pmix_bitmap_is_set_bit(&prte_rml_base.revived_dmns, ancestor)) {
+        *why = PRTE_RML_ANCESTRY_STALE;
+        return false;
+    }
+
+    // grow only when the next slot is past the end - "<=" also fired while
+    // the array still had room and shrank it back under the entries we had
+    // already recorded
+    if (*n >= inferred->size) {
+        resize_ranks(inferred, (*n+1)*3/2);
+    }
+    ((pmix_rank_t*)inferred->array)[(*n)++] = ancestor;
+    pmix_bitmap_set_bit(&prte_rml_base.failed_dmns, ancestor);
+    return true;
+}
+
+prte_rml_ancestry_t prte_rml_reconcile_ancestry(pmix_data_array_t* report,
+                                                pmix_data_array_t* inferred)
+{
+    // Apply what WE already know to the peer's list first: a difference our own
+    // failure knowledge accounts for is not new information.
+    //
+    // Note what is deliberately NOT done here: the report is not first padded
+    // out to our own length. update_ancestors fills an empty slot with "the
+    // previous ancestor's next inheritor", which is meaningful for a hole in
+    // the middle of a real list and nonsense for a slot invented past its end -
+    // padding a report of [0] (all the HNP sends when it adopts a grandchild
+    // directly) produced [0,2] at radix 2, rank 2 being the root's OTHER child
+    // and no ancestor of ours at all. That reconciled against nothing and took
+    // the DVM down with a FORCED_EXIT, in exactly the race the notice exists to
+    // settle. A legitimately shorter report is what the tail loop below is for.
+    prte_rml_update_ancestors(report);
+
+    if (!ranks_differ(report, &prte_rml_base.ancestors)) {
+        return PRTE_RML_ANCESTRY_AGREED;
+    }
+
+    if (report->size > prte_rml_base.ancestors.size) {
+        // The peer places us deeper than we place ourselves, and our own
+        // failure knowledge did not account for it. An ancestor list only ever
+        // shortens through failures, so no set of deaths reconciles this.
+        return PRTE_RML_ANCESTRY_INCONSISTENT;
+    }
+
+    // Operate on a copy of our ancestors, walking it toward the report one
+    // inferred death at a time. record_inference is what bounds the walk: it
+    // refuses a rank that is already failed, so every pass that is allowed to
+    // proceed marks one more living rank dead.
+    pmix_data_array_t ancestors = PMIX_DATA_ARRAY_STATIC_INIT;
+    resize_ranks(&ancestors, prte_rml_base.ancestors.size);
+    for (size_t i = 0; i < ancestors.size; i++) {
+        ((pmix_rank_t*)ancestors.array)[i] =
+            ((pmix_rank_t*)prte_rml_base.ancestors.array)[i];
+    }
+
+    resize_ranks(inferred, 1);
+    size_t infer_i = 0;
+    prte_rml_ancestry_t verdict = PRTE_RML_ANCESTRY_INFERRED;
+
+    for (size_t i = 0; i < report->size && i < ancestors.size; i++) {
+        pmix_rank_t ancestor = ((pmix_rank_t*)ancestors.array)[i];
+        if (ancestor == ((pmix_rank_t*)report->array)[i]) {
+            continue;
+        }
+
+        if (!record_inference(inferred, &infer_i, ancestor, &verdict)) {
+            break;
+        }
+        prte_rml_update_ancestors(&ancestors);
+
+        i--;
+    }
+    while (PRTE_RML_ANCESTRY_INFERRED == verdict &&
+           ancestors.size > report->size) {
+        pmix_rank_t ancestor = ((pmix_rank_t*)ancestors.array)[report->size];
+
+        if (!record_inference(inferred, &infer_i, ancestor, &verdict)) {
+            break;
+        }
+        prte_rml_update_ancestors(&ancestors);
+    }
+
+    // Undo setting the failed bit for inferred failures, so the caller can do
+    // the full error handling process for them.
+    shrink_ranks(inferred);
+    for (size_t i = 0; i < inferred->size; i++) {
+        pmix_bitmap_clear_bit(
+            &prte_rml_base.failed_dmns, ((pmix_rank_t*)inferred->array)[i]
+        );
+    }
+
+    // If the arrays are still different, one/both of us are in an invalid state
+    if (PRTE_RML_ANCESTRY_INFERRED == verdict &&
+        ranks_differ(report, &ancestors)) {
+        verdict = PRTE_RML_ANCESTRY_INCONSISTENT;
+    }
+    PMIx_Data_array_destruct(&ancestors);
+
+    if (PRTE_RML_ANCESTRY_INFERRED != verdict) {
+        // Nothing may be acted on, so hand back no inferences at all
+        resize_ranks(inferred, 0);
+    } else if (0 == inferred->size) {
+        // The lists differ but no death explains it
+        verdict = PRTE_RML_ANCESTRY_INCONSISTENT;
+    }
+    return verdict;
+}
+
+/* Hand a set of departed daemon ranks to the errmgr, skipping any this daemon
+ * had already recorded.
+ *
+ * PRTE_PROC_STATE_COMM_FAILED is what makes a daemon act on a departure rather
+ * than merely route around it - on the HNP it is what sweeps the dead node's
+ * procs to TERM_WO_SYNC so their job can complete.  It is otherwise raised only
+ * by prte_mca_oob_tcp_component_lost_connection, i.e. only on the daemon that
+ * was holding the socket.  At the default radix that is always the HNP - a
+ * ten-node DVM at radix 64 is flat, so the HNP is every daemon's parent - and
+ * the DVM therefore looked correct.  Give the routing tree any depth and it
+ * stops being true: an interior daemon detects the loss, the notice walks up
+ * and correctly marks the rank failed everywhere including the HNP, and the HNP
+ * - never having lost a socket - never runs the errmgr.  The procs that were on
+ * the dead node are never marked terminated, so the job never completes and its
+ * tool waits forever.  A `prun` against a radix-2 DVM whose job's node was
+ * killed hung indefinitely, where the same DVM at radix 64 released it at once.
+ *
+ * Every path in this file that learns of a departure reports it here, whether
+ * it was told (a failure notice) or deduced it (a peer's lineage that only an
+ * unrecorded death explains).  Those must not diverge: the routing tree's
+ * failed_dmns set is the sole record of what we already know, so a path that
+ * repairs the tree without reporting does not merely stay quiet - it makes
+ * every later notice for that rank look like a duplicate and suppresses the
+ * report for good.
+ *
+ * Which is also why this MUST be called before the repair that records the
+ * ranks, and why it can be: the state activation is thread-shifted, so the
+ * errmgr cannot run ahead of the repair no matter what order the two calls
+ * appear in, whereas the failed_dmns test is only meaningful while the repair
+ * has yet to set the bits.
+ *
+ * For an inferred death that also depends on prte_rml_reconcile_ancestry
+ * having undone the marks it sets while walking - it does, deliberately, "so
+ * the caller can do the full error handling process", and
+ * test_reconcile_ancestry pins it.  A bit left behind there would not merely
+ * skip one report; it would make the rank look known to every path forever.
+ */
+static void report_new_departures(const pmix_data_array_t* failed)
+{
+    /* mirrors the OOB's guard: while finalizing there is nobody left to tell */
+    if (prte_finalizing) {
+        return;
+    }
+    pmix_rank_t* ranks = (pmix_rank_t*) failed->array;
+    for (size_t i = 0; i < failed->size; i++) {
+        pmix_proc_t dmn;
+        /* PMIX_RANK_INVALID is the padding an ancestor walk leaves behind, not
+         * a departure */
+        if (PMIX_RANK_INVALID == ranks[i]) {
+            continue;
+        }
+        if (pmix_bitmap_is_set_bit(&prte_rml_base.failed_dmns, ranks[i])) {
+            continue;
+        }
+        PMIX_LOAD_PROCID(&dmn, PRTE_PROC_MY_NAME->nspace, ranks[i]);
+        PRTE_ACTIVATE_PROC_STATE(&dmn, PRTE_PROC_STATE_COMM_FAILED);
+    }
+}
+
+/* A child's report of its own lineage, riding its failure notice (see
+ * send_failures_notice). Its last entry is the parent it sent to, which is what
+ * makes it checkable: strip that entry and what remains is the child's view of
+ * OUR ancestor list, directly comparable with our own.
+ *
+ * Consumes nothing and repairs only on a clean inference. Where the downward
+ * (adoption) path treats an irreconcilable report as fatal, this one only logs:
+ * that report is how a daemon learns its own lineage, whereas this one is an
+ * accelerant. Everything it can tell us also arrives by a route that does not
+ * depend on a peer's honesty - our own lost socket, or the HNP's arbitrated
+ * broadcast - so a report we cannot place is a race to drop, not a reason to
+ * end the DVM.
+ */
+static void reconcile_child_ancestry(pmix_data_array_t* report,
+                                     pmix_proc_t* sender)
+{
+    /* A repair here would emit adoption and failure notices to daemons that are
+     * already on their way out, where they can be misread as faults - the same
+     * reason prte_rml_route_lost stops short of one while a teardown is under
+     * way. */
+    if (prte_finalizing || prte_prteds_term_ordered ||
+        prte_abnormal_term_ordered || prte_dvm_leaving) {
+        return;
+    }
+
+    if (0 == report->size) {
+        /* only the HNP has an empty ancestor list, and the HNP never sends
+         * this leg of the message */
+        return;
+    }
+
+    pmix_rank_t* ranks = (pmix_rank_t*) report->array;
+    if (ranks[report->size-1] != PRTE_PROC_MY_NAME->rank) {
+        /* Stale: the sender has re-homed since it sent, or we have. Its list
+         * names some other daemon as its parent, so it says nothing about OUR
+         * lineage and must not be reconciled against it. */
+        PMIX_OUTPUT_VERBOSE((
+            1, prte_rml_base.routed_output,
+            "%s routed:radix: failure notice from %s reports parent %s, not us"
+            " - ignoring its ancestry",
+            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(sender),
+            PRTE_VPID_PRINT(ranks[report->size-1])
+        ));
+        return;
+    }
+    resize_ranks(report, report->size-1);
+
+    pmix_data_array_t inferred = PMIX_DATA_ARRAY_STATIC_INIT;
+    prte_rml_ancestry_t verdict = prte_rml_reconcile_ancestry(report, &inferred);
+
+    switch (verdict) {
+    case PRTE_RML_ANCESTRY_AGREED:
+        /* The ordinary outcome, and worth a trace of its own: it is the only
+         * evidence that the lineage travelled and was checked at all, which is
+         * the half of this a test can pin down. Whether it ever carries news
+         * depends on who wins a race with a socket error. */
+        PMIX_OUTPUT_VERBOSE((
+            2, prte_rml_base.routed_output,
+            "%s routed:radix: lineage reported by %s agrees with ours",
+            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(sender)
+        ));
+        break;
+
+    case PRTE_RML_ANCESTRY_INFERRED:
+        PMIX_OUTPUT_VERBOSE((
+            1, prte_rml_base.routed_output,
+            "%s routed:radix: lineage reported by %s implies %lu ancestor"
+            " death(s) we had not recorded", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+            PRTE_NAME_PRINT(sender), (unsigned long) inferred.size
+        ));
+        report_new_departures(&inferred);
+        prte_rml_repair_routing_tree(&inferred, /* global = */ false, /* epoch = */ 0);
+        break;
+
+    case PRTE_RML_ANCESTRY_STALE:
+    case PRTE_RML_ANCESTRY_INCONSISTENT:
+        PMIX_OUTPUT_VERBOSE((
+            1, prte_rml_base.routed_output,
+            "%s routed:radix: lineage reported by %s cannot be reconciled"
+            " - ignoring it", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+            PRTE_NAME_PRINT(sender)
+        ));
+        break;
+    }
+    PMIx_Data_array_destruct(&inferred);
+}
+
 void prte_rml_recv_failures_notice(
     int status, pmix_proc_t* sender, pmix_data_buffer_t* buf,
     prte_rml_tag_t tag, void* cbdata
 ) {
-    PRTE_HIDE_UNUSED_PARAMS(status,sender,tag,cbdata);
+    PRTE_HIDE_UNUSED_PARAMS(status,tag,cbdata);
 
     int cnt = 1;
 
@@ -70,6 +380,22 @@ void prte_rml_recv_failures_notice(
         return;
     }
 
+    /* A global notice carries the collective recovery epoch it moves the DVM
+     * to - see the epoch member of prte_rml_recovery_status_t.  The upward leg
+     * does not: only the HNP issues an epoch, and only its broadcast applies
+     * one. */
+    uint32_t epoch = 0;
+    if(global){
+        cnt = 1;
+        ret = PMIx_Data_unpack(NULL, buf, &epoch, &cnt, PMIX_UINT32);
+        if(PMIX_SUCCESS != ret){
+            PMIX_ERROR_LOG(ret);
+            PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_FORCED_EXIT);
+            return;
+        }
+    }
+
+    cnt = 1;
     pmix_data_array_t failed_ranks = PMIX_DATA_ARRAY_STATIC_INIT;
     ret = PMIx_Data_unpack(NULL, buf, &failed_ranks, &cnt, PMIX_DATA_ARRAY);
     if(PMIX_SUCCESS != ret){
@@ -79,59 +405,35 @@ void prte_rml_recv_failures_notice(
         return;
     }
 
-    /* Note which of these we did not already know about, BEFORE the repair
-     * records them - see the errmgr hand-off below. */
-    pmix_rank_t* incoming = (pmix_rank_t*) failed_ranks.array;
-    size_t n_incoming = failed_ranks.size;
-    bool* newly = NULL;
-    if (0 < n_incoming) {
-        newly = (bool*) calloc(n_incoming, sizeof(bool));
-    }
-    if (NULL != newly) {
-        for (size_t i = 0; i < n_incoming; i++) {
-            newly[i] = (PMIX_RANK_INVALID != incoming[i]) &&
-                       !pmix_bitmap_is_set_bit(&prte_rml_base.failed_dmns, incoming[i]);
-        }
-    }
+    /* Hand the departure to the errmgr before the repair records it - only
+     * ranks we had not already recorded are reported, so the daemon that
+     * detected the loss itself (and already raised COMM_FAILED from the OOB)
+     * does not raise it twice when the HNP's global broadcast comes back
+     * around, and a duplicate notice is a no-op. */
+    report_new_departures(&failed_ranks);
 
-    prte_rml_repair_routing_tree(&failed_ranks, global);
-
-    /* Hand the departure to the errmgr.
-     *
-     * PRTE_PROC_STATE_COMM_FAILED is otherwise raised only by
-     * prte_mca_oob_tcp_component_lost_connection, i.e. only on the daemon that
-     * was holding the socket.  At the default radix that is always the HNP -
-     * a ten-node DVM at radix 64 is flat, so the HNP is every daemon's parent -
-     * and the DVM therefore looked correct.  Give the routing tree any depth
-     * and it stops being true: an interior daemon detects the loss, the notice
-     * walks up and correctly marks the rank failed everywhere including the
-     * HNP, and the HNP - never having lost a socket - never runs the errmgr.
-     * The procs that were on the dead node are never marked terminated, so the
-     * job never completes and its tool waits forever.  A `prun` against a
-     * radix-2 DVM whose job's node was killed hung indefinitely, where the same
-     * DVM at radix 64 released it at once.
-     *
-     * Only ranks this daemon had not already recorded are reported, so the
-     * daemon that detected the loss itself (and already raised COMM_FAILED from
-     * the OOB) does not raise it twice when the HNP's global broadcast comes
-     * back around, and a duplicate notice is a no-op.  The guard mirrors the
-     * OOB's: while finalizing there is nobody left to tell. */
-    if (NULL != newly) {
-        if (!prte_finalizing) {
-            for (size_t i = 0; i < n_incoming; i++) {
-                pmix_proc_t dmn;
-                if (!newly[i]) {
-                    continue;
-                }
-                PMIX_LOAD_PROCID(&dmn, PRTE_PROC_MY_NAME->nspace, incoming[i]);
-                PRTE_ACTIVATE_PROC_STATE(&dmn, PRTE_PROC_STATE_COMM_FAILED);
-            }
-        }
-        free(newly);
-    }
+    prte_rml_repair_routing_tree(&failed_ranks, global, epoch);
 
     /* repair takes a copy of what it needs, so the unpacked array is ours */
     PMIx_Data_array_destruct(&failed_ranks);
+
+    /* The sender's own lineage rides the upward leg only. Reconcile it AFTER
+     * the repair above: the ranks it just reported may be exactly what explains
+     * the difference between our two views, in which case there is nothing left
+     * to infer. */
+    if (!global) {
+        pmix_data_array_t report = PMIX_DATA_ARRAY_STATIC_INIT;
+        cnt = 1;
+        ret = PMIx_Data_unpack(NULL, buf, &report, &cnt, PMIX_DATA_ARRAY);
+        if (PMIX_SUCCESS != ret) {
+            /* Advisory payload: losing it costs us the early convergence, not
+             * the DVM, and the failures above have already been applied. */
+            PMIX_ERROR_LOG(ret);
+        } else {
+            reconcile_child_ancestry(&report, sender);
+        }
+        PMIx_Data_array_destruct(&report);
+    }
 }
 
 void prte_rml_recv_adoption_notice(
@@ -155,95 +457,34 @@ void prte_rml_recv_adoption_notice(
     // may just be old. Instead, we use their reported ancestry list to infer
     // any relevant faults that must have happened and use that information to
     // update our state.
-
-    // Update the reported list with any faults we know of
-    if(report.size < prte_rml_base.ancestors.size){
-        resize_ranks(&report, prte_rml_base.ancestors.size);
-    }
-    prte_rml_update_ancestors(&report);
-
-    // If we match after updating their list, there's no new info for us
-    bool different = report.size != prte_rml_base.ancestors.size;
-    for(size_t i = 0; !different && i < report.size; i++){
-        different = ((pmix_rank_t*)report.array)[i] !=
-            ((pmix_rank_t*)prte_rml_base.ancestors.array)[i];
-    }
-    if(!different){
-        PMIx_Data_array_destruct(&report);
-        return;
-    }
-
-    if(report.size > prte_rml_base.ancestors.size){
-        // This should never happen -- it implies there is some extra failure
-        // that could lead to our depth increasing, which is an invariate
-        // violation. Depth should only ever decrease.
-        PRTE_ERROR_LOG( PRTE_ERR_UNRECOVERABLE );
-        PMIX_OUTPUT_VERBOSE((
-            0, prte_rml_base.routed_output,
-            "%s routed:radix: incompatible routing tree state from %s",
-            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(sender)
-        ));
-        PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_FORCED_EXIT);
-        PMIx_Data_array_destruct(&report);
-        return;
-    }
-
-    // Operate on a copy of our ancestors
-    pmix_data_array_t ancestors = PMIX_DATA_ARRAY_STATIC_INIT;
-    resize_ranks(&ancestors, prte_rml_base.ancestors.size);
-    for(size_t i = 0; i < ancestors.size; i++){
-        ((pmix_rank_t*)ancestors.array)[i] =
-            ((pmix_rank_t*)prte_rml_base.ancestors.array)[i];
-    }
-
-    // Build an array of inferred faults
     pmix_data_array_t inferred = PMIX_DATA_ARRAY_STATIC_INIT;
-    resize_ranks(&inferred, 1);
-    size_t infer_i = 0;
-
-    for(size_t i = 0; i < report.size && i < ancestors.size; i++){
-        pmix_rank_t ancestor = ((pmix_rank_t*)ancestors.array)[i];
-        if(ancestor == ((pmix_rank_t*)report.array)[i]) continue;
-
-        if(infer_i >= inferred.size) resize_ranks(&inferred, (infer_i+1)*1.5);
-        ((pmix_rank_t*)inferred.array)[infer_i++] = ancestor;
-
-        pmix_bitmap_set_bit(&prte_rml_base.failed_dmns, ancestor);
-        prte_rml_update_ancestors(&ancestors);
-
-        i--;
-    }
-    while(ancestors.size > report.size){
-        pmix_rank_t ancestor = ((pmix_rank_t*)ancestors.array)[report.size];
-
-        // grow only when the next slot is past the end - "<=" also fired while
-        // the array still had room and shrank it back under the entries we had
-        // already recorded
-        if(infer_i >= inferred.size) resize_ranks(&inferred, (infer_i+1)*1.5);
-        ((pmix_rank_t*)inferred.array)[infer_i++] = ancestor;
-
-        pmix_bitmap_set_bit(&prte_rml_base.failed_dmns, ancestor);
-        prte_rml_update_ancestors(&ancestors);
-    }
-
-    // Undo setting the failed bit for inferred failures, so we can do the full
-    // error handling process for them.
-    shrink_ranks(&inferred);
-    for(size_t i = 0; i < inferred.size; i++){
-        pmix_bitmap_clear_bit(
-            &prte_rml_base.failed_dmns, ((pmix_rank_t*)inferred.array)[i]
-        );
-    }
-
-    // If the arrays are still different, one/both of us are in an invalid state
-    different = report.size != ancestors.size;
-    for(size_t i = 0; !different && i < report.size; i++){
-        different = ((pmix_rank_t*)report.array)[i] !=
-            ((pmix_rank_t*)ancestors.array)[i];
-    }
+    prte_rml_ancestry_t verdict = prte_rml_reconcile_ancestry(&report, &inferred);
     PMIx_Data_array_destruct(&report);
-    PMIx_Data_array_destruct(&ancestors);
-    if(different){
+
+    switch (verdict) {
+    case PRTE_RML_ANCESTRY_AGREED:
+        break;
+
+    case PRTE_RML_ANCESTRY_INFERRED:
+        // Finally, report the inferred deaths and do a full repair on them
+        report_new_departures(&inferred);
+        prte_rml_repair_routing_tree(&inferred, /* global = */ false, /* epoch = */ 0);
+        break;
+
+    case PRTE_RML_ANCESTRY_STALE:
+        // Our would-be parent's view predates a return we have already applied.
+        // It gets the correction the same way we did, from the revival xcast.
+        PMIX_OUTPUT_VERBOSE((
+            1, prte_rml_base.routed_output,
+            "%s routed:radix: ignoring pre-revival adoption notice from %s",
+            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(sender)
+        ));
+        break;
+
+    case PRTE_RML_ANCESTRY_INCONSISTENT:
+        // This one is fatal in this direction and not in the other: an adoption
+        // notice is how we learn our own lineage, so a report we cannot place
+        // means we no longer know where we are in the tree.
         PRTE_ERROR_LOG( PRTE_ERR_UNRECOVERABLE );
         PMIX_OUTPUT_VERBOSE((
             0, prte_rml_base.routed_output,
@@ -251,13 +492,7 @@ void prte_rml_recv_adoption_notice(
             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(sender)
         ));
         PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_FORCED_EXIT);
-        PMIx_Data_array_destruct(&inferred);
-        return;
-    }
-
-    // Finally, do a full repair on the inferred faults
-    if(inferred.size > 0){
-        prte_rml_repair_routing_tree(&inferred, /* global = */ false);
+        break;
     }
     PMIx_Data_array_destruct(&inferred);
 }
@@ -324,12 +559,26 @@ static void send_failures_notice(const prte_rml_recovery_status_t* status){
         return;
     }
 
+    /* Only the broadcast carries an epoch, and issuing it here - once per
+     * notice actually emitted - is what makes the value the same everywhere
+     * and strictly increasing.  Every daemon adopts it rather than counting
+     * the notices it has received, so a daemon that missed one (a daemon
+     * launched into a DVM that has already recovered has missed all of them)
+     * is corrected by the next notice or by the WIREUP broadcast. */
+    if(global){
+        uint32_t epoch = prte_grpcomm_issue_epoch();
+        ret = PMIx_Data_pack(NULL, msg, &epoch, 1, PMIX_UINT32);
+        if(PMIX_SUCCESS != ret){
+            PMIX_ERROR_LOG(ret);
+            PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_FORCED_EXIT);
+            PMIX_DATA_BUFFER_RELEASE(msg);
+            return;
+        }
+    }
+
     // Build array of failures to pass up to my parent
     pmix_data_array_t arr = PMIX_DATA_ARRAY_STATIC_INIT;
     if(status->parent_changed){
-        // TODO: Include current ancestor list, to ensure new parent understands
-        // that they are my new parent.
-
         // New parent might not be aware of old failures, report all non-global
         // failures in my subtree
         pmix_bitmap_t local_only;
@@ -382,6 +631,33 @@ static void send_failures_notice(const prte_rml_recovery_status_t* status){
         PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_FORCED_EXIT);
         PMIX_DATA_BUFFER_RELEASE(msg);
         return;
+    }
+
+    // Tell our parent the lineage we now believe in - our ancestor list, whose
+    // last entry is the parent we are sending to. This is the mirror of what an
+    // adoption notice carries the other way, and the receiver reconciles it the
+    // same way, but the two directions were not symmetric until now: a notice
+    // travelling UP reported facts about the sender's subtree and nothing about
+    // why it was talking to this daemon at all. A parent that has not yet
+    // detected the death that re-homed us learns nothing from it, and keeps
+    // routing our traffic through a dead ancestor until one of its own sends
+    // times out. It cannot even reconstruct the death from the failure array:
+    // that array is filtered to the sender's own subtree, and an ancestor is by
+    // definition not in it, so the common re-homing case sends an EMPTY array.
+    //
+    // The list rides only this leg. The HNP's copy of this message is a global
+    // broadcast to daemons whose lineage has nothing to do with ours, which is
+    // why `global` gates it - and why `global` unpacks first, so the same tag
+    // can carry both shapes.
+    if (!global) {
+        ret = PMIx_Data_pack(NULL, msg, &prte_rml_base.ancestors, 1,
+                             PMIX_DATA_ARRAY);
+        if (PMIX_SUCCESS != ret) {
+            PMIX_ERROR_LOG(ret);
+            PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_FORCED_EXIT);
+            PMIX_DATA_BUFFER_RELEASE(msg);
+            return;
+        }
     }
 
     // HNP broadcasts new failure information down

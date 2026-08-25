@@ -134,6 +134,85 @@ class Obj:
     core_logical: frozenset = field(default_factory=frozenset)
 
 
+def _count_gpus(root):
+    """How many compute GPUs this topology holds.
+
+    Mirrors the two rules pmix_hwloc_get_devices() applies, because the
+    interesting number here is the one the runtime will arrive at: the unit
+    is the PCI *function* (a GPU commonly exposes a card node, a render node
+    and a vendor compute node, and they are one device), and a display-class
+    function counts only if it carries a vendor backend or a DRM render node
+    -- which is what separates a real GPU from a management controller's VGA
+    adapter.
+    """
+    backends = ("cuda", "nvml", "rsmi", "levelzero", "opencl")
+    ngpu = 0
+    for pci in root.iter("object"):
+        if pci.get("type") != "PCIDev":
+            continue
+        osdevs = [c for c in pci if c.tag == "object" and c.get("type") == "OSDev"]
+        if not osdevs:
+            continue
+        compute = False
+        render = False
+        for od in osdevs:
+            if od.get("osdev_type") == "5":          # COPROC
+                compute = True
+            for inf in od.findall("info"):
+                if (inf.get("name", "").lower() == "backend"
+                        and inf.get("value", "").lower() in backends):
+                    compute = True
+            if (od.get("name") or "").lower().startswith("renderd"):
+                render = True
+        cls_id = (pci.get("pci_type") or "").split()
+        is_display = bool(cls_id) and cls_id[0].startswith("03")
+        if compute or (render and is_display):
+            ngpu += 1
+    return ngpu
+
+
+def _gpus_nameable(root):
+    """Can every GPU in this topology be named to a vendor runtime?
+
+    Mirrors the vendor-id table in pmix_hwloc_get_devices(): hwloc records a
+    device's vendor identity only from its vendor backends, under one key
+    per vendor.  PRRTE refuses --map-by device=<gpu class> when any GPU on
+    the node carries none, because an assignment the process cannot act on
+    is indistinguishable from a working run.
+
+    Scanned across the whole PCI function, not per OS device: with the CUDA
+    and NVML backends both loaded the function is named by "cuda0" while the
+    uuid sits on the sibling "nvml0".
+    """
+    keys = ("nvidiauuid", "amduuid", "levelzerouuid")
+    backends = ("cuda", "nvml", "rsmi", "levelzero", "opencl")
+    for pci in root.iter("object"):
+        if pci.get("type") != "PCIDev":
+            continue
+        osdevs = [c for c in pci if c.tag == "object" and c.get("type") == "OSDev"]
+        if not osdevs:
+            continue
+        compute = False
+        render = False
+        named = False
+        for od in osdevs:
+            if od.get("osdev_type") == "5":
+                compute = True
+            for inf in od.findall("info"):
+                nm = inf.get("name", "").lower()
+                if nm == "backend" and inf.get("value", "").lower() in backends:
+                    compute = True
+                if nm in keys:
+                    named = True
+            if (od.get("name") or "").lower().startswith("renderd"):
+                render = True
+        cls_id = (pci.get("pci_type") or "").split()
+        is_display = bool(cls_id) and cls_id[0].startswith("03")
+        if (compute or (render and is_display)) and not named:
+            return False
+    return True
+
+
 class TopoModel:
     """Per-topology model derived entirely from the XML -- no hardcoded
     dimensions."""
@@ -186,7 +265,10 @@ class TopoModel:
                     o.core_logical = frozenset(
                         cl for (cb, cl) in cores
                         if cb and (cb & o.cpuset) != 0)
-        return cls(os.path.splitext(os.path.basename(path))[0], by_level)
+        model = cls(os.path.splitext(os.path.basename(path))[0], by_level)
+        model.ngpus = _count_gpus(root)
+        model.gpus_nameable = _gpus_nameable(root)
+        return model
 
     def objects_at(self, level):
         return self.by_level.get(level, [])
@@ -392,12 +474,23 @@ def locate_prterun(top_builddir):
 
 
 def build_argv(prterun_argv0, topo_path, case):
-    argv = [prterun_argv0, "--rtos", "donotlaunch", "--display", "map",
+    argv = [prterun_argv0, "--rtos", "donotlaunch", "--display", "map"]
+    argv += list(case.alloc_args)
+    argv += [
             # pin the mapping-policy baseline so the harness is hermetic: do not
-            # inherit any rmaps_default_mapping_policy a developer may have set
-            # (e.g. in ~/.prte/mca-params.conf). Defaults to the no-directive
-            # "" baseline; cases needing oversubscription pin ":oversubscribe".
-            "--prtemca", "rmaps_default_mapping_policy", case.default_map_policy,
+            # inherit a default mapping policy a developer may have set (e.g. in
+            # ~/.prte/mca-params.conf). Defaults to the no-directive "" baseline;
+            # cases needing oversubscription pin ":oversubscribe".
+            #
+            # Spelled "mapby", the variable's own name, rather than one of its
+            # deprecated synonyms ("map_by", "rmaps_default_mapping_policy").
+            # A synonym still pins the value, but PRRTE prints a deprecation
+            # banner for it, and that banner then lands in every captured
+            # golden - noise in the snapshots, and a spurious diff for anyone
+            # who regenerates only some of them. A command-line setting beats
+            # a file setting whichever spelling the file used, so nothing is
+            # lost by using the current one.
+            "--prtemca", "mapby", case.default_map_policy,
             "--prtemca", "hwloc_use_topo_file", topo_path,
             "-H", case.hostspec]
     if case.map_by is not None:
@@ -496,9 +589,17 @@ class Case:
     n: int = 1
     apps: list = field(default_factory=list)   # list[AppSpec]
     extra_args: tuple = ()
+    # Args that build the ALLOCATION the case selects within, emitted ahead
+    # of everything else.  Every other case lets the -H spec build its own
+    # allocation, which makes each node's slot count equal to its -H count -
+    # the one shape in which a ":N" cap cannot disagree with the node.
+    alloc_args: tuple = ()
+    # {node: nprocs} this case must produce, for placements the generic
+    # invariants below do not describe.
+    expect_counts: dict = None
     expect: str = "map"          # "map" | "reject"
     expect_banner: str = None    # substring expected on reject
-    # value pinned for rmaps_default_mapping_policy; "" = the no-directive
+    # value pinned for the "mapby" MCA variable; "" = the no-directive
     # baseline. A case that wants oversubscription to come from the DVM
     # default rather than from the command line sets ":oversubscribe" here.
     default_map_policy: str = ""
@@ -579,6 +680,219 @@ def group_cases(topo):
                apps=[AppSpec(2), AppSpec(3)], expect="map")
 
 
+def hostcap_cases(topo):
+    """A ":N" cap on a -H entry, applied to an allocation that already exists.
+
+    Every other case in this harness hands -H to a prterun that has no
+    allocation, so the spec builds one and each node's slot count *is* its
+    -H count.  The interesting case is the other one: an allocation already
+    in hand (here from ras/simulator, the only resource manager available
+    offline) and a -H that selects within it.  Then the cap and the node's
+    own slot count disagree, and the mapper has to place by the cap.
+
+    That is exactly what it did not do: the by-object mappers - which is
+    where the default mapping policy lands - filled the head of the list to
+    its slot count and left the tail of the -H list empty.
+    """
+    nslots = 8
+    alloc = ("--prtemca", "ras", "simulator",
+             "--prtemca", "ras_simulator_num_nodes", "3",
+             "--prtemca", "ras_simulator_slots", str(nslots),
+             "--prtemca", "ras_simulator_max_slots", "0")
+    nodes = ["nodeA0", "nodeA1", "nodeA2"]
+    pool = [(nd, 1) for nd in nodes]
+    hostspec = ",".join("%s:1" % nd for nd in nodes)
+    one_each = dict((nd, 1) for nd in nodes)
+
+    # one slot taken from each of three nodes: every policy has to put one
+    # proc on each, whether or not the policy names an object
+    for mb in (None, "core", "package", "node", "slot", "hwthread"):
+        if mb in ("package",) and topo.count("Package") < 1:
+            continue
+        yield Case("hostcap.%s.cap1.m-%s" % (topo.name, mb or "default"),
+                   "hostcap", topo, "capped", hostspec, pool,
+                   map_by=mb, n=len(nodes), alloc_args=alloc,
+                   expect_counts=dict(one_each), expect="map")
+
+    # uneven caps: the map has to follow the caps the user wrote, not spread
+    # the procs evenly and not fill the first node
+    yield Case("hostcap.%s.cap-uneven" % topo.name, "hostcap", topo,
+               "capped", "nodeA0:1,nodeA1:2", [("nodeA0", 1), ("nodeA1", 2)],
+               map_by="core", n=3, alloc_args=alloc,
+               expect_counts={"nodeA0": 1, "nodeA1": 2}, expect="map")
+
+    # asking for more than the caps total is refused, even though the
+    # allocation itself is big enough to hold the job
+    yield Case("hostcap.%s.cap-exceeded" % topo.name, "hostcap", topo,
+               "capped", hostspec, pool, map_by="core", n=len(nodes) + 1,
+               alloc_args=alloc, expect="reject",
+               expect_banner="not enough slots available")
+
+    # permission to oversubscribe changes how many procs a node may end up
+    # with, not how they are handed out: each node still gets what it was
+    # given first, and the leftovers are then split evenly - the same answer
+    # by-slot and by-node give for the same job
+    yield Case("hostcap.%s.cap-oversub" % topo.name, "hostcap", topo,
+               "capped", "nodeA0:2,nodeA1:2,nodeA2:2",
+               [("nodeA0", 2), ("nodeA1", 2), ("nodeA2", 2)],
+               map_by="core:oversubscribe", n=8, alloc_args=alloc,
+               expect_counts={"nodeA0": 3, "nodeA1": 3, "nodeA2": 2},
+               expect="map")
+
+    # the same rule with no cap in play: the ":N" here is exactly what the
+    # nodes hold, so what bounds the first pass is the node itself.  These
+    # nodes have more cores than slots (the simulator sizes the slots, the
+    # topology supplies the cores), which is the shape that tells a mapper
+    # that respects slots from one that fills a node to its core count.
+    small = ("--prtemca", "ras", "simulator",
+             "--prtemca", "ras_simulator_num_nodes", "3",
+             "--prtemca", "ras_simulator_slots", "2",
+             "--prtemca", "ras_simulator_max_slots", "0")
+    yield Case("hostcap.%s.slots-oversub" % topo.name, "hostcap", topo,
+               "capped", "nodeA0:2,nodeA1:2,nodeA2:2",
+               [("nodeA0", 2), ("nodeA1", 2), ("nodeA2", 2)],
+               map_by="core:oversubscribe", n=8, alloc_args=small,
+               expect_counts={"nodeA0": 3, "nodeA1": 3, "nodeA2": 2},
+               expect="map")
+
+    yield Case("hostcap.%s.slots-oversub-span" % topo.name, "hostcap", topo,
+               "capped", "nodeA0:2,nodeA1:2,nodeA2:2",
+               [("nodeA0", 2), ("nodeA1", 2), ("nodeA2", 2)],
+               map_by="core:oversubscribe:span", n=8, alloc_args=small,
+               expect_counts={"nodeA0": 3, "nodeA1": 3, "nodeA2": 2},
+               expect="map")
+
+    # :SPAN answers the same job the same way - it reaches the balance by
+    # cycling the nodes rather than by splitting a remainder, so this is
+    # worth pinning on both paths
+    yield Case("hostcap.%s.cap-span" % topo.name, "hostcap", topo,
+               "capped", "nodeA0:2,nodeA1:2,nodeA2:2",
+               [("nodeA0", 2), ("nodeA1", 2), ("nodeA2", 2)],
+               map_by="core:span", n=6, alloc_args=alloc,
+               expect_counts={"nodeA0": 2, "nodeA1": 2, "nodeA2": 2},
+               expect="map")
+
+    yield Case("hostcap.%s.cap-span-oversub" % topo.name, "hostcap", topo,
+               "capped", "nodeA0:2,nodeA1:2,nodeA2:2",
+               [("nodeA0", 2), ("nodeA1", 2), ("nodeA2", 2)],
+               map_by="core:oversubscribe:span", n=8, alloc_args=alloc,
+               expect_counts={"nodeA0": 3, "nodeA1": 3, "nodeA2": 2},
+               expect="map")
+
+    # :SPAN treats the allocation as one big node, so it hands out one target
+    # per node per trip round the list.  What that buys is a balanced job:
+    # the same request without :SPAN fills each node in turn instead.  Pinned
+    # against an allocation whose nodes have more cores than slots, since a
+    # node-major walk and an interleaved one only differ once a node can hold
+    # more than its share.
+    four = ("--prtemca", "ras", "simulator",
+            "--prtemca", "ras_simulator_num_nodes", "3",
+            "--prtemca", "ras_simulator_slots", "4",
+            "--prtemca", "ras_simulator_max_slots", "0")
+    allfour = "nodeA0:4,nodeA1:4,nodeA2:4"
+    fourpool = [("nodeA0", 4), ("nodeA1", 4), ("nodeA2", 4)]
+    for cid, mb, n, cnt in (
+            ("span-balance", "core:span", 8, {"nodeA0": 3, "nodeA1": 3, "nodeA2": 2}),
+            ("span-fewer-than-nodes", "core:span", 2, {"nodeA0": 1, "nodeA1": 1}),
+            ("span-exact", "core:span", 12, {"nodeA0": 4, "nodeA1": 4, "nodeA2": 4}),
+            ("span-oversub", "core:oversubscribe:span", 14,
+             {"nodeA0": 5, "nodeA1": 5, "nodeA2": 4}),
+            # the contrast: no :SPAN, so the nodes are filled in turn
+            ("nospan-fills", "core", 8, {"nodeA0": 4, "nodeA1": 4})):
+        yield Case("hostcap.%s.%s" % (topo.name, cid), "hostcap", topo,
+                   "capped", allfour, fourpool, map_by=mb, n=n,
+                   alloc_args=four, expect_counts=cnt, expect="map")
+
+    # A node with nothing left to give is what oversubscription is FOR, and it
+    # is reached without a spawn: the second app of an MPMD job maps against
+    # the slots the first one just consumed.  The first pass hands out what
+    # the nodes offer, which here is nothing, and the pass after it places
+    # them - so a mapper that reads "no node could take anything" as "this job
+    # cannot be placed" fails the map.  That is what a PMIx_Spawn onto a node
+    # its parent job has filled looked like.
+    yield Case("hostcap.%s.oversub-full" % topo.name, "hostcap", topo,
+               "capped", "nodeA0:2,nodeA1:2,nodeA2:2",
+               [("nodeA0", 2), ("nodeA1", 2), ("nodeA2", 2)],
+               map_by="core:oversubscribe",
+               apps=[AppSpec(6), AppSpec(2)], alloc_args=small,
+               expect_counts={"nodeA0": 3, "nodeA1": 3, "nodeA2": 2},
+               expect="map")
+    # a cap ABOVE what the node holds is a different question, and the answer
+    # turns on who sized the node.  ras/simulator declares itself not
+    # scheduler-owned, so here the ":N" re-describes the node and the job maps
+    # against the larger count - the arm a scheduler would refuse instead is
+    # only reachable where a real one is running (contrib/slurmswarm).
+    yield Case("hostcap.%s.cap-over-node" % topo.name, "hostcap", topo,
+               "capped", "nodeA0:4", [("nodeA0", 4)], map_by="core", n=4,
+               alloc_args=small, expect_counts={"nodeA0": 4}, expect="map")
+
+
+def device_cases(topo):
+    """--map-by device=, whose placement is pinned by golden snapshots.
+
+    Only emitted for a topology that actually has GPUs: on one without any,
+    the directive is correctly an error, and that negative is covered
+    separately.  The plain and interleaved orders are both pinned because the
+    difference between them IS the feature - one fills a package before
+    moving on, the other alternates.
+
+    A topology whose GPUs carry no vendor identity gets the refusal instead
+    of the placements.  That is not a gap in the coverage, it IS the
+    behavior: PRRTE will not map by a device it cannot name to the runtime
+    that has to use it.  The two GPU topologies in test/topologies are the
+    same machine seen by an hwloc with and without the vendor backends, so
+    both arms are real rather than contrived.
+    """
+    if getattr(topo, "ngpus", 0) < 2:
+        return
+    hostspec, pool = LAYOUTS["single"]
+    n = topo.ngpus
+    if not getattr(topo, "gpus_nameable", True):
+        yield Case("device.%s.gpu-unnameable" % topo.name, "device", topo,
+                   "single", hostspec, pool, map_by="device=gpu",
+                   rank_by="slot", bind_to="core", n=n, expect="reject",
+                   expect_banner="carry no")
+        return
+    yield Case("device.%s.gpu" % topo.name, "device", topo, "single",
+               hostspec, pool, map_by="device=gpu", rank_by="slot",
+               bind_to="core", n=n, expect="map")
+    yield Case("device.%s.gpu-interleave" % topo.name, "device", topo,
+               "single", hostspec, pool, map_by="device=gpu:interleave",
+               rank_by="slot", bind_to="core", n=n, expect="map")
+    # a device is assigned, not subdivided: more procs than devices is an
+    # error unless the user says they meant it
+    yield Case("device.%s.gpu-toomany" % topo.name, "device", topo, "single",
+               hostspec, pool, map_by="device=gpu", rank_by="slot",
+               bind_to="core", n=2 * n, expect="reject",
+               expect_banner="Processes placeable")
+    yield Case("device.%s.gpu-shared" % topo.name, "device", topo, "single",
+               hostspec, pool, map_by="device=gpu:shared", rank_by="slot",
+               bind_to="core", n=2 * n, expect="map")
+
+    # the reverse ratio: N procs on each device
+    yield Case("device.%s.ppr2" % topo.name, "device", topo, "single",
+               hostspec, pool, map_by="ppr:2:device=gpu", rank_by="slot",
+               bind_to="core", n=2 * n, expect="map")
+
+    # several devices to each proc: the locality widens to whatever
+    # contains them all, so a binding that would be refused with one device
+    # per proc becomes legitimate
+    if 0 == n % 2:
+        yield Case("device.%s.gpu-ndev2" % topo.name, "device", topo, "single",
+                   hostspec, pool, map_by="device=gpu:ndev=2", rank_by="slot",
+                   bind_to="package", n=n // 2, expect="map")
+
+    # fewer procs than devices is where the two orders visibly differ
+    if 2 <= n // 2:
+        yield Case("device.%s.gpu-half" % topo.name, "device", topo, "single",
+                   hostspec, pool, map_by="device=gpu", rank_by="slot",
+                   bind_to="core", n=n // 2, expect="map")
+        yield Case("device.%s.gpu-half-interleave" % topo.name, "device", topo,
+                   "single", hostspec, pool,
+                   map_by="device=gpu:interleave", rank_by="slot",
+                   bind_to="core", n=n // 2, expect="map")
+
+
 def perapp_cases(topo):
     """MPMD lines carrying distinct per-app --map-by/--rank-by/--bind-to
     directives - the rmaps per-app dispatch path.  Placement/ranking/binding
@@ -646,6 +960,8 @@ def generate_cases(topos, layouts, ns, full):
         cases.extend(matrix_cases(topo, layouts, ns))
         cases.extend(negative_cases(topo))
         cases.extend(group_cases(topo))
+        cases.extend(hostcap_cases(topo))
+        cases.extend(device_cases(topo))
         cases.extend(perapp_cases(topo))
     return cases
 
@@ -729,10 +1045,13 @@ def check_universal(case, pmap):
         if pmap.rank_policy != case.rank_by.upper():
             v.append(("U1", "rank policy %s != %s"
                       % (pmap.rank_policy, case.rank_by.upper())))
-    if case.bind_to and case.bind_to in BIND_DISPLAY:
-        if pmap.bind_policy not in BIND_DISPLAY[case.bind_to]:
+    if case.bind_to and bind_object(case.bind_to) in BIND_DISPLAY:
+        # the display carries the qualifiers too ("CORE:OVERLOAD-ALLOWED"),
+        # so compare the object each side names, not the whole word
+        shown = (pmap.bind_policy or "").split(":", 1)[0]
+        if shown not in BIND_DISPLAY[bind_object(case.bind_to)]:
             v.append(("U1", "bind policy %s not in %s"
-                      % (pmap.bind_policy, BIND_DISPLAY[case.bind_to])))
+                      % (pmap.bind_policy, BIND_DISPLAY[bind_object(case.bind_to)])))
 
     # U2 total procs
     total = len(flat)
@@ -774,6 +1093,12 @@ def check_universal(case, pmap):
 
 def check_mapping(case, pmap):
     v = []
+    if case.expect_counts is not None:
+        actual = dict(_node_counts(pmap))
+        if actual != case.expect_counts:
+            v.append(("M-counts", "node counts %s != expected %s"
+                      % (actual, case.expect_counts)))
+        return v
     if case.apps:
         return v  # multi-app placement shape is pinned by golden snapshots
     if not case.map_by or ":" in case.map_by or case.map_by not in MAP_BY:
@@ -796,15 +1121,20 @@ def check_mapping(case, pmap):
                 v.append(("M-slot",
                           "node counts %s != block-fill %s" % (actual, exp)))
     else:
-        # object-level maps (non-span) are node-local: all procs land on the
-        # first node, round-robin across that node's objects, oversubscribing
-        # rather than spilling to the next node.  (--map-by node / :SPAN are
-        # the directives that spread across nodes.)
-        first = case.pool[0][0]
-        if actual != {first: n}:
-            v.append(("M-%s" % case.map_by,
-                      "node counts %s != node-local {%s: %d}"
-                      % (actual, first, n)))
+        # object-level maps (non-span) are front-loaded like by-slot: each
+        # node is filled with what it offers - round-robin across that node's
+        # objects - before the mapper moves to the next one.  So while the job
+        # fits in the allocation the shape is a block fill, which for the
+        # common case of a job smaller than the first node is "everything on
+        # the first node".  (--map-by node / :SPAN are the directives that
+        # spread across nodes.)  Past the total slot count the procs left over
+        # come back around to oversubscribe, and that spread is left to
+        # golden, exactly as for by-slot.
+        if n <= total_slots:
+            exp = _expected_block_fill(case.pool, n)
+            if actual != exp:
+                v.append(("M-%s" % case.map_by,
+                          "node counts %s != block-fill %s" % (actual, exp)))
     return v
 
 
@@ -834,19 +1164,32 @@ def check_ranking(case, pmap):
     return v
 
 
+def bind_object(bind_to):
+    """The object named by a --bind-to spec, with any qualifiers dropped.
+
+    "core:overload-allowed" binds to a core; the qualifier says what may
+    happen when the cores run out, not what is bound to.  Looking the whole
+    string up in BIND_LEVEL raised a KeyError and failed the case as a
+    checker error - which reads like a defect in the mapper rather than a
+    gap in the harness."""
+    if not bind_to:
+        return bind_to
+    return bind_to.split(":", 1)[0]
+
+
 def check_binding(case, pmap):
     v = []
     if not case.bind_to:
         return v
     flat = _flat_procs(pmap)
-    if case.bind_to == "none":
+    if bind_object(case.bind_to) == "none":
         for _, p in flat:
             if p.bound is not None:
                 v.append(("B-none", "rank %d is bound but bind-to none"
                           % p.rank))
                 break
         return v
-    level = BIND_LEVEL[case.bind_to]
+    level = BIND_LEVEL[bind_object(case.bind_to)]
     spans = case.topo.spans_at(level)
     for _, p in flat:
         if p.bound is None:
@@ -879,7 +1222,7 @@ def check_perapp_binding(case, pmap):
                               % (idx, p.rank)))
                     break
             continue
-        level = BIND_LEVEL[app.bind_to]
+        level = BIND_LEVEL[bind_object(app.bind_to)]
         spans = case.topo.spans_at(level)
         for _, p in flat:
             if p.app != idx:
@@ -916,7 +1259,7 @@ def golden_path(golden_dir, case):
 
 def is_curated_golden(c):
     """A small, human-reviewable subset pinned by golden snapshots."""
-    if c.group in ("oversubscribe", "ppr", "multiapp", "perapp"):
+    if c.group in ("oversubscribe", "ppr", "multiapp", "perapp", "device"):
         return True
     if c.group == "matrix" and c.expect == "map":
         # one representative per map-by (even layout, rank slot, bind none)

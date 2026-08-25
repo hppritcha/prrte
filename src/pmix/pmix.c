@@ -384,6 +384,8 @@ pmix_proc_state_t prte_pmix_convert_state(int state)
 
     case PRTE_PROC_STATE_KILLED_BY_CMD:
         return PMIX_PROC_STATE_KILLED_BY_CMD;
+    case PRTE_PROC_STATE_KILLED_BY_RELEASE:
+        return PMIX_PROC_STATE_KILLED_BY_RELEASE;
     case PRTE_PROC_STATE_ABORTED:
         return PMIX_PROC_STATE_ABORTED;
     case PRTE_PROC_STATE_FAILED_TO_START:
@@ -445,6 +447,8 @@ int prte_pmix_convert_pstate(pmix_proc_state_t state)
         return PRTE_PROC_STATE_TERMINATED;
     case PMIX_PROC_STATE_KILLED_BY_CMD:
         return PRTE_PROC_STATE_KILLED_BY_CMD;
+    case PMIX_PROC_STATE_KILLED_BY_RELEASE:
+        return PRTE_PROC_STATE_KILLED_BY_RELEASE;
     case PMIX_PROC_STATE_ABORTED:
         return PRTE_PROC_STATE_ABORTED;
     case PMIX_PROC_STATE_FAILED_TO_START:
@@ -496,6 +500,9 @@ pmix_status_t prte_pmix_convert_job_state_to_error(int state)
         case PRTE_JOB_STATE_KILLED_BY_CMD:
             return PMIX_ERR_JOB_CANCELED;
 
+        case PRTE_JOB_STATE_KILLED_BY_RELEASE:
+            return PMIX_ERR_JOB_KILLED_BY_RELEASE;
+
         case PRTE_JOB_STATE_ABORTED:
         case PRTE_JOB_STATE_CALLED_ABORT:
         case PRTE_JOB_STATE_SILENT_ABORT:
@@ -523,6 +530,9 @@ pmix_status_t prte_pmix_convert_proc_state_to_error(int state)
     switch (state) {
         case PRTE_PROC_STATE_KILLED_BY_CMD:
             return PMIX_ERR_JOB_CANCELED;
+
+        case PRTE_PROC_STATE_KILLED_BY_RELEASE:
+            return PMIX_ERR_JOB_KILLED_BY_RELEASE;
 
         case PRTE_PROC_STATE_ABORTED:
         case PRTE_PROC_STATE_CALLED_ABORT:

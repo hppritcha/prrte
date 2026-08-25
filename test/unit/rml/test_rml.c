@@ -62,6 +62,8 @@
 #    include <net/if.h>
 #endif
 
+#include "src/runtime/prte_globals.h"
+#include "src/runtime/prte_worker_pool.h"
 #include "src/runtime/runtime.h"
 #include "src/util/pmix_argv.h"
 #include "src/util/pmix_if.h"
@@ -70,7 +72,10 @@
 #include "src/rml/rml.h"
 #include "src/rml/oob/oob.h"
 #include "src/rml/oob/oob_tcp.h"
+#include "src/rml/oob/oob_tcp_hdr.h"
+#include "src/rml/oob/oob_tcp_connection.h"
 #include "src/rml/oob/oob_tcp_peer.h"
+#include "src/rml/oob/oob_tcp_sendrecv.h"
 
 #define CHECK(label, cond)                                    \
     do {                                                      \
@@ -423,87 +428,271 @@ static int test_payload_outlives_sends(void)
     return failures;
 }
 
-/*
- * The pool of event bases that peer sockets are serviced on.
+/* Which base a peer's socket handlers run on.
  *
- * Two properties matter and neither needs a socket to check.  First, the
- * "no worker threads" case - which is the default, and therefore the shape
- * every existing deployment runs - must still leave ev_bases holding exactly
- * one entry, prte_event_base, because every call site indexes the array
- * unconditionally; a NULL array or a zero-length one is a segfault on the
- * first peer.  Second, peers must be handed out round-robin and the cursor
- * must wrap, since a cursor that ran off the end would index past the array.
+ * peer_cons does not decide - it asks the process-wide worker pool (see
+ * src/runtime/prte_worker_pool.h), and what matters here is that it asks at
+ * all, and that it copes with the answer in both shapes.  With no pool up -
+ * the state a peer built before prte_init stood one up, or after finalize
+ * took it down, is in - every peer must land on prte_event_base, because
+ * every socket path uses peer->evbase unconditionally.  With a pool up,
+ * successive peers must land on different bases, or the pool buys nothing.
  *
- * The multi-thread case is driven with a hand-built array rather than by
- * asking for real threads: prte_progress_thread_init spins an actual engine
- * thread per base, which a bare test process has no business starting.  What
- * is under test here is the assignment arithmetic, not libevent.
+ * The rotation itself is tested where it lives, in test_runtime.
  */
-static int test_progress_thread_pool(void)
+static int test_peer_base_assignment(void)
 {
-    int failures = 0, i;
-    prte_event_base_t *fake[3];
-    prte_oob_tcp_peer_t *peers[7];
+    int failures = 0, i, save = prte_num_worker_threads;
+    prte_oob_tcp_peer_t *peers[6];
 
-    /* the default: no dedicated threads */
-    prte_oob_base.num_progress_threads = 0;
-    prte_oob_base.ev_bases = NULL;
-    prte_oob_base.ev_threads = NULL;
-    prte_oob_base.next_base = 0;
-    CHECK("pool starts", PRTE_SUCCESS == prte_oob_start_progress_threads());
-    CHECK("array exists with no threads", NULL != prte_oob_base.ev_bases);
-    CHECK("no threads means the main base",
-          NULL != prte_oob_base.ev_bases && prte_event_base == prte_oob_base.ev_bases[0]);
-    CHECK("no threads recorded", 0 == prte_oob_base.num_progress_threads);
-    CHECK("no thread names recorded", NULL == prte_oob_base.ev_threads);
-
-    /* every peer lands on that one entry, and the cursor does not move */
+    /* no pool: every peer takes the main base.  (prte_event_base has never
+     * been created in this bare test process, so compare against it rather
+     * than asserting non-NULL.) */
+    prte_num_worker_threads = 0;
+    CHECK("empty pool starts", PRTE_SUCCESS == prte_worker_pool_init());
     for (i = 0; i < 3; i++) {
         peers[i] = PMIX_NEW(prte_oob_tcp_peer_t);
         CHECK("peer takes the main base", prte_event_base == peers[i]->evbase);
     }
-    CHECK("cursor pinned with no threads", 0 == prte_oob_base.next_base);
     for (i = 0; i < 3; i++) {
         PMIX_RELEASE(peers[i]);
     }
+    prte_worker_pool_finalize();
 
-    prte_oob_harvest_progress_threads();
-    CHECK("harvest clears the array", NULL == prte_oob_base.ev_bases);
-    CHECK("harvest clears the count", 0 == prte_oob_base.num_progress_threads);
-
-    /* a negative request is a request for none, not an array sized -1 */
-    prte_oob_base.num_progress_threads = -4;
-    CHECK("negative pool starts", PRTE_SUCCESS == prte_oob_start_progress_threads());
-    CHECK("negative clamps to none", 0 == prte_oob_base.num_progress_threads);
-    CHECK("negative still yields the main base",
-          NULL != prte_oob_base.ev_bases && prte_event_base == prte_oob_base.ev_bases[0]);
-    prte_oob_harvest_progress_threads();
-
-    /* three bases, seven peers: 0,1,2,0,1,2,0 */
-    for (i = 0; i < 3; i++) {
-        /* distinct non-NULL values are all the assignment arithmetic sees */
-        fake[i] = (prte_event_base_t *) &fake[i];
-    }
-    prte_oob_base.num_progress_threads = 3;
-    prte_oob_base.ev_bases = fake;
-    prte_oob_base.next_base = 0;
-    for (i = 0; i < 7; i++) {
+    /* three workers, six peers: each peer takes a worker base, and the
+     * assignment cycles with the pool's period rather than pinning them all
+     * to one thread */
+    prte_num_worker_threads = 3;
+    CHECK("worker pool starts", PRTE_SUCCESS == prte_worker_pool_init());
+    for (i = 0; i < 6; i++) {
         peers[i] = PMIX_NEW(prte_oob_tcp_peer_t);
     }
-    for (i = 0; i < 7; i++) {
-        CHECK("peer assigned round-robin", fake[i % 3] == peers[i]->evbase);
+    for (i = 0; i < 6; i++) {
+        CHECK("peer left the main base", prte_event_base != peers[i]->evbase);
+        CHECK("peer assignment cycles with the pool",
+              peers[i]->evbase == peers[i % 3]->evbase);
     }
-    CHECK("cursor wrapped", 1 == prte_oob_base.next_base);
-    for (i = 0; i < 7; i++) {
+    CHECK("consecutive peers get different bases",
+          peers[0]->evbase != peers[1]->evbase
+          && peers[1]->evbase != peers[2]->evbase
+          && peers[0]->evbase != peers[2]->evbase);
+    for (i = 0; i < 6; i++) {
         PMIX_RELEASE(peers[i]);
     }
-    /* the array is on our stack - do not let harvest free it */
-    prte_oob_base.ev_bases = NULL;
-    prte_oob_base.num_progress_threads = 0;
-    prte_oob_base.next_base = 0;
+    prte_worker_pool_finalize();
+    prte_num_worker_threads = save;
 
     if (0 == failures) {
-        fprintf(stdout, "PASSED test_progress_thread_pool\n");
+        fprintf(stdout, "PASSED test_peer_base_assignment\n");
+    }
+    return failures;
+}
+
+
+/* The wire header.
+ *
+ * A DATA message carries no namespace at all: every OOB peer is a daemon of
+ * this DVM, so the receiver rebuilds both procids with its own.  The connect
+ * HANDSHAKE does carry one, because that is where the claim is checked.
+ * Nothing here needs a socket - what matters is how long each of the two is
+ * on the wire, that the receiver's read reconstructs exactly the names the
+ * sender put in, and that the byte-order conversion is a round trip.  Those
+ * are what a reader of oob_tcp_sendrecv.c has to take on trust, and getting
+ * any of them wrong delivers a message under the wrong identity rather than
+ * failing.
+ */
+static int test_wire_header(void)
+{
+    int failures = 0;
+    prte_oob_tcp_hdr_t snd, rcv;
+    pmix_proc_t origin, dest;
+    char wire[sizeof(prte_oob_tcp_hdr_t)];
+    size_t len;
+    const char *ns = "prterun-somenode-12345@0";
+
+    /* this process stands in for the receiving daemon */
+    PMIX_LOAD_NSPACE(PRTE_PROC_MY_NAME->nspace, ns);
+
+    /* --- a data message ------------------------------------------------ */
+    memset(&snd, 0, sizeof(snd));
+    snd.epoch = 7;
+    snd.origin = 3;
+    snd.dst = 11;
+    snd.tag = PRTE_RML_TAG_DAEMON;
+    snd.seq_num = 42;
+    snd.nbytes = 4096;
+    snd.type = MCA_OOB_TCP_USER;
+    snd.nslen = 0;      /* what the queueing macros do */
+
+    len = PRTE_OOB_TCP_HDR_LEN(&snd);
+    CHECK("a data header is exactly the fixed part",
+          len == PRTE_OOB_TCP_HDR_FIXED);
+    /* the point of the exercise: the struct is much larger than the message */
+    CHECK("hdr on the wire is far smaller than the struct", len < sizeof(snd) / 4);
+
+    MCA_OOB_TCP_HDR_HTON(&snd);
+    memcpy(wire, &snd, len);
+
+    memset(&rcv, 0xff, sizeof(rcv));
+    memcpy(&rcv, wire, PRTE_OOB_TCP_HDR_FIXED);
+    CHECK("nslen needs no byte-order conversion to be usable",
+          PRTE_OOB_TCP_HDR_LEN(&rcv) == len);
+    PRTE_OOB_TCP_HDR_END_NSPACE(&rcv);
+    MCA_OOB_TCP_HDR_NTOH(&rcv);
+
+    CHECK("epoch survives the round trip", 7 == rcv.epoch);
+    CHECK("tag survives the round trip", PRTE_RML_TAG_DAEMON == rcv.tag);
+    CHECK("seq_num survives the round trip", 42 == rcv.seq_num);
+    CHECK("nbytes survives the round trip", 4096 == rcv.nbytes);
+    CHECK("type survives the round trip", MCA_OOB_TCP_USER == rcv.type);
+
+    /* both names come back in OUR namespace, which is the whole point of
+     * leaving it off the wire */
+    PRTE_OOB_TCP_HDR_PROC(&rcv, rcv.origin, &origin);
+    PRTE_OOB_TCP_HDR_PROC(&rcv, rcv.dst, &dest);
+    CHECK("origin rank rebuilt", 3 == origin.rank);
+    CHECK("dst rank rebuilt", 11 == dest.rank);
+    CHECK("origin nspace is the receiver's own", PMIX_CHECK_NSPACE(origin.nspace, ns));
+    CHECK("dst carries the same nspace", PMIX_CHECK_NSPACE(dest.nspace, ns));
+
+    /* --- a handshake --------------------------------------------------- */
+    memset(&snd, 0, sizeof(snd));
+    snd.origin = 5;
+    snd.dst = 0;
+    snd.type = MCA_OOB_TCP_IDENT;
+    PRTE_OOB_TCP_HDR_LOAD_NSPACE(&snd, ns);
+
+    CHECK("hdr nslen excludes the terminator", strlen(ns) == snd.nslen);
+    len = PRTE_OOB_TCP_HDR_LEN(&snd);
+    CHECK("a handshake header is the fixed part plus the nspace",
+          len == PRTE_OOB_TCP_HDR_FIXED + strlen(ns));
+
+    MCA_OOB_TCP_HDR_HTON(&snd);
+    memcpy(wire, &snd, len);
+
+    /* what a receiver does: the fixed part first, then nslen characters,
+     * then supply the terminator the sender did not send */
+    memset(&rcv, 0xff, sizeof(rcv));
+    memcpy(&rcv, wire, PRTE_OOB_TCP_HDR_FIXED);
+    CHECK("the handshake's nspace length arrives with the fixed part",
+          PRTE_OOB_TCP_HDR_LEN(&rcv) == len);
+    memcpy(rcv.nspace, wire + PRTE_OOB_TCP_HDR_FIXED, rcv.nslen);
+    PRTE_OOB_TCP_HDR_END_NSPACE(&rcv);
+    MCA_OOB_TCP_HDR_NTOH(&rcv);
+    CHECK("the nspace arrives terminated and intact", 0 == strcmp(rcv.nspace, ns));
+    CHECK("a matching handshake nspace is what the peer check compares",
+          PMIX_CHECK_NSPACE(rcv.nspace, PRTE_PROC_MY_NAME->nspace));
+
+    /* a stranger's handshake is distinguishable - this is the comparison
+     * tcp_peer_recv_connect_ack makes before adopting a peer */
+    PMIX_LOAD_NSPACE(rcv.nspace, "prterun-othernode-999@0");
+    CHECK("another DVM's handshake nspace does not match",
+          !PMIX_CHECK_NSPACE(rcv.nspace, PRTE_PROC_MY_NAME->nspace));
+
+    /* a maximum-length nspace still fits the single-byte length field */
+    memset(&snd, 0, sizeof(snd));
+    {
+        char big[PMIX_MAX_NSLEN + 1];
+        memset(big, 'x', PMIX_MAX_NSLEN);
+        big[PMIX_MAX_NSLEN] = '\0';
+        PRTE_OOB_TCP_HDR_LOAD_NSPACE(&snd, big);
+        CHECK("a full-length nspace is carried whole", PMIX_MAX_NSLEN == snd.nslen);
+        PRTE_OOB_TCP_HDR_END_NSPACE(&snd);
+        CHECK("a full-length nspace round trips", 0 == strcmp(snd.nspace, big));
+    }
+
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_wire_header\n");
+    }
+    return failures;
+}
+
+/* Giving up on a peer must not take its queued messages with it.
+ *
+ * A send handed to the OOB is owed a callback: PRTE_RML_SEND_COMPLETE is how
+ * the originator learns the message went out or died, and RELM is waiting on
+ * exactly that to decide whether to replay.  PMIX_RELEASE on the send frees
+ * the buffer and tells nobody, which looks like nothing at all happening.
+ *
+ * Every path that gives up on a peer therefore has to drain the queue and
+ * complete each message with a failure status - the peer teardown here, and
+ * the arms of prte_oob_tcp_peer_try_connect that cannot get a socket at all
+ * (a create or bind failure spans every interface, so there is no other
+ * address to try).  Those arms are a reconnect path as well as a
+ * first-connect one, so what is queued can be real work rather than a
+ * handshake; they used to drop it.  They share this drain, so exercising it
+ * through the one entry point that needs no sockets covers them.
+ *
+ * The on-deck message is checked as well as the queue: it is held in
+ * peer->send_msg rather than on the list, and is the one most easily missed.
+ */
+static int completed_sends = 0;
+static int last_send_status = PRTE_SUCCESS;
+
+static void record_completion(int status, pmix_proc_t *peer,
+                              pmix_data_buffer_t *buffer,
+                              prte_rml_tag_t tag, void *cbdata)
+{
+    PRTE_HIDE_UNUSED_PARAMS(peer, tag, cbdata);
+    if (NULL != buffer) {
+        PMIX_DATA_BUFFER_RELEASE(buffer);
+    }
+    completed_sends++;
+    last_send_status = status;
+}
+
+static prte_oob_tcp_send_t *queued_send(prte_oob_tcp_peer_t *peer)
+{
+    prte_oob_tcp_send_t *snd;
+    prte_rml_send_t *msg;
+
+    msg = PMIX_NEW(prte_rml_send_t);
+    PMIX_XFER_PROCID(&msg->dst, &peer->name);
+    PMIX_XFER_PROCID(&msg->origin, PRTE_PROC_MY_NAME);
+    msg->tag = PRTE_RML_TAG_XCAST;
+    msg->cbfunc = record_completion;
+    PMIX_DATA_BUFFER_CREATE(msg->dbuf);
+
+    snd = PMIX_NEW(prte_oob_tcp_send_t);
+    snd->msg = msg;
+    return snd;
+}
+
+static int test_queued_sends_complete_on_close(void)
+{
+    int failures = 0, i;
+    prte_oob_tcp_peer_t *peer;
+
+    peer = PMIX_NEW(prte_oob_tcp_peer_t);
+    PMIX_LOAD_PROCID(&peer->name, PRTE_PROC_MY_NAME->nspace, 1);
+    peer->sd = -1;
+    /* a connection that was up: "established" is what keeps peer_close out of
+     * the rotate-to-the-next-address branch, which deliberately keeps the
+     * queue so it can go out over the next address */
+    peer->established = true;
+    peer->state = MCA_OOB_TCP_FAILED;
+
+    completed_sends = 0;
+    last_send_status = PRTE_SUCCESS;
+
+    peer->send_msg = queued_send(peer);
+    for (i = 0; i < 2; i++) {
+        prte_oob_tcp_send_t *snd = queued_send(peer);
+        pmix_list_append(&peer->send_queue, &snd->super);
+    }
+
+    prte_oob_tcp_peer_close(peer);
+
+    CHECK("every queued send was completed, on-deck message included",
+          3 == completed_sends);
+    CHECK("and completed as a failure", PRTE_SUCCESS != last_send_status);
+    CHECK("the on-deck slot was cleared", NULL == peer->send_msg);
+    CHECK("the queue was drained", 0 == pmix_list_get_size(&peer->send_queue));
+
+    PMIX_RELEASE(peer);
+
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_queued_sends_complete_on_close\n");
     }
     return failures;
 }
@@ -527,7 +716,9 @@ int main(void)
     failures += test_bad_subnets_dropped();
     failures += test_subnet_resolves_and_dedupes();
     failures += test_payload_outlives_sends();
-    failures += test_progress_thread_pool();
+    failures += test_peer_base_assignment();
+    failures += test_queued_sends_complete_on_close();
+    failures += test_wire_header();
 
     prte_finalize();
 

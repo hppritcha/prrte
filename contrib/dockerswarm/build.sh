@@ -65,6 +65,17 @@
 # source too (covering both code bases); otherwise the baked-in PMIx (Linux) or
 # an installed PMIx (macOS, override with PMIX_HOME) is used.
 #
+# Optional: PRTE_SWARM_MCA_DSO=1 builds every MCA component as a run-time
+# loadable DSO (--enable-mca-dso) instead of linking it into libprrte.  That is
+# a supported build nobody runs multi-node, so the whole suite against it is
+# cheap insurance -- see AGENTS.md, "Components as DSOs".  It is off by default
+# because the default build is what users get.
+#
+# NOTE the name: anything called PRTE_MCA_* is harvested out of the launcher's
+# environment onto the prted command line as an MCA parameter, so a knob named
+# PRTE_MCA_DSO would arrive at every daemon as `--prtemca DSO 1`.  Harness
+# knobs take the PRTE_SWARM_ prefix for exactly that reason.
+#
 # Requires: docker (for linux/image), git, and a working autotools toolchain.
 
 set -euo pipefail
@@ -109,6 +120,8 @@ PMIX_HOME="${PMIX_HOME:-}"              # optional installed PMIx prefix (macOS)
 # checkout must be autogen'd and NOT configured in-tree (same rule as
 # PMIX_SRC -- configure runs VPATH over a read-only bind mount).
 OMPI_SRC="${OMPI_SRC:-}"
+# Build every component as a run-time loadable DSO rather than into libprrte.
+MCA_DSO="${PRTE_SWARM_MCA_DSO:-0}"
 
 mode=linux
 distclean=auto                          # auto | always | never
@@ -279,6 +292,7 @@ build_linux() {
     docker run --rm \
         -v "$root":/prrte-src:ro \
         -v "$VOLUME":/opt/prte \
+        -e PRTE_SWARM_MCA_DSO="$MCA_DSO" \
         ${pmix_mount[@]+"${pmix_mount[@]}"} \
         ${ompi_mount[@]+"${ompi_mount[@]}"} \
         "$IMAGE" bash -euo pipefail -c '
@@ -366,7 +380,7 @@ build_linux() {
 
             # invalidate the freshness stamp up front: from here until the
             # build finishes, whatever is installed is NOT this source tree
-            rm -f /opt/prte/.build-stamp
+            rm -f /opt/prte/.build-stamp /opt/prte/.build-mode
 
             echo ">>>> PRRTE VPATH build -> /opt/prte/prte"
             mkdir -p /opt/prte/vpath-linux && cd /opt/prte/vpath-linux
@@ -379,9 +393,24 @@ build_linux() {
             # break in those lines surfaces here rather than in the slower
             # sibling.  libjansson-dev is baked into the image.
             prte_args="--prefix=/opt/prte/prte --with-pmix=$PMIX_PREFIX --with-jansson --enable-debug"
+            # Every component as a loadable DSO instead of inside libprrte.
+            # It goes in the argument string, so switching the knob is a
+            # configure-argument change and reconfigure_needed catches it --
+            # the same mechanism that catches a changed --with-pmix.
+            if [ "${PRTE_SWARM_MCA_DSO:-0}" != 0 ]; then
+                prte_args="$prte_args --enable-mca-dso"
+                echo ">>>> components as DSOs (--enable-mca-dso)"
+            fi
             if reconfigure_needed . "$prte_args" /prrte-src; then
                 echo ">>>> (re)configuring PRRTE: $prte_args"
                 drop_orphans . /prrte-src
+                # The install outlives the build dir, and lib/prte holds the
+                # component DSOs of whatever was built last.  Switching the
+                # knob OFF would otherwise leave them there for the static
+                # build to dlopen -- every component present twice, one copy
+                # of it stale.  Nothing else removes them: make install only
+                # adds.
+                rm -rf /opt/prte/prte/lib/prte
                 /prrte-src/configure $prte_args
                 echo "$prte_args" > .configure-args
             fi
@@ -429,6 +458,18 @@ build_linux() {
                 /prrte-src/contrib/dockerswarm/jobinfo.c \
                 -I"$PMIX_PREFIX/include" -L"$PMIX_PREFIX/lib" -Wl,-rpath,"$PMIX_PREFIX/lib" -lpmix
 
+            # devinfo: reads back the device this proc was mapped against.
+            # The point is that it asks the PROCESS, not the head node: the
+            # assignment is computed on the HNP, packed into the launch
+            # message, unpacked by the daemon that forks the proc, and then
+            # published by the PMIx server in that daemon, whereas
+            # "--display map" shows only the first of those steps.
+            # (No apostrophes here: see the note further down.)
+            echo ">>>> devinfo (device assignment) test client"
+            gcc -O0 -g -o /opt/prte/prte/bin/devinfo \
+                /prrte-src/contrib/dockerswarm/devinfo.c \
+                -I"$PMIX_PREFIX/include" -L"$PMIX_PREFIX/lib" -Wl,-rpath,"$PMIX_PREFIX/lib" -lpmix
+
             # dataserver: a bare PMIx client for the publish/lookup service
             # in src/runtime/data_server.  The store is a single array on
             # the HNP and every client reaches it through its own daemon, so
@@ -464,6 +505,34 @@ build_linux() {
                 /prrte-src/contrib/dockerswarm/groupcon.c \
                 -I"$PMIX_PREFIX/include" -L"$PMIX_PREFIX/lib" -Wl,-rpath,"$PMIX_PREFIX/lib" -lpmix
 
+            # connector: a bare PMIx client that connects a spawned child job
+            # to its parent and then has the child leave, with or without
+            # disconnecting first.  The PMIx server library runs a connect
+            # whose participants are all local without telling the host at
+            # all, so an assemblage that spans daemons is the only shape the
+            # runtime ever sees - and the promise being checked (an event to
+            # the assemblage when a member departs without disconnecting) is
+            # one the runtime has to keep.
+            # (No apostrophes here: see the note further down.)
+            echo ">>>> connector (connect/disconnect assemblage) test client"
+            gcc -O0 -g -o /opt/prte/prte/bin/connector \
+                /prrte-src/contrib/dockerswarm/connector.c \
+                -I"$PMIX_PREFIX/include" -L"$PMIX_PREFIX/lib" -Wl,-rpath,"$PMIX_PREFIX/lib" -lpmix
+
+            # groupinv: a bare PMIx client that forms a group by INVITATION
+            # and asks for a context id.  That method runs no server
+            # collective, so its leader requests the id through job control,
+            # which lands on the daemon hosting the leader -- and only the HNP
+            # holds the id pool, so that daemon has to relay it.  The client
+            # makes the HIGHEST rank the leader precisely so that, mapped by
+            # node, the leader is never the HNP.  On one host the relay is
+            # skipped entirely and the test proves nothing.
+            # (No apostrophes here: see the note further down.)
+            echo ">>>> groupinv (group invite/join context id) test client"
+            gcc -O0 -g -o /opt/prte/prte/bin/groupinv \
+                /prrte-src/contrib/dockerswarm/groupinv.c \
+                -I"$PMIX_PREFIX/include" -L"$PMIX_PREFIX/lib" -Wl,-rpath,"$PMIX_PREFIX/lib" -lpmix
+
             # scaletest: a PMIx client that times a full-data fence and a
             # bare barrier over the whole job, so the cost of the DVM
             # collectives can be plotted against DVM size, process count,
@@ -476,7 +545,7 @@ build_linux() {
             # (No apostrophes here: see the note further down.)
             echo ">>>> scaletest (collective scaling measurement) client"
             gcc -O2 -g -o /opt/prte/prte/bin/scaletest \
-                /prrte-src/contrib/dockerswarm/scaletest.c \
+                /prrte-src/contrib/scaling/scaletest.c \
                 -I"$PMIX_PREFIX/include" -L"$PMIX_PREFIX/lib" -Wl,-rpath,"$PMIX_PREFIX/lib" -lpmix
 
             # fencer: one fence, either a modex or a pure barrier.  The two
@@ -640,6 +709,16 @@ build_linux() {
             # The stamp is what lets the suite say so.  It is removed first so
             # a build that dies midway cannot leave a stale one behind.
             date -u +%Y-%m-%dT%H:%M:%SZ > /opt/prte/.build-stamp
+            # ...and how the components were linked, for the suite to report.
+            # It has to be recorded here rather than counted from the install:
+            # the default build installs component DSOs too (the launchers
+            # needing third-party headers are in the default --enable-mca-dso
+            # list), so a count cannot tell the two configurations apart.
+            if [ "${PRTE_SWARM_MCA_DSO:-0}" != 0 ]; then
+                echo "mca-dso" > /opt/prte/.build-mode
+            else
+                echo "default" > /opt/prte/.build-mode
+            fi
             echo ">>>> done: install in /opt/prte/prte"
         '
     echo ">>> Linux build complete."
@@ -689,10 +768,19 @@ build_macos() {
     # uses PMIx internals, so a tree left pointing at a different PMIx than
     # you asked for builds cleanly and then dies at startup, which reads as
     # "this host is flaky" rather than "you built against the wrong PMIx".
-    local cfg_args="--prefix=$root/vpath-macos/install $pmix_arg --enable-debug ${EXTRA_CONFIGURE_ARGS:-}"
+    local dso_arg=""
+    if [ "$MCA_DSO" != 0 ]; then
+        dso_arg="--enable-mca-dso"
+        echo ">>> components as DSOs (--enable-mca-dso)"
+    fi
+    local cfg_args="--prefix=$root/vpath-macos/install $pmix_arg --enable-debug $dso_arg ${EXTRA_CONFIGURE_ARGS:-}"
     if [ -f config.status ] && [ "$(cat .prte-configure-args 2>/dev/null)" != "$cfg_args" ]; then
         echo ">>> configure arguments changed - reconfiguring"
         rm -f config.status
+        # ...and drop any component DSOs the previous configuration installed,
+        # or turning --enable-mca-dso back off leaves them to be dlopened
+        # alongside the copies now inside libprrte.  See build_linux.
+        rm -rf "$root/vpath-macos/install/lib/prte"
     fi
     # shellcheck disable=SC2086
     if [ ! -f config.status ]; then

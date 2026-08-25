@@ -70,8 +70,9 @@ option to the help request as "--help <option>".
 | "--stop-in-init"     | Direct the specified processes to stop in     |
 |                      | "PMIx_Init"                                   |
 +----------------------+-----------------------------------------------+
-| "--stop-in-app"      | Direct the specified processes to stop at an  |
-|                      | application-controlled location               |
+| "--stop-in-app"      | Direct the processes to stop at an            |
+|      [=breakpoint]   | application-controlled location, optionally   |
+|                      | naming the breakpoint at which to stop        |
 +----------------------+-----------------------------------------------+
 | "--no-aggregate-     | Do not aggregate help messages issued by      |
 | help"                | multiple processes - report each one as it is |
@@ -152,6 +153,10 @@ option to the help request as "--help <option>".
 +----------------------+-----------------------------------------------+
 | "--add-host <hosts>" | List of hosts to add to the DVM prior to      |
 |                      | launching the given app                       |
++----------------------+-----------------------------------------------+
+| "--activate <hosts>" | List of allocated nodes to bring into the DVM |
+|                      | (start a daemon on) prior to launching the    |
+|                      | given app                                     |
 +----------------------+-----------------------------------------------+
 | "--hostfile          | Provide a hostfile                            |
 | <filename>"          |                                               |
@@ -394,6 +399,11 @@ mapping the job.
 #include#help-dash-host.txt#add-host
 
 #
+[activate]
+
+#include#help-dash-host.txt#activate
+
+#
 [np]
 
 Specify number of application processes to be started
@@ -587,6 +597,19 @@ that was returned: %d.
 %s has exited due to process rank %lu with PID %lu on node %s calling
 "abort". This may have caused other processes in the application to be
 terminated by signals sent by %s (as reported here).
+#
+[prun:proc-killed-by-release]
+
+%s has exited because process rank %lu on node %s was killed when that
+node was released from the DVM. Releasing a node removes its daemon,
+which kills the application processes still running under it.
+
+The node was released on request - by a process, a tool, or the
+scheduler. Nothing drains a node before releasing it.
+
+Any remaining processes in this job were terminated by %s. A job that
+can carry on without the lost processes can say so with
+"--runtime-options recoverable" and will not be terminated.
 #
 [prun:proc-exit-no-sync]
 

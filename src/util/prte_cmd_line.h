@@ -111,6 +111,7 @@ BEGIN_C_DECLS
 #define PRTE_CLI_ADDHOSTFILE            "add-hostfile"              // required
 #define PRTE_CLI_HOST                   "host"                      // required
 #define PRTE_CLI_ADDHOST                "add-host"                  // required
+#define PRTE_CLI_ACTIVATE               "activate"                  // required
 #define PRTE_CLI_PATH                   "path"                      // required
 #define PRTE_CLI_PSET                   "pset"                      // required
 #define PRTE_CLI_PRELOAD_FILES          "preload-files"             // required
@@ -180,7 +181,7 @@ BEGIN_C_DECLS
 #define PRTE_CLI_PACKAGE    "package"
 #define PRTE_CLI_NODE       "node"
 #define PRTE_CLI_SEQ        "seq"
-#define PRTE_CLI_DIST       "dist"
+#define PRTE_CLI_DEVICE     "device="
 #define PRTE_CLI_PPR        "ppr"
 #define PRTE_CLI_RANKFILE   "rankfile"
 #define PRTE_CLI_NONE       "none"
@@ -252,7 +253,6 @@ BEGIN_C_DECLS
 #define PRTE_CLI_NOLOCAL    "nolocal"
 // PRTE_CLI_HWTCPUS reused here
 #define PRTE_CLI_CORECPUS   "corecpus"
-#define PRTE_CLI_DEVICE     "device="
 #define PRTE_CLI_INHERIT    "inherit"
 #define PRTE_CLI_NOINHERIT  "noinherit"
 #define PRTE_CLI_QDIR       "dir="
@@ -261,6 +261,9 @@ BEGIN_C_DECLS
 #define PRTE_CLI_NOOVERLOAD "no-overload"
 #define PRTE_CLI_IF_SUPP    "if-supported"
 #define PRTE_CLI_ORDERED    "ordered"
+#define PRTE_CLI_INTERLEAVE "interleave"
+#define PRTE_CLI_SHARED     "shared"
+#define PRTE_CLI_NDEV       "ndev"
 #define PRTE_CLI_REPORT     "report"
 #define PRTE_CLI_DISPALLOC  "displayalloc"
 // PRTE_CLI_DISPLAY reused here

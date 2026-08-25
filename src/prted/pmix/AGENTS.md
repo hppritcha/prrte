@@ -42,7 +42,7 @@ upcall; each file below implements a related group of them.
 | `pmix_server_queries.c` | `query` — namespaces, proc tables, psets, groups, allocations. |
 | `pmix_server_gen.c` | `abort`, `client_finalized`, `client_connected2`, `tool_connected`, `iof_pull`, `push_stdin`, `log`. `client_finalized` is how a **tool**'s departure is learned as well — see below. |
 | `pmix_server_fence.c` | `fence_nb` and `direct_modex`. |
-| `pmix_server_pub.c` | `publish`/`lookup`/`unpublish` (relayed to the data server). |
+| `pmix_server_pub.c` | `publish`/`lookup`/`unpublish` (relayed to the data server; `init_server()` attaches the master to an **external** one). |
 | `pmix_server_notify.c` | `notify_event` (up), and the RML receive that fans a peer's event out to local clients (down). |
 | `pmix_server_group.c` | `group` — a thin pass-through to grpcomm. |
 | `pmix_server_job_ctrl.c` | `job_control` — kill/terminate/signal/define-pset, as daemon commands. |
@@ -150,11 +150,45 @@ job-level fetch matched the first unrelated entry in the array, got
 parked as "already requested", and was never answered. Compare `tproc`
 against `tproc`.
 
+**A job object outlives its map, and finding one proves nothing.** The map
+is built when the job is mapped and released the moment the job completes
+(`check_complete_resume`, `state/dvm`), while the job object itself lives
+until `cleanup_job` runs — a *later* event, and the only one that records
+the departure `prte_pmix_server_job_has_departed()` tests. A dmodex request
+landing in between finds a job that is present, is not yet "departed", and
+has a NULL `map`. The `PMIX_RANK_WILDCARD` arm handed that job straight to
+`prte_pmix_server_register_nspace()`, which assembles the job-level data by
+walking `map->nodes` — a NULL dereference that took the daemon down after
+the job had run correctly, so it read as a clean run with a segfault at the
+end. The proc-level arm immediately below already refused the equivalent
+case (a proc the mapper has not placed) with `PMIX_ERR_NOT_FOUND`; the
+wildcard arm now refuses it the same way. The window is small and entirely
+ordinary — a parent asking about a short-lived child it just spawned
+(`examples/dynamic.c`) hit it in roughly 1% of runs on the container
+harness, in both spellings of `report-child-jobs-separately` and on master
+before this change.
+
 **Two request arrays, two meanings.** `local_reqs` holds requests *we*
 originated and are waiting on; `remote_reqs` holds requests *a peer*
 asked us to service. `prte_pmix_server_clear()` sweeps only
 `remote_reqs`, because the local ones belong to callbacks that will still
 fire.
+
+Two things about that sweep, both of which it got wrong:
+
+- **Discarding a request is not answering it.** Every entry it drops is a
+  peer daemon waiting for a reply, and dropping it in silence leaves that
+  peer waiting for the life of the DVM. The sweep runs when a job is done,
+  so the honest reply is `PRTE_ERR_NOT_FOUND` — the proc it asked about is
+  gone and its data with it, which is a question that no longer has an
+  answer rather than a failure. Only for requests not marked `inprogress`:
+  those are held by somebody who will answer them.
+- **It has to skip the entries that name no target.** The match is on
+  `req->tproc`, and a *monitor* request never sets one — so its nspace is
+  empty, which is PMIx's wildcard and matches every job. Every job that
+  ended was quietly taking the outstanding monitor requests with it. Guard
+  with `PMIX_NSPACE_INVALID()` first; this is the same trap described above
+  for `tproc` versus `target`, in a second place.
 
 ---
 
@@ -231,6 +265,60 @@ bearing:
 - **A refresh must not be answered from here.** `PMIX_GET_REFRESH_CACHE` is
   the caller saying our copy may be stale, which is exactly when we must
   go and ask.
+
+### A binding we were not sent is not a binding of "none"
+
+`prte_proc_t.cpuset` is NULL in two completely different situations, and
+since the launch message started **scattering** the cpusets — each daemon
+is sent only the bindings of the procs it will fork, see
+[`src/mca/odls/AGENTS.md`](../../mca/odls/AGENTS.md) — both are ordinary:
+
+| NULL cpuset on | means |
+|----------------|-------|
+| a proc we host | the mapper bound nothing (`--bind-to none`, or it could not) |
+| any other proc | we were never told, and are not the authority |
+
+Everything that reads a cpuset therefore has to ask *whose proc it is*
+first, because the answer to "where is it bound" differs and neither
+answer is an error:
+
+- **`register_nspace()`** publishes `PMIX_CPUSET` and the locality string
+  when it has a cpuset, publishes a **NULL** `PMIX_LOCALITY_STRING` — which
+  positively asserts "unbound" — only for a proc *it hosts*, and publishes
+  nothing at all for any other. Silence is what makes a get fall through to
+  somebody who knows; a NULL locality is an answer, and the wrong one.
+- **`derive_proc_data()`** does the same, and `dmodex_req()` goes further:
+  when the key asked for is `PMIX_CPUSET` or `PMIX_LOCALITY_STRING` and we
+  hold neither the cpuset nor the proc, it declines to derive at all and
+  sends the request to the daemon that forks the proc.
+
+The failure this prevents is silent — a peer told that a bound process is
+unbound, on a path where nothing returns an error.
+
+### The hosting daemon answers a placement key from the job, not from the process
+
+That referral only works because of the other half, in
+`pmix_server_dmdx_recv()` (`pmix_server.c`): a direct modex whose
+`PMIX_REQUIRED_KEY` is one of the `derivable_key()` set is answered
+**straight out of `jdata->procs[rank]`**, by the same
+`prte_pmix_server_derive_proc_data()`, before the handler goes anywhere near
+its own PMIx server.
+
+That ordering is load bearing, and getting it wrong is a hang rather than a
+wrong answer. The ordinary path below it asks the local server for the key
+and, not finding it, parks the request on a two-second retry until the
+process publishes something. For application data that is exactly right —
+the asker wants a value the process has not produced yet. For **PRRTE's own**
+placement and binding it is a deadlock: those keys have never required a
+`PMIx_Put` from the proc being asked about, and a process that only ever
+*gets* never commits anything, so the request is never satisfied. Seen
+outright with `contrib/dockerswarm/peerinfo.c`, which does nothing but get:
+every rank hung.
+
+So the rule for anything added to `derivable_key()`: **this daemon must be
+able to answer it from what PRRTE knows, on both sides.** The asking daemon
+derives it when it holds the facts; the hosting daemon derives it when asked;
+neither waits on the process.
 
 **This depends on a PMIx that surfaces the request at all**, which is why
 it could not have been written earlier: a client's get for a reserved key
@@ -314,6 +402,109 @@ onto PRRTE job and app attributes. Notes for extending them:
 
 ---
 
+## Connected assemblages (`pmix_server_connect.c`)
+
+`PMIx_Connect` is not a communication operation — the fence it runs is a
+means, not the point. What it asks for is that the host **treat the
+participants as one application for fault purposes**, and the concrete
+obligation that creates is one event: a member that terminates, or calls
+`PMIx_Finalize`, without first calling `PMIx_Disconnect` owes the rest of
+the assemblage a `PMIX_ERR_PROC_TERM_WO_SYNC`. A connect never followed by a
+disconnect is therefore not an untidy loose end; it is the case the event
+exists for.
+
+Keeping that promise needs the membership, and where it is held is the whole
+design:
+
+- **The DVM master holds it, alone.** It is the one process that learns of
+  every proc termination in the DVM — including the procs of a node whose
+  daemon has died, which is exactly when an assemblage most wants telling,
+  and exactly when a record kept on that daemon would have died with it.
+- **Each participating daemon reports it**, on `PRTE_RML_TAG_CONNECTED`,
+  from the *completion* of the connect collective (`connect_release`) rather
+  than from its start — so a connect that failed is never recorded. Every
+  such daemon reports, and the master takes the first and ignores the rest:
+  there is no cheap election here that does not depend on one particular
+  daemon still being alive, and the reports are a few dozen bytes on an
+  operation that has just paid for a DVM-wide collective.
+- **Termination is noticed in one place**: the `PRTE_PROC_STATE_TERMINATED`
+  arm of `prte_state_base_track_procs()`, behind the `PRTE_PROC_FLAG_RECORDED`
+  guard that makes it exactly once per proc. Every death reaches it, whether
+  the proc exited, failed, or was force-marked terminated by the errmgr
+  because its daemon is gone.
+- **A member entry may be a wildcard rank**, and usually is — a connect
+  between two jobs is written `{A/WILDCARD, B/WILDCARD}`. It stands for
+  every proc of that namespace both when matching a departure and when
+  addressing the event, where `PMIX_EVENT_CUSTOM_RANGE` carries the member
+  array as-is and PMIx's own `PMIX_CHECK_PROCID` does the covering.
+- **Matching a *set* is literal, though.** Two assemblages are the same one
+  if they name the same participants, order disregarded; but `A/0` and
+  `A/WILDCARD` are different participants, because PMIx will not pair a
+  connect expressed one way with a connect expressed the other. A disconnect
+  naming a set that was never recorded must fail to find it rather than drop
+  somebody else's.
+- **A record outlives one member's job.** The survivors are still connected
+  to each other and still owed an event apiece, so a record is dropped only
+  by a disconnect or when nothing named in it exists any more
+  (`prte_pmix_server_connection_purge()`, from
+  `prte_pmix_server_job_departed()`).
+
+Two things follow from that record, and they are the rest of the definition:
+
+- **A spawn connects the child to the parent process** (`connection_spawned()`,
+  from `prte_plm_base_spawn_response()`), because the PMIx definition makes
+  that the default for `PMIx_Spawn`. Which launches have a parent process at
+  all is the delicate part: `jdata->originator` does *not* answer it, since
+  `plm_base_receive` overwrites it with the daemon that relayed the request.
+  `PRTE_JOB_LAUNCH_PROXY` survives from the requestor's own daemon and is the
+  process that actually asked — screened against our own namespace (a
+  prterun-style launch records the daemon) and against `PRTE_JOB_FLAG_TOOL`
+  (a `prun` records its own tool procID, and a tool is not a member of a job).
+  `PMIX_SPAWN_CHILD_SEP` opts out.
+
+  **The same screen governs `PMIX_PARENT_ID`** (`register_nspace()`), and for
+  the same reason: an app reads that key to ask "was I spawned by another
+  application process?". Publishing the launch proxy unscreened answers *yes*
+  to every ordinary `prun ./app`, so a program that branches on it — a spawned
+  child doing one thing and its parent another, which is what the key is for —
+  runs the wrong half of itself. That was live: the daemon screen was there
+  and the tool screen was not, and the swarm's `connect:` cases (whose client
+  detects its role exactly that way) all failed on it, every one of them with
+  the parent calling itself the child.
+- **A failure that terminates one member's job terminates the assemblage**
+  (`connection_job_failed()`, from `_terminate_job()` in `errmgr/dvm` — the
+  one place every failure-driven teardown goes through), each such job
+  announced with `PMIX_ERR_JOB_TERM_WO_SYNC` and explained to the user with
+  the `connected-term` help topic. `pmix_terminate_connected=0` turns it off.
+  The assemblage is marked `terminating` as it goes, so the failures its own
+  teardown produces do not drive it again.
+
+**Dissolving is more generous than recording, deliberately.** Recording
+compares memberships exactly; a disconnect dissolves any assemblage all of
+whose members it *names*, wildcards covering ranks. That asymmetry is what
+lets an application out of the assemblage a spawn created for it: the spawn
+connects the child to the parent **process**, while an application that wants
+out disconnects the two **jobs** — the shape `MPI_Comm_disconnect` has — and
+under an exact-set rule that request would match nothing and the implicit
+assemblage could never be left. It cannot dissolve anything by accident: a
+request only covers a member it names, and a wildcard member is covered only
+by a wildcard.
+
+A proc in more than one assemblage — a spawned child that also connects
+explicitly — produces **one** event, addressed to the union of the
+memberships, not one per assemblage.
+
+Note what this depends on: PMIx used to execute a connect or disconnect whose
+participants were **all local** without calling the host at all, which left
+PRRTE unable to see a single-node assemblage — and, worse, unable to see the
+disconnect that would dissolve one it had created itself at spawn. That is
+fixed in the PMIx server library (openpmix: the host is called whenever it
+offers the entry point; locality alone is no longer a reason to skip it).
+Against a PMIx without that fix, a single-node spawn assemblage cannot be
+dissolved.
+
+---
+
 ## Session control (`pmix_server_session.c`)
 
 `PMIx_Session_control` is the scheduler's API for creating, operating on and
@@ -380,6 +571,35 @@ The parts that matter when editing this file:
   must carry every job's termination status, and the job objects do not survive
   to the end of the session — so each one is recorded on `session->results` as
   it retires.
+
+---
+
+## Servers we are a client OF, and which one is primary
+
+A daemon is a PMIx server, but the master is also a PMIx **tool** of anything
+it has to reach outside this DVM. There are two such things, and they are
+reached the same way — `PMIx_tool_attach_to_server()`:
+
+- a **scheduler**, in `prte_pmix_set_scheduler()` (`pmix_server_alloc*.c`);
+- an **external data server**, in `init_server()` (`pmix_server_pub.c`) — a
+  data server living in another DVM, which the RML cannot address at all
+  because it names a peer by rank in the sender's own namespace. See
+  [`../../runtime/data_server/AGENTS.md`](../../runtime/data_server/AGENTS.md).
+
+**PMIx sends a client-side call to whichever attached server is currently
+primary, and only one may be primary at a time.** So *every* operation that
+uses one of these connections must name its own server first:
+`prte_pmix_set_primary_server()` is the single point that does it, it is a
+no-op when the named server is already primary, and it must not be treated as
+a once-at-startup step. This is race-free because the PMIx client calls pack
+and send synchronously before returning, on the thread that just designated
+the primary — so nothing can switch it out from under an in-flight request.
+`PMIx_tool_set_server()` blocks until the PMIx progress thread completes it,
+which is fine from the PRRTE progress thread and fatal from the PMIx one.
+
+The flag this replaced (`scheduler_set_as_server`) recorded "the scheduler has
+been made primary" once and never reconsidered — correct only for as long as
+the scheduler was the sole connection.
 
 ---
 
@@ -469,10 +689,12 @@ it is enforced here:
 ## Testing
 
 **Unit — `test/unit/prted/`.** The directive translators
-(`prte_pmix_xfer_job_info`, `prte_pmix_xfer_app`), the job-info cache, and
-the session time-limit parser (`prte_pmix_server_parse_session_time`) are
-pure data transforms and are covered there. Most of the rest of this
-directory needs a live PMIx server and at least one peer daemon.
+(`prte_pmix_xfer_job_info`, `prte_pmix_xfer_app`), the job-info cache, the
+session time-limit parser (`prte_pmix_server_parse_session_time`), the
+departed-jobs list, and the connected-assemblage registry
+(`test_connections` — set matching, wildcard coverage, and when a record is
+purged) are pure data transforms and are covered there. Most of the rest of
+this directory needs a live PMIx server and at least one peer daemon.
 
 **Live smoke test.** `prte --daemonize && prun -n 4 hostname && pterm`
 exercises register_nspace, register_client, fence, and the spawn path on
@@ -490,7 +712,13 @@ only exist with more than one daemon:
 - **session control** (`test_session`) — a reservation actually withholding
   its nodes from a general job, a request relayed from a non-master daemon,
   and a session signal reaching the jobs on every node they occupy. It is
-  driven by `examples/sessionctrl.c`, which `build.sh` installs.
+  driven by `examples/sessionctrl.c`, which `build.sh` installs;
+- **connect/disconnect** (`test_connect`, driven by
+  `contrib/dockerswarm/connector.c`) — a spawned child connected to its
+  parent on another node, leaving with and without disconnecting first, and
+  failing with and without having disconnected first. The single-node run of
+  the same client covers the same ground once the PMIx fix above is in place;
+  what only the swarm shows is an assemblage that genuinely spans daemons.
 
 ---
 

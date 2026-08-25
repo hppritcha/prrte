@@ -76,7 +76,10 @@ typedef uint8_t prte_app_context_flags_t;
 #define PRTE_APP_RANKBY             27 /* uint16_t ranking policy enum */
 #define PRTE_APP_BINDTO             28 /* uint16_t binding policy enum */
 #define PRTE_APP_MAP_FILE           29 /* char* path to seq or rankfile */
-#define PRTE_APP_DIST_DEVICE        30 /* char* dist device name */
+#define PRTE_APP_MAP_DEVICE         30 /* char* device class or name for --map-by device= */
+#define PRTE_APP_MAP_INTERLEAVE     39 /* char* level to interleave the device list across */
+#define PRTE_APP_MAP_SHARED         40 /* bool: devices may be shared by several procs */
+#define PRTE_APP_MAP_NDEV           41 /* uint16_t: devices assigned to each proc */
 #define PRTE_APP_HWT_CPUS           31 /* bool: use hwthreads as CPUs */
 #define PRTE_APP_CORE_CPUS          32 /* bool: use cores as CPUs */
 #define PRTE_APP_CPUSET             33 /* char* comma-delimited CPU ranges */
@@ -92,6 +95,11 @@ typedef uint8_t prte_app_context_flags_t;
  * mapping policy is the choice of mapper. Local to the HNP - never
  * packed/sent. */
 #define PRTE_APP_LAST_MAPPER        38 /* char* mapping component that placed this app */
+/* nodes the DVM is to be extended across before this app is launched. Unlike
+ * PRTE_APP_ADD_HOST this adds nothing to the allocation - it can only name
+ * nodes the allocation already contains, and merely asks that a daemon be
+ * started on them. */
+#define PRTE_APP_ACTIVATE_HOSTS     42 /* char* hosts to bring into the DVM */
 
 #define PRTE_APP_MAX_KEY 100
 
@@ -217,7 +225,10 @@ typedef uint16_t prte_job_flags_t;
 #define PRTE_JOB_TRACE_TIMEOUT_EVENT        (PRTE_JOB_START_KEY +  75) // prte_ptr (prte_timer_t*) - timer event for stacktrace collection
 #define PRTE_JOB_INHERIT                    (PRTE_JOB_START_KEY +  76) // bool - job inherits parent's mapping/ranking/binding policies
 #define PRTE_JOB_PES_PER_PROC               (PRTE_JOB_START_KEY +  77) // uint16_t - number of cpus to be assigned to each process
-#define PRTE_JOB_DIST_DEVICE                (PRTE_JOB_START_KEY +  78) // char* - device to use for dist mapping
+#define PRTE_JOB_MAP_DEVICE                 (PRTE_JOB_START_KEY +  78) // char* - device class or name for --map-by device=
+#define PRTE_JOB_MAP_INTERLEAVE             (PRTE_JOB_START_KEY + 128) // char* - level to interleave the device list across
+#define PRTE_JOB_MAP_SHARED                 (PRTE_JOB_START_KEY + 129) // bool - devices may be shared by several procs
+#define PRTE_JOB_MAP_NDEV                   (PRTE_JOB_START_KEY + 130) // uint16_t - devices assigned to each proc
 #define PRTE_JOB_HWT_CPUS                   (PRTE_JOB_START_KEY +  79) // bool - job requests hwthread cpus
 #define PRTE_JOB_CORE_CPUS                  (PRTE_JOB_START_KEY +  80) // bool - job requests core cpus
 #define PRTE_JOB_PPR                        (PRTE_JOB_START_KEY +  81) // char* - string specifying the procs-per-resource pattern
@@ -229,6 +240,15 @@ typedef uint16_t prte_job_flags_t;
 #define PRTE_JOB_DEBUG_DAEMONS_PER_PROC     (PRTE_JOB_START_KEY +  87) // uint16_t - Number of debug daemons per application proc
 #define PRTE_JOB_STOP_IN_INIT               (PRTE_JOB_START_KEY +  88) // bool - stop in PMIx_Init
 #define PRTE_JOB_STOP_IN_APP                (PRTE_JOB_START_KEY +  89) // bool - stop at app-determined location
+#define PRTE_JOB_BREAKPOINT                 (PRTE_JOB_START_KEY + 131) // char* - string ID of the app-determined location at which to stop
+#define PRTE_JOB_SPAWN_ALLOC                (PRTE_JOB_START_KEY + 132) // pmix_data_array_t* - an entire allocation request (PMIX_SPAWN_ALLOC)
+                                                                       // to be executed before this job is launched: the array's first
+                                                                       // element carries the directive, the rest are the request's info
+#define PRTE_JOB_SPAWN_ALLOC_ID             (PRTE_JOB_START_KEY + 133) // char* - PMIX_ALLOC_ID of the allocation obtained FOR this job by
+                                                                       // PRTE_JOB_SPAWN_ALLOC. Present only while the job owes that
+                                                                       // allocation a release should it fail to launch
+#define PRTE_JOB_SPAWN_ALLOC_STATUS         (PRTE_JOB_START_KEY + 134) // int32_t - the spawn status held while the allocation obtained for a
+                                                                       // failed job is handed back, and delivered once it has been
 #define PRTE_JOB_ENVARS_HARVESTED           (PRTE_JOB_START_KEY +  90) // envars have already been harvested
 #define PRTE_JOB_OUTPUT_NOCOPY              (PRTE_JOB_START_KEY +  91) // bool - do not copy output to stdout/err
 #define PRTE_JOB_RANK_OUTPUT                (PRTE_JOB_START_KEY +  92) // bool - tag stdout/stderr with rank
@@ -279,6 +299,14 @@ typedef uint16_t prte_job_flags_t;
 #define PRTE_JOB_REPORT_CHILD_SEP           (PRTE_JOB_START_KEY + 126) // bool - report the exit status of child jobs separately: return the
                                                                        // primary job's status only, rather than the first non-zero status
                                                                        // returned by the primary job or any job it spawned
+#define PRTE_JOB_NO_IOF_INHERIT             (PRTE_JOB_START_KEY + 127) // bool - this job is NOT to inherit the output forwarding of the job
+                                                                       // that spawned it. Recorded by the mapper, which is where the
+                                                                       // inherit question is resolved, and read where the job's PMIx
+                                                                       // information is built, which is where it has to be told to PMIx.
+                                                                       // Deliberately NOT PRTE_JOB_NOINHERIT: that one is consulted when
+                                                                       // this job later becomes a parent itself, so reusing it would make
+                                                                       // a non-inheriting child silently refuse to pass mapping,
+                                                                       // ranking and binding on to a grandchild
 
 #define PRTE_JOB_MAX_KEY (PRTE_JOB_START_KEY + 200)
 
@@ -315,6 +343,7 @@ typedef uint16_t prte_proc_flags_t;
 #define PRTE_PROC_NODENAME          (PRTE_PROC_START_KEY + 12) // string - node where proc is located, used only by tools
 #define PRTE_PROC_CGROUP            (PRTE_PROC_START_KEY + 13) // string - name of cgroup this proc shall be assigned to
 #define PRTE_PROC_NBEATS            (PRTE_PROC_START_KEY + 14) // int32 - number of heartbeats in current window
+#define PRTE_PROC_DEVICE_ID         (PRTE_PROC_START_KEY + 15) // pmix_data_array_t of pmix_device_t - the devices this proc was mapped against, always an array even for one
 
 #define PRTE_PROC_MAX_KEY (PRTE_PROC_START_KEY + 100)
 

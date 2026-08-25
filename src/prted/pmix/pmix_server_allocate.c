@@ -157,15 +157,35 @@ pmix_status_t prte_pmix_set_scheduler(void)
         prte_pmix_server_globals.scheduler_connected = true;
     }
 
-    /* if we have not yet set the scheduler as our server, do so */
-    if (!prte_pmix_server_globals.scheduler_set_as_server) {
-        rc = PMIx_tool_set_server(&prte_pmix_server_globals.scheduler, NULL, 0);
-        if (PMIX_SUCCESS != rc) {
-            return rc;
-        }
-        prte_pmix_server_globals.scheduler_set_as_server = true;
+    /* direct our client-side calls at the scheduler.  This is not a
+     * once-only step: an external data server is a second connection we may
+     * hold, and whichever of the two was used last is the one PMIx would
+     * otherwise send this request to. */
+    return prte_pmix_set_primary_server(&prte_pmix_server_globals.scheduler);
+}
+
+pmix_status_t prte_pmix_set_primary_server(const pmix_proc_t *target)
+{
+    pmix_status_t rc;
+
+    /* PMIX_CHECK_PROCID answers "true" for an empty nspace, so the flag -
+     * not the identity - is what says we have ever designated one */
+    if (prte_pmix_server_globals.primary_server_set &&
+        PMIX_CHECK_PROCID(&prte_pmix_server_globals.primary_server, target)) {
+        return PMIX_SUCCESS;
     }
 
+    rc = PMIx_tool_set_server(target, NULL, 0);
+    if (PMIX_SUCCESS != rc) {
+        return rc;
+    }
+    PMIX_XFER_PROCID(&prte_pmix_server_globals.primary_server, target);
+    prte_pmix_server_globals.primary_server_set = true;
+
+    pmix_output_verbose(2, prte_pmix_server_globals.output,
+                        "%s primary server is now %s",
+                        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                        PRTE_NAME_PRINT(target));
     return PMIX_SUCCESS;
 }
 
@@ -208,7 +228,7 @@ pmix_status_t prte_server_send_request(uint8_t cmd, prte_pmix_server_req_t *req)
             PMIX_DATA_BUFFER_RELEASE(buf);
             return rc;
         }
-    } else {
+    } else if (PRTE_PMIX_SESSION_CTRL == cmd) {
         /* pack the sessionID */
         rc = PMIx_Data_pack(NULL, buf, &req->sessionID, 1, PMIX_UINT32);
         if (PMIX_SUCCESS != rc) {
@@ -217,6 +237,9 @@ pmix_status_t prte_server_send_request(uint8_t cmd, prte_pmix_server_req_t *req)
             return rc;
         }
     }
+    /* PRTE_PMIX_GROUP_CTXID has no field of its own - it asks for a number
+     * and nothing about that number depends on the requestor. Keep this in
+     * step with the matching unpack in pmix_server_sched(). */
 
     /* pack the number of info */
     rc = PMIx_Data_pack(NULL, buf, &req->ninfo, 1, PMIX_SIZE);

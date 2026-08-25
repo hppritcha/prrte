@@ -181,13 +181,17 @@ value, **the configuration file trumps the MCA parameter file**.  (A value
 given explicitly on a command line still wins over both, so an operator can
 still override the configuration for a one-off.)
 
-Operational and logging keys (``DVMTempDir``, ``SessionTmpDir``,
-``ControllerLogPath``, ``PRTEDLogPath``, ``ControllerLogJobState``,
-``ControllerLogProcState``, ``PRTEDLogJobState``, ``PRTEDLogProcState``)
-tune session-directory placement and state logging; they are documented in
+Operational keys (``DVMTempDir``, ``SessionTmpDir``) tune
+session-directory placement; they are documented in
 :doc:`../../configuration` and do not affect DVM formation.  An unknown key
 is silently ignored so that a newer configuration file remains usable by an
-older daemon.
+older daemon — which is also what now becomes of the six ``ControllerLog*``
+/ ``PRTEDLog*`` state-logging keys an early draft of this format carried.
+They are **not** part of the format: a key here applies to every daemon of
+every DVM the cluster starts, unattended, while the volume of a
+per-transition log scales with the processes launched and fills the disk the
+session directories live on.  That facility is reached through the
+``state_base_log_*`` MCA parameters instead, one run at a time.
 
 Identity derivation
 -------------------
@@ -209,7 +213,7 @@ Rank
 
 **The controller is always rank 0**, whether or not its node appears in
 ``DVMNodes``.  The remaining daemons are ranked by their **position in the
-listed order of ``DVMNodes``**, skipping the controller's entry if it is
+listed order of** ``DVMNodes``, skipping the controller's entry if it is
 present, and numbered ``1, 2, 3, …`` in that order.  Concretely, every
 daemon:
 
@@ -227,11 +231,11 @@ other's rank.
 
 Two membership cases follow directly, and both are supported:
 
-* **Controller not listed in ``DVMNodes``** — the usual case, where the
+* **Controller not listed in** ``DVMNodes`` — the usual case, where the
   controller node runs no application processes.  The controller is rank 0
   and the ``N`` entries of ``DVMNodes`` take ranks ``1 … N``; the DVM has
   ``N + 1`` daemons.
-* **Controller listed in ``DVMNodes``** — chosen when application processes
+* **Controller listed in** ``DVMNodes`` — chosen when application processes
   *are* permitted on the controller node.  The controller is still rank 0;
   its entry is skipped during the ``1 … `` numbering, the other ``N − 1``
   entries take ranks ``1 … N − 1``, and the DVM has ``N`` daemons.  In this
@@ -322,12 +326,12 @@ Two consumers, one parser
 Bootstrap configuration is consumed in two places, and both must interpret
 the file identically:
 
-#. **Daemon-side (``ess``).**  Before ``prte_init``, each bootstrapping
+#. **Daemon-side (ess).**  Before ``prte_init``, each bootstrapping
    ``prted`` reads the configuration to establish its own identity, role,
    port, and the controller URI.  This is the path in
    ``src/mca/ess/base/ess_base_bootstrap.c``, invoked from ``prted.c`` when
    ``--bootstrap`` is present.
-#. **Controller-side (``ras``).**  The elected controller must populate its
+#. **Controller-side (ras).**  The elected controller must populate its
    node pool with the DVM's nodes.  The ``ras/bootstrap`` component
    (``src/mca/ras/bootstrap/``) becomes selectable when
    ``prte_bootstrap_setup`` is set and, in its ``allocate`` method, parses
@@ -375,9 +379,8 @@ What the draft does *not* yet do
 * **No contact information is built.**  The controller URI is never
   synthesized from ``DVMControllerHost``/``DVMPort``, and the
   ports parsed from the file are not applied to the RML listeners.
-* **The operational and logging keys are parsed and immediately freed** —
-  ``DVMTempDir``, ``SessionTmpDir``, the log paths and log-state toggles
-  have no effect.
+* **The operational keys are parsed and immediately freed** —
+  ``DVMTempDir`` and ``SessionTmpDir`` have no effect.
 * **The parser is duplicated** between ``ess_base_bootstrap.c`` and
   ``ras_boot.c`` rather than shared, so the two consumers can drift.
 
@@ -420,7 +423,7 @@ above; they are collected here for reference.
   numbered from 1 (see `Rank`_).  There is no requirement that
   ``DVMControllerHost`` be the first entry in ``DVMNodes``, and it need not
   appear in ``DVMNodes`` at all.
-* **Whether the controller is counted in ``DVMNodes``.**  The controller
+* **Whether the controller is counted in DVMNodes.**  The controller
   node is counted as a member (a compute node) of the DVM **if and only if**
   its host appears in ``DVMNodes``.  When it does, the expected daemon count
   is the cardinality of ``DVMNodes``; when it does not, the count is that
@@ -441,8 +444,7 @@ above; they are collected here for reference.
   parameter file: the cap is a first-class configuration key, while the
   never-give-up and initial-delay defaults are seeded by bootstrap (an
   operator MCA setting still overrides them).
-* **Controller entry point.**  The controller is a **self-promoted
-  ``prted``**.  A system administrator boots the identical
+* **Controller entry point.**  The controller is a **self-promoted** ``prted``.  A system administrator boots the identical
   ``prted --bootstrap`` on every node, and the daemon on
   ``DVMControllerHost`` promotes itself to the HNP.  There is no separate
   controller command to place on a special node.  To keep exactly **one

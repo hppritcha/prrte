@@ -140,6 +140,14 @@ PRTE_EXPORT extern int prte_exit_status;
 /* define some common keys used in PRTE */
 #define PRTE_DB_DAEMON_VPID "prte.daemon.vpid"
 
+/* Spawn directive naming nodes the DVM is to be extended across before the
+ * accompanying job is launched.  This is not a PMIx attribute: PMIx has no
+ * standard way to say "start a daemon on a node I already hold", and the
+ * operation is deliberately weaker than PMIX_ADD_HOST - it can only name
+ * nodes the allocation already contains.  The value is a string in
+ * --host syntax. */
+#define PRTE_ACTIVATE_HOSTS "prte.activate.hosts"
+
 /* State Machine lists */
 PRTE_EXPORT extern pmix_list_t prte_job_states;
 PRTE_EXPORT extern pmix_list_t prte_proc_states;
@@ -446,6 +454,21 @@ typedef struct prte_job_t {
     pmix_rank_t num_ready_for_debug;
     /* originator of a dynamic spawn */
     pmix_proc_t originator;
+    /* Daemons that have someone interested in this job's output, by rank
+     * within our own namespace. A tool's IOF subscription is held by the
+     * PMIx server of the daemon that tool attached to, and only that
+     * server can deliver to it - so the HNP has to relay a copy of this
+     * job's output to every daemon in this set.
+     *
+     * It is a SET rather than the single "originator" it replaces because
+     * there can legitimately be several: the daemon hosting the tool that
+     * launched the job, plus any daemon whose tool later asked for this
+     * job's output through PMIx_IOF_pull, plus - for a spawned job - the
+     * ones its parent had.
+     *
+     * HNP-local; never packed. Nothing below the HNP relays, so no other
+     * daemon has any use for it. */
+    pmix_bitmap_t iof_daemons;
     /* number of local procs */
     pmix_rank_t num_local_procs;
     /* flags */
@@ -575,9 +598,28 @@ PRTE_EXPORT prte_job_t *prte_get_job_data_object(const pmix_nspace_t job);
  */
 PRTE_EXPORT int prte_set_job_data_object(prte_job_t *jdata);
 
-/** Pack/unpack a job object */
-PRTE_EXPORT int prte_job_pack(pmix_data_buffer_t *bkt, prte_job_t *job);
-PRTE_EXPORT int prte_job_unpack(pmix_data_buffer_t *bkt, prte_job_t **job);
+/** What a packed job carries.
+ *
+ * The launch message is broadcast to every daemon, but a proc's cpuset is
+ * of interest only to the daemon that will fork it - so the launch path
+ * leaves the cpusets out and sends each daemon its own slice point to
+ * point (prte_odls_base_send_cpuset_slices). Every other caller packs
+ * everything.
+ *
+ * The mode is packed at the head of the buffer so the decoder reads what
+ * is there rather than being told out of band; prte_job_unpack hands it
+ * back so the caller can tell "not sent" from "not bound".
+ */
+typedef uint8_t prte_job_pack_mode_t;
+#define PRTE_JOB_PACK_ALL        0 // everything, including each proc's cpuset
+#define PRTE_JOB_PACK_NO_CPUSETS 1 // cpusets are being scattered separately
+
+/** Pack/unpack a job object. "mode" may be NULL on the unpack if the
+ * caller does not care which shape arrived. */
+PRTE_EXPORT int prte_job_pack(pmix_data_buffer_t *bkt, prte_job_t *job,
+                              prte_job_pack_mode_t mode);
+PRTE_EXPORT int prte_job_unpack(pmix_data_buffer_t *bkt, prte_job_t **job,
+                                prte_job_pack_mode_t *mode);
 PRTE_EXPORT int prte_job_copy(prte_job_t **dest, prte_job_t *src);
 PRTE_EXPORT void prte_job_print(char **output, prte_job_t *jdata);
 
@@ -588,8 +630,15 @@ PRTE_EXPORT int prte_app_copy(prte_app_context_t **dest, prte_app_context_t *src
 PRTE_EXPORT void prte_app_print(char **output, prte_job_t *jdata, prte_app_context_t *src);
 
 /** Pack/unpack a proc*/
-PRTE_EXPORT int prte_proc_pack(pmix_data_buffer_t *bkt, prte_proc_t *proc);
-PRTE_EXPORT int prte_proc_unpack(pmix_data_buffer_t *bkt, prte_proc_t *proc);
+/* "devices" says whether this job's procs carry a device assignment.  It is
+ * a parameter rather than something read back off the job because the job's
+ * map is packed AFTER the proc array - so a decoder reading a proc has not
+ * yet seen the mapping policy, and deriving the answer there would skip a
+ * field the packer wrote and desynchronize the rest of the buffer. */
+PRTE_EXPORT int prte_proc_pack(pmix_data_buffer_t *bkt, prte_proc_t *proc,
+                               bool devices, prte_job_pack_mode_t mode);
+PRTE_EXPORT int prte_proc_unpack(pmix_data_buffer_t *bkt, prte_proc_t *proc,
+                                 bool devices, prte_job_pack_mode_t mode);
 PRTE_EXPORT int prte_proc_copy(prte_proc_t **dest, prte_proc_t *src);
 PRTE_EXPORT void prte_proc_print(char **output, prte_job_t *jdata, prte_proc_t *src);
 

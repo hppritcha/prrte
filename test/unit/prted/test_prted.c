@@ -71,6 +71,7 @@
 #include "src/mca/schizo/base/base.h"
 #include "src/mca/state/base/base.h"
 #include "src/prted/prted.h"
+#include "src/prted/pmix/pmix_server.h"
 #include "src/prted/pmix/pmix_server_internal.h"
 
 #define CHECK(label, cond)                                    \
@@ -200,6 +201,10 @@ static int test_xfer_job_info(void)
     pmix_info_t info[3];
     char *str;
     uint32_t u32, *u32ptr;
+    pmix_envar_t envt;
+    prte_attribute_t *attr;
+    size_t nenvars;
+    bool found_app;
 
     /* a boolean directive lands as a job attribute */
     jdata = fresh_job();
@@ -275,6 +280,38 @@ static int test_xfer_job_info(void)
     CHECK("xfer/unknown-cached",
           prte_get_attribute(&jdata->attributes, PRTE_JOB_INFO_CACHE, NULL, PMIX_POINTER));
     PMIX_INFO_DESTRUCT(&info[0]);
+    PMIX_RELEASE(jdata);
+
+    /* envar directives are multi-valued: each must land on the list, and none
+     * may displace one already there under the same key - prte_pmix_xfer_app()
+     * runs first and puts app_idx 0's directives on this same list */
+    jdata = fresh_job();
+    PMIX_ENVAR_CONSTRUCT(&envt);
+    envt.envar = (char *) "APP_LEVEL";
+    envt.value = (char *) "1";
+    prte_append_attribute(&jdata->attributes, PRTE_JOB_SET_ENVAR, PRTE_ATTR_GLOBAL,
+                          &envt, PMIX_ENVAR);
+    envt.envar = (char *) "JOB_LEVEL";
+    envt.value = (char *) "2";
+    PMIX_INFO_LOAD(&info[0], PMIX_SET_ENVAR, &envt, PMIX_ENVAR);
+    envt.envar = (char *) "JOB_LEVEL_2";
+    envt.value = (char *) "3";
+    PMIX_INFO_LOAD(&info[1], PMIX_SET_ENVAR, &envt, PMIX_ENVAR);
+    CHECK("xfer/envar-rc", PRTE_SUCCESS == prte_pmix_xfer_job_info(jdata, info, 2));
+    nenvars = 0;
+    found_app = false;
+    PMIX_LIST_FOREACH(attr, &jdata->attributes, prte_attribute_t) {
+        if (PRTE_JOB_SET_ENVAR == attr->key) {
+            ++nenvars;
+            if (0 == strcmp(attr->data.data.envar.envar, "APP_LEVEL")) {
+                found_app = true;
+            }
+        }
+    }
+    CHECK("xfer/envar-count", 3 == nenvars);
+    CHECK("xfer/envar-preexisting-kept", found_app);
+    PMIX_INFO_DESTRUCT(&info[0]);
+    PMIX_INFO_DESTRUCT(&info[1]);
     PMIX_RELEASE(jdata);
 
     /* an empty directive array is a no-op, not a fault */
@@ -1248,6 +1285,204 @@ static int test_session_time(void)
     return failures;
 }
 
+/*
+ * The departed-job registry.  A lookup that cannot find a job has to tell
+ * "we have not heard of it YET" from "it has been and gone": the first is a
+ * race worth waiting out, the second is a request that would wait forever,
+ * because nothing drains those on a timer.  This list is the only thing that
+ * can tell them apart, so the two properties that matter are that it
+ * remembers what it was told and that it stays bounded - a persistent DVM
+ * runs jobs without end.
+ */
+static int test_departed_jobs(void)
+{
+    int failures = 0;
+    /* the helpers take a pmix_nspace_t - a fixed-size array - so hand them
+     * one rather than a string literal the compiler can see is shorter */
+    pmix_nspace_t ns, first, last;
+    int i;
+
+    /* the registry lives in the server globals, which a full
+     * pmix_server_init() would have constructed for us */
+    PMIX_CONSTRUCT(&prte_pmix_server_globals.departed_jobs, pmix_list_t);
+
+    PMIX_LOAD_NSPACE(ns, "unit-test-never-existed");
+    CHECK("an unknown job has not departed", !prte_pmix_server_job_has_departed(ns));
+
+    PMIX_LOAD_NSPACE(first, "unit-test-dep@1");
+    prte_pmix_server_job_departed(first);
+    CHECK("a departed job is remembered", prte_pmix_server_job_has_departed(first));
+    PMIX_LOAD_NSPACE(ns, "unit-test-dep@2");
+    CHECK("...and its neighbours are not", !prte_pmix_server_job_has_departed(ns));
+
+    /* recording the same one twice must not consume a second slot, or a job
+     * whose departure is reported more than once would push out the history
+     * of jobs that really did depart */
+    prte_pmix_server_job_departed(first);
+    CHECK("a repeat does not grow the list",
+          1 == pmix_list_get_size(&prte_pmix_server_globals.departed_jobs));
+
+    /* the bound holds, and it is the OLDEST that is dropped */
+    for (i = 2; i <= 40; i++) {
+        snprintf(ns, sizeof(ns), "unit-test-dep@%d", i);
+        prte_pmix_server_job_departed(ns);
+    }
+    CHECK("the list stays bounded",
+          32 >= pmix_list_get_size(&prte_pmix_server_globals.departed_jobs));
+    PMIX_LOAD_NSPACE(last, "unit-test-dep@40");
+    CHECK("the most recent departure is still known",
+          prte_pmix_server_job_has_departed(last));
+    CHECK("the oldest has aged out", !prte_pmix_server_job_has_departed(first));
+
+    /* LIST_DESTRUCT, not DESTRUCT: the latter only re-initializes the list
+     * and would leak every entry still on it */
+    PMIX_LIST_DESTRUCT(&prte_pmix_server_globals.departed_jobs);
+
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_departed_jobs\n");
+    }
+    return failures;
+}
+
+/* The registry of connected assemblages.
+ *
+ * PMIx_Connect asks the host to treat a set of processes as one application
+ * for fault purposes, and the one obligation that creates is narrow: a member
+ * that terminates without first calling PMIx_Disconnect owes the rest of the
+ * assemblage a PMIX_ERR_PROC_TERM_WO_SYNC event.  Nothing recorded the
+ * membership, so there was nothing to consult when a member died.
+ *
+ * The membership is held on the DVM master, and what is testable without a
+ * DVM is the bookkeeping itself: that the same set is recognized however it
+ * is ordered, that a set is matched literally rather than loosely, who a
+ * wildcard member covers, and that a record is neither leaked nor dropped
+ * while somebody named in it still exists.  Sending the event needs daemons.
+ */
+static int test_connections(void)
+{
+    int failures = 0;
+    pmix_proc_t members[2], other[2], proc;
+    prte_proc_t pdata;
+    prte_job_t *jdata;
+    bool made_array = false;
+
+    /* the registry lives in the server globals, which a full
+     * pmix_server_init() would have constructed - and it declines to record
+     * anything until that has happened, which is what keeps every other test
+     * in this binary out of it */
+    PMIX_CONSTRUCT(&prte_pmix_server_globals.connections, pmix_list_t);
+    prte_pmix_server_globals.initialized = true;
+    if (NULL == prte_job_data) {
+        prte_job_data = PMIX_NEW(pmix_pointer_array_t);
+        pmix_pointer_array_init(prte_job_data, 8, INT32_MAX, 8);
+        made_array = true;
+    }
+
+    PMIX_LOAD_PROCID(&members[0], "unit-test-conn@1", PMIX_RANK_WILDCARD);
+    PMIX_LOAD_PROCID(&members[1], "unit-test-conn@2", PMIX_RANK_WILDCARD);
+
+    prte_pmix_server_connection_record(members, 2);
+    CHECK("a connect is recorded",
+          1 == pmix_list_get_size(&prte_pmix_server_globals.connections));
+
+    /* the PMIx definition says the order of the participants carries no
+     * meaning, so the same set given the other way round is the same set */
+    other[0] = members[1];
+    other[1] = members[0];
+    prte_pmix_server_connection_record(other, 2);
+    CHECK("the same set in another order is the same connection",
+          1 == pmix_list_get_size(&prte_pmix_server_globals.connections));
+
+    /* a wildcard member stands for every proc of that namespace - which is
+     * how a connect between two jobs is nearly always expressed, so getting
+     * this wrong means never notifying anybody */
+    PMIX_LOAD_PROCID(&proc, "unit-test-conn@1", 3);
+    CHECK("a wildcard member covers a rank of that job",
+          prte_pmix_server_is_connected(&proc));
+    PMIX_LOAD_PROCID(&proc, "unit-test-conn@9", 0);
+    CHECK("and covers nothing outside it", !prte_pmix_server_is_connected(&proc));
+
+    /* Matching a set is literal.  PMIx will not pair a connect expressed with
+     * wildcards with one that named the ranks, so a disconnect naming a set
+     * we never recorded must leave the record we do hold alone rather than
+     * drop it in somebody else's name. */
+    PMIX_LOAD_PROCID(&other[0], "unit-test-conn@1", 0);
+    PMIX_LOAD_PROCID(&other[1], "unit-test-conn@2", 0);
+    prte_pmix_server_connection_drop(other, 2);
+    CHECK("a different set does not drop this one",
+          1 == pmix_list_get_size(&prte_pmix_server_globals.connections));
+
+    /* a job of the assemblage ends, but the other is still running: the
+     * survivors are still connected to each other and still owed an event
+     * apiece, so the record has to stay */
+    jdata = PMIX_NEW(prte_job_t);
+    PMIX_LOAD_NSPACE(jdata->nspace, "unit-test-conn@2");
+    CHECK("the surviving job registers", PRTE_SUCCESS == prte_set_job_data_object(jdata));
+    prte_pmix_server_connection_purge(members[0].nspace);
+    CHECK("a connection outlives one member's job",
+          1 == pmix_list_get_size(&prte_pmix_server_globals.connections));
+
+    /* ...and once nothing named in it is left, it has nobody to serve */
+    pmix_pointer_array_set_item(prte_job_data, jdata->index, NULL);
+    PMIX_RELEASE(jdata);
+    prte_pmix_server_connection_purge(members[1].nspace);
+    CHECK("and is forgotten when nothing named in it is left",
+          0 == pmix_list_get_size(&prte_pmix_server_globals.connections));
+
+    /* a disconnect of the set that was recorded does drop it */
+    prte_pmix_server_connection_record(members, 2);
+    prte_pmix_server_connection_drop(members, 2);
+    CHECK("a disconnect drops the connection",
+          0 == pmix_list_get_size(&prte_pmix_server_globals.connections));
+
+    /*
+     * Dissolving is deliberately more generous than recording: a request
+     * that names every member of an assemblage dissolves it, whether or not
+     * it names them the same way.  The case that needs it is the one the
+     * runtime creates itself - a spawn connects the child to the parent
+     * PROCESS, while an application that wants out disconnects the two JOBS,
+     * which is the shape MPI_Comm_disconnect has.  Under an exact-set rule
+     * that request matches nothing and the implicit assemblage can never be
+     * left, so a child's later failure would take a parent with it that had
+     * said in as many words that it was done.
+     */
+    PMIX_LOAD_PROCID(&other[0], "unit-test-conn@1", 0);
+    other[1] = members[1];
+    prte_pmix_server_connection_record(other, 2);
+    prte_pmix_server_connection_drop(members, 2);
+    CHECK("a disconnect of the jobs dissolves a connection to one rank of one",
+          0 == pmix_list_get_size(&prte_pmix_server_globals.connections));
+
+    /* ...and the generosity only goes that way: naming one rank does not
+     * dissolve an assemblage that named the whole job */
+    prte_pmix_server_connection_record(members, 2);
+    prte_pmix_server_connection_drop(other, 2);
+    CHECK("a disconnect of one rank leaves a whole-job connection alone",
+          1 == pmix_list_get_size(&prte_pmix_server_globals.connections));
+    prte_pmix_server_connection_drop(members, 2);
+
+    /* a proc that belongs to nothing is not connected, and reporting its
+     * termination is a no-op rather than a walk off the end of an empty list */
+    PMIX_CONSTRUCT(&pdata, prte_proc_t);
+    PMIX_LOAD_PROCID(&pdata.name, "unit-test-conn@1", 0);
+    pdata.exit_code = 0;
+    CHECK("an unconnected proc is not connected", !prte_pmix_server_is_connected(&pdata.name));
+    prte_pmix_server_connection_terminated(&pdata);
+    PMIX_DESTRUCT(&pdata);
+
+    prte_pmix_server_globals.initialized = false;
+    PMIX_LIST_DESTRUCT(&prte_pmix_server_globals.connections);
+    if (made_array) {
+        PMIX_RELEASE(prte_job_data);
+        prte_job_data = NULL;
+    }
+
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_connections\n");
+    }
+    return failures;
+}
+
 int main(void)
 {
     int rc, failures = 0, skipped = 0;
@@ -1308,6 +1543,8 @@ int main(void)
         return 1;
     }
 
+    failures += test_departed_jobs();
+    failures += test_connections();
     failures += test_prefix_normalization();
     failures += test_singleton_id();
     failures += test_xfer_job_info();

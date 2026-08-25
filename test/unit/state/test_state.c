@@ -41,7 +41,9 @@
 
 #include "prte_config.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "constants.h"
 #include "src/event/event-internal.h"
@@ -544,6 +546,149 @@ static int test_runtime_options(void)
 }
 
 /*
+ * prte_state_base_report_child_sep() reads the same directive the walk above
+ * records, but for a caller with no job object: a launcher driving a
+ * persistent DVM, deciding whether a child job's exit status becomes its own.
+ *
+ * The one thing that matters about it is that it AGREES with the walk.  Two
+ * readers of one directive that disagree would make "prun --runtime-options
+ * report-child-jobs-separately" and "prterun ..." return different exit
+ * statuses for the same run, which is the failure the directive exists to
+ * prevent.  So every case below is asserted against the attribute the walk
+ * leaves behind, not against a hand-written expectation.
+ */
+static int test_report_child_sep_reader(void)
+{
+    int failures = 0;
+    prte_job_t *jdata;
+    char *spec;
+    bool viawalk;
+    size_t n;
+    /* the spellings a command line can carry, including one that names the
+     * directive alongside others and one that does not name it at all */
+    const char *specs[] = {
+        "report-child-jobs-separately",
+        "report-child-jobs-separately=true",
+        "report-child-jobs-separately=false",
+        "recoverable,report-child-jobs-separately,notifyerrors",
+        "recoverable,report-child-jobs-separately=false",
+        "timeout=60",
+        NULL
+    };
+
+    for (n = 0; NULL != specs[n]; n++) {
+        jdata = PMIX_NEW(prte_job_t);
+        PMIX_LOAD_NSPACE(jdata->nspace, "unit-test-rcsr");
+        /* set_runtime_options edits the string it is given, so each reader
+         * gets its own copy */
+        spec = strdup(specs[n]);
+        CHECK(specs[n], PRTE_SUCCESS == prte_state_base_set_runtime_options(jdata, spec));
+        free(spec);
+        viawalk = prte_get_attribute(&jdata->attributes, PRTE_JOB_REPORT_CHILD_SEP,
+                                     NULL, PMIX_BOOL);
+        spec = strdup(specs[n]);
+        CHECK(specs[n], viawalk == prte_state_base_report_child_sep(spec));
+        free(spec);
+        PMIX_RELEASE(jdata);
+    }
+
+    /* a caller with nothing to read is not asking for it */
+    CHECK("no spec reads as false", !prte_state_base_report_child_sep(NULL));
+
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_report_child_sep_reader\n");
+    }
+    return failures;
+}
+
+/*
+ * "stop-in-app" is the one runtime option whose value is not a truth value.
+ * Written bare or with a boolean it asserts "stop wherever the application
+ * chooses"; written with anything else, that text is the string ID of the
+ * breakpoint the application is to stop at, which the daemons hand to the
+ * process in the PMIX_BREAKPOINT envar.  Two things can go wrong quietly
+ * here: the strict-boolean refusal that guards every other directive would
+ * reject a breakpoint name outright, and a name left behind by an earlier
+ * directive would send the job to a breakpoint nobody asked for.
+ */
+static int test_stop_in_app(void)
+{
+    int failures = 0;
+    prte_job_t *jdata;
+    char *spec, *bkpt;
+
+    /* bare: stop somewhere, no particular place */
+    jdata = PMIX_NEW(prte_job_t);
+    PMIX_LOAD_NSPACE(jdata->nspace, "unit-test-sia1");
+    spec = strdup("stop-in-app");
+    CHECK("bare directive accepted",
+          PRTE_SUCCESS == prte_state_base_set_runtime_options(jdata, spec));
+    free(spec);
+    CHECK("bare sets stop-in-app",
+          prte_get_attribute(&jdata->attributes, PRTE_JOB_STOP_IN_APP, NULL, PMIX_BOOL));
+    CHECK("bare names no breakpoint",
+          !prte_get_attribute(&jdata->attributes, PRTE_JOB_BREAKPOINT, NULL, PMIX_STRING));
+
+    /* a name: not a truth value, so it must not be refused as one, and the
+     * directive after it must still be applied */
+    spec = strdup("stop-in-app=mpi-init,recoverable=true");
+    CHECK("named breakpoint accepted",
+          PRTE_SUCCESS == prte_state_base_set_runtime_options(jdata, spec));
+    free(spec);
+    CHECK("name sets stop-in-app",
+          prte_get_attribute(&jdata->attributes, PRTE_JOB_STOP_IN_APP, NULL, PMIX_BOOL));
+    bkpt = NULL;
+    CHECK("name recorded",
+          prte_get_attribute(&jdata->attributes, PRTE_JOB_BREAKPOINT, (void **) &bkpt,
+                             PMIX_STRING));
+    CHECK("name value", NULL != bkpt && 0 == strcmp(bkpt, "mpi-init"));
+    if (NULL != bkpt) {
+        free(bkpt);
+    }
+    CHECK("directive after the name applied",
+          prte_get_attribute(&jdata->attributes, PRTE_JOB_RECOVERABLE, NULL, PMIX_BOOL));
+
+    /* asserting the boolean afterwards drops the name: the job is no longer
+     * to stop at that one place */
+    spec = strdup("stop-in-app=true");
+    CHECK("truth value accepted",
+          PRTE_SUCCESS == prte_state_base_set_runtime_options(jdata, spec));
+    free(spec);
+    CHECK("true keeps stop-in-app",
+          prte_get_attribute(&jdata->attributes, PRTE_JOB_STOP_IN_APP, NULL, PMIX_BOOL));
+    CHECK("true clears the name",
+          !prte_get_attribute(&jdata->attributes, PRTE_JOB_BREAKPOINT, NULL, PMIX_STRING));
+
+    /* and turning it off clears both */
+    spec = strdup("stop-in-app=mpi-init");
+    CHECK("name re-applied", PRTE_SUCCESS == prte_state_base_set_runtime_options(jdata, spec));
+    free(spec);
+    spec = strdup("stop-in-app=false");
+    CHECK("false accepted", PRTE_SUCCESS == prte_state_base_set_runtime_options(jdata, spec));
+    free(spec);
+    CHECK("false clears stop-in-app",
+          !prte_get_attribute(&jdata->attributes, PRTE_JOB_STOP_IN_APP, NULL, PMIX_BOOL));
+    CHECK("false clears the name",
+          !prte_get_attribute(&jdata->attributes, PRTE_JOB_BREAKPOINT, NULL, PMIX_STRING));
+    PMIX_RELEASE(jdata);
+
+    /* the exemption is confined to this directive - its neighbors still
+     * refuse a value that is neither true nor false */
+    jdata = PMIX_NEW(prte_job_t);
+    PMIX_LOAD_NSPACE(jdata->nspace, "unit-test-sia2");
+    spec = strdup("stop-in-init=mpi-init");
+    CHECK("stop-in-init still refuses a non-boolean",
+          PRTE_ERR_SILENT == prte_state_base_set_runtime_options(jdata, spec));
+    free(spec);
+    PMIX_RELEASE(jdata);
+
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_stop_in_app\n");
+    }
+    return failures;
+}
+
+/*
  * Component selection is role-driven: dvm answers only for the DVM master,
  * prted only for a daemon, both at priority 100.  Exactly one applies to
  * any given process, which is what makes a "pick one" framework safe here.
@@ -619,9 +764,154 @@ static int test_component_selection(void)
     return failures;
 }
 
+/*
+ * DVM state logging.
+ *
+ * The log is an operational record, asked for by the state_base_log_* MCA
+ * parameters, so what has to hold is that (a) enabling it
+ * produces the file the documentation names, in the directory asked for,
+ * creating that directory if need be; (b) both record kinds carry the fields
+ * the documentation promises; and (c) a transition is recorded when it is
+ * ORDERED, which means it appears even when no handler is registered for it
+ * and the dispatcher drops it.  That last one is the whole point - a state
+ * machine that silently swallowed an activation is exactly what someone
+ * reads this log to discover - and it is what this test drives, since it
+ * runs with empty state tables.
+ *
+ * main() enables logging into logdir before prte_init_util, because an MCA
+ * variable reads its environment only at its first registration.
+ */
+static char *logdir = NULL;
+
+/* does the log contain this exact line? */
+static bool log_has(const char *needle)
+{
+    char buf[8192];
+    size_t n;
+    FILE *fp;
+    bool found;
+
+    if (NULL == prte_state_base.log_file) {
+        return false;
+    }
+    fp = fopen(prte_state_base.log_file, "r");
+    if (NULL == fp) {
+        return false;
+    }
+    n = fread(buf, 1, sizeof(buf) - 1, fp);
+    fclose(fp);
+    buf[n] = '\0';
+    found = (NULL != strstr(buf, needle));
+    return found;
+}
+
+static int test_state_log(void)
+{
+    int failures = 0;
+    char *dir = NULL;
+    char *expected = NULL;
+    prte_job_t *jdata;
+    pmix_proc_t proc;
+
+    /* --- the path rule, on its own: absolute is taken as given, relative
+     * and absent are resolved against the session-directory base, and
+     * without such a base a relative request cannot be answered --- */
+    CHECK("logdir absolute",
+          PRTE_SUCCESS == prte_state_base_log_resolve_dir("/var/log/prte", "/tmp", &dir)
+          && NULL != dir && 0 == strcmp("/var/log/prte", dir));
+    free(dir);
+    dir = NULL;
+    CHECK("logdir relative",
+          PRTE_SUCCESS == prte_state_base_log_resolve_dir("dvmlogs", "/tmp", &dir)
+          && NULL != dir && 0 == strcmp("/tmp/dvmlogs", dir));
+    free(dir);
+    dir = NULL;
+    CHECK("logdir default",
+          PRTE_SUCCESS == prte_state_base_log_resolve_dir(NULL, "/tmp", &dir)
+          && NULL != dir && 0 == strcmp("/tmp", dir));
+    free(dir);
+    dir = NULL;
+    CHECK("logdir empty is default",
+          PRTE_SUCCESS == prte_state_base_log_resolve_dir("", "/tmp", &dir)
+          && NULL != dir && 0 == strcmp("/tmp", dir));
+    free(dir);
+    dir = NULL;
+    CHECK("logdir relative needs a base",
+          PRTE_SUCCESS != prte_state_base_log_resolve_dir("dvmlogs", NULL, &dir));
+    CHECK("refused leaves no dir", NULL == dir);
+    /* an absolute path needs no base, so it still answers */
+    CHECK("logdir absolute needs no base",
+          PRTE_SUCCESS == prte_state_base_log_resolve_dir("/var/log/prte", NULL, &dir));
+    free(dir);
+
+    /* --- the file the framework opened for us --- */
+    CHECK("log enabled", prte_state_base.log_jobstate && prte_state_base.log_procstate);
+    CHECK("log open", NULL != prte_state_base.log_fp);
+    if (NULL == prte_state_base.log_fp) {
+        /* nothing below can say anything if the open failed */
+        fprintf(stdout, "FAILED test_state_log\n");
+        return failures;
+    }
+    /* we init as PRTE_PROC_MASTER, so this is the controller's spelling, and
+     * the directory did not exist until the open created it */
+    pmix_asprintf(&expected, "%s/prtectrlr-%s-log", logdir, prte_process_info.nodename);
+    CHECK("log file name", NULL != prte_state_base.log_file && NULL != expected
+                           && 0 == strcmp(expected, prte_state_base.log_file));
+    free(expected);
+
+    /* --- the records, with no handler registered for either state: the
+     * dispatcher drops both, and the log must show them anyway --- */
+    fresh_machines();
+
+    jdata = PMIX_NEW(prte_job_t);
+    PMIX_LOAD_NSPACE(jdata->nspace, "statelogtest");
+    prte_state_base_activate_job_state(jdata, PRTE_JOB_STATE_MAP_COMPLETE);
+    CHECK("job record", log_has(" JOB statelogtest MAP COMPLETE\n"));
+
+    /* a job activation carrying no job at all still has to be recorded */
+    prte_state_base_activate_job_state(NULL, PRTE_JOB_STATE_DAEMONS_LAUNCHED);
+    CHECK("null-job record", log_has(" JOB - DAEMONS LAUNCHED\n"));
+
+    PMIX_LOAD_PROCID(&proc, "statelogtest", 7);
+    prte_state_base_activate_proc_state(&proc, PRTE_PROC_STATE_RUNNING);
+    CHECK("proc record", log_has(" PROC statelogtest:7 RUNNING\n"));
+
+    /* activate_proc_state drops a NULL name before it dispatches; the order
+     * was still given, so it is still recorded */
+    prte_state_base_activate_proc_state(NULL, PRTE_PROC_STATE_TERMINATED);
+    CHECK("null-proc record", log_has(" PROC - NORMALLY TERMINATED\n"));
+
+    PMIX_RELEASE(jdata);
+    drop_machines();
+
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_state_log\n");
+    }
+    return failures;
+}
+
 int main(void)
 {
     int rc, failures = 0;
+    char cwd[PRTE_PATH_MAX];
+    char *logfile;
+
+    /* Ask for a state log before anything registers an MCA variable: a
+     * variable reads its environment only at its first registration, and the
+     * state framework's happens below.  The directory deliberately does not
+     * exist yet - creating it is part of what is under test. */
+    if (NULL == getcwd(cwd, sizeof(cwd))) {
+        fprintf(stderr, "getcwd failed\n");
+        return 1;
+    }
+    pmix_asprintf(&logdir, "%s/state-log-test-%lu", cwd, (unsigned long) getpid());
+    if (NULL == logdir) {
+        fprintf(stderr, "out of memory\n");
+        return 1;
+    }
+    setenv("PRTE_MCA_state_base_log_jobstate", "1", 1);
+    setenv("PRTE_MCA_state_base_log_procstate", "1", 1);
+    setenv("PRTE_MCA_state_base_log_path", logdir, 1);
 
     rc = prte_init_util(PRTE_PROC_MASTER);
     if (PRTE_SUCCESS != rc) {
@@ -648,9 +938,20 @@ int main(void)
     failures += test_proc_dispatch();
     failures += test_caddy_contract();
     failures += test_runtime_options();
+    failures += test_report_child_sep_reader();
+    failures += test_stop_in_app();
     failures += test_component_selection();
+    failures += test_state_log();
 
+    /* the framework close frees log_file, so take a copy to clean up with */
+    logfile = (NULL == prte_state_base.log_file) ? NULL : strdup(prte_state_base.log_file);
     (void) pmix_mca_base_framework_close(&prte_state_base_framework);
+    if (NULL != logfile) {
+        (void) unlink(logfile);
+        free(logfile);
+    }
+    (void) rmdir(logdir);
+    free(logdir);
     prte_event_base_close();
     prte_finalize();
 

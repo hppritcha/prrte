@@ -52,6 +52,7 @@
 #include "src/mca/errmgr/errmgr.h"
 
 #include "src/runtime/prte_globals.h"
+#include "src/runtime/prte_worker_pool.h"
 #include "src/runtime/runtime.h"
 #include "src/runtime/runtime_internals.h"
 
@@ -176,6 +177,21 @@ int prte_register_params(void)
     if (PRTE_SUCCESS != ret) {
         return ret;
     }
+
+    /* Verbosity of prte_debug_output, the general PRRTE debug stream that
+     * prte_dt_init() opens.  Nothing set this, so the variable sat at its
+     * -1 initializer for the life of the process and the stream could only
+     * ever reach verbosity 1, and then only as a side effect of
+     * --debug-daemons.  Every message the tree writes to it above that
+     * level was unreachable.  Registered here, in phase two, so a parameter
+     * file can set it - and ahead of prte_init(), which is where
+     * prte_dt_init() reads it. */
+    prte_debug_verbosity = -1;
+    (void) pmix_mca_base_var_register("prte", "prte", NULL, "debug_verbose",
+                                      "Verbosity of the general PRRTE debug output stream "
+                                      "(-1 = off)",
+                                      PMIX_MCA_BASE_VAR_TYPE_INT,
+                                      &prte_debug_verbosity);
 
     /*
      * This string is going to be used in prte/util/stacktrace.c
@@ -614,6 +630,17 @@ int prte_register_params(void)
                                       "Whether binding of internal PRRTE progress thread is required",
                                       PMIX_MCA_BASE_VAR_TYPE_BOOL,
                                       &prte_bind_progress_thread_reqd);
+
+    /* One pool of worker threads serves everything PRRTE wants off the main
+     * progress thread - peer socket handlers and local fork/exec both draw
+     * from it.  See src/runtime/prte_worker_pool.h. */
+    prte_num_worker_threads = 8;
+    (void) pmix_mca_base_var_register("prte", "prte", NULL, "num_worker_threads",
+                                      "Number of worker progress threads used to service peer "
+                                      "sockets and to fork/exec local processes (0 = do both on "
+                                      "the main progress thread)",
+                                      PMIX_MCA_BASE_VAR_TYPE_INT,
+                                      &prte_num_worker_threads);
 
     (void) pmix_mca_base_var_register("prte", "prte", NULL, "uniform_nodes",
                                       "Allocation contains homogeneous nodes",

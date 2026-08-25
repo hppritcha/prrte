@@ -10,7 +10,7 @@
  * Copyright (c) 2019      Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
- * Copyright (c) 2021-2023 Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting.  All rights reserved.
  * Copyright (c) 2023      Triad National Security, LLC. All rights
  *                         reserved.
  * Copyright (c) 2026      Sandia National Laboratories  All rights reserved.
@@ -228,7 +228,8 @@ static void update_descendants(void){
 // Defined below, shared with prte_rml_compute_routing_tree.
 static void build_tree_from_base(void);
 
-void prte_rml_repair_routing_tree(pmix_data_array_t* failed_ranks, bool global){
+void prte_rml_repair_routing_tree(pmix_data_array_t* failed_ranks, bool global,
+                                  uint32_t epoch){
     if(global){
         // Make sure these are given local notice first, but mark as globally
         // failed just before, to avoid redundant failure notices up the tree
@@ -236,12 +237,16 @@ void prte_rml_repair_routing_tree(pmix_data_array_t* failed_ranks, bool global){
         for(size_t i = 0; i < failed_ranks->size; i++){
             pmix_bitmap_set_bit(&prte_rml_base.global_failed_dmns, ranks[i]);
         }
-        prte_rml_repair_routing_tree(failed_ranks, false);
+        // the local pass never moves the epoch, so it needs no value
+        prte_rml_repair_routing_tree(failed_ranks, false, 0);
     }
 
     prte_rml_recovery_status_t status;
     PMIX_CONSTRUCT(&status, prte_rml_recovery_status_t);
-    if(global) status.scope = PRTE_RML_FAULT_SCOPE_GLOBAL;
+    if(global){
+        status.scope = PRTE_RML_FAULT_SCOPE_GLOBAL;
+        status.epoch = epoch;
+    }
 
     resize_ranks(&status.failed_ranks, failed_ranks->size);
     size_t j = 0;
@@ -270,6 +275,10 @@ void prte_rml_repair_routing_tree(pmix_data_array_t* failed_ranks, bool global){
             } else {
                 pmix_bitmap_set_bit(&prte_rml_base.dead_dmns, r);
             }
+            // A rank we are now recording as departed is no longer one whose
+            // return has to be protected from being inferred away, so let the
+            // mark go. It is re-set if the rank returns again.
+            pmix_bitmap_clear_bit(&prte_rml_base.revived_dmns, r);
         }
         ((pmix_rank_t*)status.failed_ranks.array)[j++] = r;
     }
@@ -362,14 +371,35 @@ void prte_rml_repair_routing_tree(pmix_data_array_t* failed_ranks, bool global){
 
     }
 
-    // Notify components
+    // Notify components.
+    //
+    // Deliberately NOT the place that raises PRTE_PROC_STATE_COMM_FAILED for
+    // the departed ranks, tempting though the symmetry is. Repairing the tree
+    // and telling the errmgr a daemon is gone are not the same question, and
+    // each happens without the other:
+    //
+    //  - A DVM shrink repairs in one batch for every target and must not raise
+    //    it: the campaign tears the targets out of the DVM itself, and the
+    //    errmgr's already-departed guard exists precisely to swallow the
+    //    comm-failure their real departure produces later
+    //    (ras_base_allocate.c, errmgr_dvm.c).
+    //  - During an ordered teardown prte_rml_route_lost returns without
+    //    repairing at all, yet the OOB still raises COMM_FAILED - and that
+    //    raise is what drives "all my routes and children are gone, terminate"
+    //    in both errmgr components. Moving the raise in here would break
+    //    orderly shutdown.
+    //  - errmgr/prted heals the tree around a peer it has given up connecting
+    //    to from inside its own error handler; raising there would re-enter it.
+    //
+    // What must not diverge is the set of paths that DO report, because this
+    // function's failed_dmns set is what they all use to tell a first report
+    // from a duplicate. They are collected in rml_fault_handler.c behind
+    // report_new_departures(); see the comment there.
     const prte_rml_recovery_status_t* s = &status;
     prte_rml_fault_handler(s);
-    // TODO: Should this fn become the central point responsible for setting
-    // failed procs to PRTE_PROC_STATE_COMM_FAILED?
     prte_grpcomm_fault_handler(s);
-    prte_filem  .fault_handler(s);
-    prte_relm   .fault_handler(s);
+    prte_filem.fault_handler(s);
+    prte_relm_fault_handler(s);
 
     PMIX_DESTRUCT(&status);
 }
@@ -395,6 +425,10 @@ void prte_rml_revive_routing_tree(pmix_rank_t rank){
     pmix_bitmap_clear_bit(&prte_rml_base.failed_dmns, rank);
     pmix_bitmap_clear_bit(&prte_rml_base.global_failed_dmns, rank);
     pmix_bitmap_clear_bit(&prte_rml_base.absent_dmns, rank);
+    // Remember that it came back. A lineage reported to us by a peer whose
+    // view predates this xcast would otherwise let us infer the rank dead
+    // again - see prte_rml_reconcile_ancestry.
+    pmix_bitmap_set_bit(&prte_rml_base.revived_dmns, rank);
 
     // Rebuild from the base positions with the returned rank now living: it
     // re-takes its slot above us if it was our ancestor (demoting us), or
@@ -499,8 +533,8 @@ void prte_rml_revive_routing_tree(pmix_rank_t rank){
     // change is expected.
     const prte_rml_recovery_status_t* s = &status;
     prte_grpcomm_fault_handler(s);
-    prte_filem  .fault_handler(s);
-    prte_relm   .fault_handler(s);
+    prte_filem.fault_handler(s);
+    prte_relm_fault_handler(s);
 
     PMIX_DESTRUCT(&status);
 }
@@ -636,7 +670,7 @@ int prte_rml_route_lost(pmix_rank_t route){
     resize_ranks(&failed_ranks, 1);
     ((pmix_rank_t*)failed_ranks.array)[0] = route;
 
-    prte_rml_repair_routing_tree(&failed_ranks, /* global = */ false);
+    prte_rml_repair_routing_tree(&failed_ranks, /* global = */ false, /* epoch = */ 0);
 
     PMIx_Data_array_destruct(&failed_ranks);
     return PRTE_SUCCESS;
@@ -697,7 +731,17 @@ void prte_rml_compute_routing_tree(void){
     // Save our state prior to any daemon failures
     prte_rml_base.n_dmns = prte_process_info.num_daemons;
 
-    // TODO: Should we save this info when DVM is resized?
+    // Everything this routine wipes is re-derived below, with one exception:
+    // which of the departures have been GLOBALLY confirmed. That is derivable
+    // from nothing else, so hold it aside across the wipe and put it back.
+    // Both sets must still be re-initialized rather than merely carried
+    // forward: a grow widens the vpid span, and the difference these two are
+    // used for (send_failures_notice) is a pmix_bitmap XOR, which silently
+    // does nothing when the two operands are not the same number of words.
+    pmix_bitmap_t prev_global;
+    PMIX_CONSTRUCT(&prev_global, pmix_bitmap_t);
+    pmix_bitmap_copy(&prev_global, &prte_rml_base.global_failed_dmns);
+
     pmix_bitmap_init(&prte_rml_base.failed_dmns, prte_rml_base.n_dmns);
     pmix_bitmap_init(&prte_rml_base.global_failed_dmns, prte_rml_base.n_dmns);
 
@@ -716,8 +760,22 @@ void prte_rml_compute_routing_tree(void){
         if(pmix_bitmap_is_set_bit(&prte_rml_base.dead_dmns, r) ||
            pmix_bitmap_is_set_bit(&prte_rml_base.absent_dmns, r)){
             pmix_bitmap_set_bit(&prte_rml_base.failed_dmns, r);
+            // A departure the DVM has already broadcast stays broadcast: a
+            // grow reshapes the tree, it does not un-tell anybody. This set
+            // is what a re-homed daemon subtracts to work out which of its
+            // subtree's failures a NEW parent has yet to hear about
+            // (send_failures_notice); losing it made every recompute turn the
+            // next parent change into a report of every departure the daemon
+            // knows, which its parent then has to recognize and drop one by
+            // one. Restored inside this arm, so the documented invariant
+            // global_failed_dmns is a subset of failed_dmns holds by
+            // construction rather than by the caller's good behavior.
+            if(pmix_bitmap_is_set_bit(&prev_global, r)){
+                pmix_bitmap_set_bit(&prte_rml_base.global_failed_dmns, r);
+            }
         }
     }
+    PMIX_DESTRUCT(&prev_global);
 
     // Derive ancestors, lifeline, and children from the base radix positions
     // and route around whatever is currently failed (the restored holes above).

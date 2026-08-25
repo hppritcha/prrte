@@ -4,7 +4,7 @@
  * Copyright (c) 2014-2020 Intel, Inc.  All rights reserved.
  * Copyright (c) 2020-2021 IBM Corporation.  All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -37,6 +37,7 @@
 #include "src/util/session_dir.h"
 
 #include "src/mca/state/base/base.h"
+#include "src/prted/pmix/pmix_server.h"
 #include "state_prted.h"
 
 /*
@@ -210,8 +211,16 @@ static void track_jobs(int fd, short argc, void *cbdata)
                  * Instead report it as running here, and the child waitpid
                  * function will send back the normal terminated state when the
                  * the job is complete.
-                 */
-                if (PRTE_PROC_STATE_TERMINATED < child->state) {
+                 *
+                 * That substitution is only safe while the termination is
+                 * still to come. Once the proc is flagged RECORDED its
+                 * WAITPID/IOF join has already fired and been counted, so
+                 * nothing further will correct a RUNNING we report now - and
+                 * a short-lived proc reaches that point before the launch it
+                 * is being reported for has finished. Tell the truth about
+                 * one that has already gone. */
+                if (PRTE_PROC_STATE_TERMINATED < child->state ||
+                    PRTE_FLAG_TEST(child, PRTE_PROC_FLAG_RECORDED)) {
                     rc = PMIx_Data_pack(NULL, alert, &child->state, 1, PMIX_UINT32);
                     if (PMIX_SUCCESS != rc) {
                         PMIX_ERROR_LOG(rc);
@@ -351,6 +360,7 @@ static void track_procs(int fd, short argc, void *cbdata)
 
     /* get the job object for this proc */
     if (NULL == (jdata = prte_get_job_data_object(proc->nspace))) {
+        prte_state_base_orphaned_proc(proc, state);
         goto cleanup;
     }
     if (PRTE_PROC_STATE_READY_FOR_DEBUG == state) {
@@ -382,8 +392,29 @@ static void track_procs(int fd, short argc, void *cbdata)
     }
 
     if (PRTE_PROC_STATE_RUNNING == state) {
-        /* update the proc state */
-        pdata->state = state;
+        /* A proc can be reported RUNNING after it has already been recorded
+         * as terminated, and the state must NOT go backwards when it is.
+         * prte_odls_base_spawn_proc() activates RUNNING at the tail of the
+         * launch, on a worker thread, while the WAITPID/IOF join that
+         * records the termination runs on the progress thread - so a proc
+         * short-lived enough to die and be reaped before the launch path
+         * finishes gets its terminated state overwritten here, microseconds
+         * after it was set. What the daemon then packs for it in the launch
+         * and termination updates is RUNNING, and since the join has already
+         * fired there is nothing left to correct it: the HNP believes that
+         * proc is alive for the rest of the DVM's life, the job never
+         * completes, terminate_orteds is never called, and prterun hangs
+         * with every daemon still up.
+         *
+         * The WAITPID_FIRED arm below guards the opposite order for the same
+         * reason ("do NOT update the proc state..."); this is that guard's
+         * missing half. The launch accounting still has to advance - it is
+         * what gates LOCAL_LAUNCH_COMPLETE - so count the proc either way
+         * and only leave its state alone. */
+        if (!PRTE_FLAG_TEST(pdata, PRTE_PROC_FLAG_RECORDED)) {
+            /* update the proc state */
+            pdata->state = state;
+        }
         jdata->num_launched++;
         if (jdata->num_launched == jdata->num_local_procs) {
             /* tell the state machine that all local procs for this job
@@ -657,11 +688,19 @@ static void job_teardown(int fd, short argc, void *cbdata)
         prte_state_base_notify_data_server(&target);
     }
 
-    /* cleanup the job info.  The caddy still holds a reference of its own,
-     * so the object survives until it is released below. */
-    pmix_pointer_array_set_item(prte_job_data, jdata->index, NULL);
-    PMIX_RELEASE(jdata);
-
+    /* The resources are back, but the JOB OBJECT STAYS until the DVM says
+     * the job is over everywhere - prted_comm.c's DVM_CLEANUP_JOB.
+     *
+     * What we hold about a proc we hosted is the only copy of it: its
+     * placement and, since the launch message started scattering them, its
+     * binding.  This daemon finishing its own share says nothing about the
+     * rest of the job, and a peer still running on another node can ask us
+     * about one of these procs at any time until it does.  Releasing here
+     * answered those questions with silence - measured on peerinfo, 50 of
+     * 56 peer bindings when two daemons happened to finish early.
+     *
+     * Only the caddy's reference is dropped here; the one the job array
+     * holds is what keeps the object alive. */
     PMIX_RELEASE(caddy);
 }
 

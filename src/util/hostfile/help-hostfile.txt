@@ -60,6 +60,14 @@ including a designated number of "slots":
 
 Blank lines and lines beginning with a "#" are ignored.
 
+A node name may carry the account PRRTE is to use when reaching that
+node, written in front of it and separated by a single "@":
+
+   user01@node01  slots=4
+
+An entry may contain at most one "@"; a second one is reported as a
+parse error naming the hostfile and the line it is on.
+
 A "slot" is the PRRTE term for an allocatable unit where we can launch
 a process.  See the section on definition of the term "slot" for a
 longer description of slots.
@@ -252,6 +260,15 @@ PRTE was unable to open the hostfile:
 
 Check to make sure the path and filename are correct.
 #
+[not-a-file]
+
+The hostfile given is not a regular file:
+
+   %s
+
+A directory (or a device, socket, or similar) cannot be read as a hostfile.
+Check to make sure the path and filename are correct.
+#
 [port]
 
 PRTE detected a bad parameter in the hostfile:
@@ -299,7 +316,7 @@ PRTE detected a parse error in the hostfile:
 
    %s
 
-It occured on line number %d on token %d:
+It occurred on line number %d on token %d:
 
    %s
 #
@@ -309,9 +326,22 @@ PRTE detected a parse error in the hostfile:
 
    %s
 
-It occured on line number %d on token %d:
+It occurred on line number %d on token %d:
 
    %d
+#
+[user-host]
+
+PRTE detected a parse error in the hostfile:
+
+   %s
+
+The entry on line number %d contains more than one "@" separator:
+
+   %s
+
+An entry may name at most one user, in the form "user@hostname". Please
+correct the hostfile and try again.
 #
 [parse_error]
 
@@ -319,7 +349,7 @@ PRTE detected a parse error in the hostfile:
 
    %s
 
-It occured on line number %d on token %d.
+It occurred on line number %d on token %d.
 #
 [not-all-mapped-alloc]
 

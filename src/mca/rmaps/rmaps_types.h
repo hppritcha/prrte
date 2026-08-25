@@ -143,20 +143,42 @@ typedef struct {
      * gave two apps the same ranks, and the second app's procs then replaced
      * the first's in jdata->procs. */
     uint32_t start_vpid;
-    char *dist_device;  /* device name for dist mapping, from PRTE_APP_DIST_DEVICE */
+    /* the --map-by device= spec: a device class ("gpu") or the name or
+     * uuid of one device. Owned by the struct - it comes out of an
+     * attribute, which returns a copy. */
+    char *map_device;
+    /* the level the device list is interleaved across, from
+     * --map-by device=X:interleave[=level]; NULL when not asked for.
+     * Owned by the struct. */
+    char *map_interleave;
+    /* whether several procs may be assigned the same device, from
+     * --map-by device=X:shared. False by default: a device is assigned to
+     * a proc rather than subdivided between them. */
+    bool map_shared;
+    /* how many devices each proc is assigned, from
+     * --map-by device=X:ndev=N. Zero means the default of one. */
+    uint16_t map_ndev;
 
 } prte_rmaps_options_t;
 
 
-/*
- **
- * Macro for use in components that are of type rmaps
- */
-#define PRTE_RMAPS_BASE_VERSION_5_0_0 PRTE_MCA_BASE_VERSION_3_0_0("rmaps", 5, 0, 0)
-/* deprecated alias — out-of-tree components get a version mismatch rather than
- * a silent ABI violation */
-#undef  PRTE_RMAPS_BASE_VERSION_4_0_0
-#define PRTE_RMAPS_BASE_VERSION_4_0_0 PRTE_RMAPS_BASE_VERSION_5_0_0
+/* The rmaps framework interface version. It is stated here and nowhere
+ * else: components stamp it into their struct with
+ * PRTE_MCA_BASE_VERSION(rmaps), and the framework's declaration reaches
+ * the same three by pasting its name, so the two cannot drift apart.
+ * Bump it on any change to the module interface that a component built
+ * against the previous one would not survive. */
+#define PRTE_MCA_rmaps_MAJOR_VERSION   5
+#define PRTE_MCA_rmaps_MINOR_VERSION   0
+#define PRTE_MCA_rmaps_RELEASE_VERSION 0
+/* The PRTE_RMAPS_BASE_VERSION_4_0_0 alias that used to sit here is gone
+ * along with the numbered macros generally. It aliased to the 5.0.0
+ * definition, so an out-of-tree component using that spelling stamped
+ * 5.0.0 and passed for current - the opposite of the "version mismatch
+ * rather than a silent ABI violation" it was there to produce. Now that
+ * the framework states its version and the loader checks it, a component
+ * genuinely built against rmaps 4.0.0 is refused on its own merits, and
+ * one carrying the old spelling fails to compile rather than lying. */
 
 /* define map-related directives */
 #define PRTE_MAPPING_NO_USE_LOCAL     0x0100
@@ -187,7 +209,7 @@ typedef struct {
 #define PRTE_MAPPING_BYHWTHREAD  8
 /* now take the other round-robin options */
 #define PRTE_MAPPING_BYSLOT      9
-#define PRTE_MAPPING_BYDIST     10
+#define PRTE_MAPPING_BYDEVICE   10
 #define PRTE_MAPPING_PELIST     11
 /* convenience - declare anything <= 15 to be round-robin*/
 #define PRTE_MAPPING_RR         16

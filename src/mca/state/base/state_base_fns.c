@@ -34,12 +34,15 @@
 
 #include "src/mca/errmgr/errmgr.h"
 #include "src/mca/iof/base/base.h"
+#include "src/mca/plm/plm.h"
 #include "src/mca/rmaps/base/base.h"
 #include "src/rml/rml.h"
 #include "src/prted/pmix/pmix_server_internal.h"
 #include "src/runtime/data_server/prte_data_server.h"
 #include "src/runtime/prte_globals.h"
 #include "src/threads/pmix_threads.h"
+#include "src/util/name_fns.h"
+#include "src/util/prte_show_help.h"
 
 #include "src/mca/state/base/base.h"
 
@@ -48,6 +51,15 @@ void prte_state_base_activate_job_state(prte_job_t *jdata, prte_job_state_t stat
     pmix_list_item_t *itm, *any = NULL, *error = NULL;
     prte_state_t *s;
     prte_state_caddy_t *caddy;
+
+    /* The state log records the moment a transition was ORDERED, which is
+     * here - the dispatch below only queues the handler.  It is deliberately
+     * ahead of everything else, so that a state nothing is registered for
+     * still appears in the record: that a transition was ordered and then
+     * dropped is exactly what the log exists to show. */
+    if (prte_state_base.log_jobstate) {
+        prte_state_base_log_job(jdata, state);
+    }
 
     for (itm = pmix_list_get_first(&prte_job_states); itm != pmix_list_get_end(&prte_job_states);
          itm = pmix_list_get_next(itm)) {
@@ -193,6 +205,11 @@ void prte_state_base_activate_proc_state(pmix_proc_t *proc, prte_proc_state_t st
     pmix_list_item_t *itm, *any = NULL, *error = NULL;
     prte_state_t *s;
     prte_state_caddy_t *caddy;
+
+    /* as above: log the order, not the dispatch */
+    if (prte_state_base.log_procstate) {
+        prte_state_base_log_proc(proc, state);
+    }
 
     /* the proc machine is keyed entirely on the name - there is nothing
      * to dispatch without one */
@@ -373,6 +390,7 @@ void prte_state_base_notify_data_server(pmix_proc_t *target)
     pmix_data_buffer_t *buf;
     int rc, room = -1;
     uint8_t cmd = PRTE_PMIX_PURGE_PROC_CMD;
+    size_t ninfo;
 
     /* if nobody local to us published anything, then we can ignore this */
     if (PMIX_NSPACE_INVALID(prte_pmix_server_globals.server.nspace)) {
@@ -405,12 +423,149 @@ void prte_state_base_notify_data_server(pmix_proc_t *target)
         return;
     }
 
-    /* send the request to the server */
-    PRTE_RML_RELIABLE_SEND(rc, prte_pmix_server_globals.server.rank,
+    /* no directives of our own - the count still has to be there, as the
+     * command carries one and the reader unpacks it unconditionally */
+    ninfo = 0;
+    rc = PMIx_Data_pack(NULL, buf, &ninfo, 1, PMIX_SIZE);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        PMIX_DATA_BUFFER_RELEASE(buf);
+        return;
+    }
+
+    /* Send the request to the server.  An external data server is not
+     * addressable over the RML - only the master holds the PMIx connection
+     * to it - so the request goes to the master, which relays it. */
+    PRTE_RML_RELIABLE_SEND(rc, (NULL == prte_data_server_uri)
+                                   ? prte_pmix_server_globals.server.rank
+                                   : PRTE_PROC_MY_HNP->rank,
                   buf, PRTE_RML_TAG_DATA_SERVER);
     if (PRTE_SUCCESS != rc) {
         PMIX_DATA_BUFFER_RELEASE(buf);
     }
+}
+
+/* A proc reported a state and we hold no job object to account it against.
+ *
+ * Both track_procs implementations used to drop such a report with a bare
+ * "goto cleanup", and the silence is what turned a lost job object into a
+ * hang.  Every conclusion about a job is derived HERE, from the job object:
+ * the per-proc counting, the TERMINATED activation it rolls up into, and -
+ * on a one-shot DVM - the "is anything still alive?" scan that only ever
+ * runs when a job reaches TERMINATED.  With no job object none of that
+ * happens, so the DVM waits forever on a job it can no longer see, having
+ * said nothing about why.  (Seen when a spawned job's object was released
+ * one reference early: prterun never exited, and the only output was an
+ * odls "Not found" naming a file and a line.)
+ *
+ * The job itself cannot be recovered - it is gone.  What is still owed is a
+ * report saying so, and a conclusion: a runtime that has lost a job must
+ * stop waiting for it rather than hang.  Nothing here concludes while any
+ * local child is still running, so a straggler is not torn down under.
+ */
+void prte_state_base_orphaned_proc(pmix_proc_t *proc, prte_proc_state_t state)
+{
+    prte_proc_t *proct;
+    prte_job_t *jptr;
+    int i;
+
+    /* Only a report that the process is really gone matters.  The callers are
+     * also reached by the running states (RUNNING, REGISTERED, IOF_COMPLETE,
+     * ...), and those have nothing to account for - complaining about each of
+     * them would bury the one report that does.  Everything above
+     * PRTE_PROC_STATE_ERROR is a way of having died, and with the job gone
+     * none of them is recoverable, so they all count. */
+    if (PRTE_PROC_STATE_WAITPID_FIRED != state &&
+        PRTE_PROC_STATE_TERMINATED != state &&
+        PRTE_PROC_STATE_ERROR >= state) {
+        return;
+    }
+
+    /* A teardown in progress releases job objects as it goes, so procs
+     * reported during one are expected to find no job and there is nothing
+     * left to conclude - the conclusion has already been reached. */
+    if (prte_finalizing || prte_abnormal_term_ordered) {
+        return;
+    }
+
+    prte_show_help("help-state-base.txt", "orphaned-proc", true,
+                   PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(proc));
+
+    /* Retire the proc ourselves.  Clearing PRTE_PROC_FLAG_ALIVE and dropping
+     * the PMIx client are done by the accounted TERMINATED path below, which
+     * reaches the proc THROUGH the job object - so with no job object the
+     * proc stays marked alive forever, and every "is anything still running?"
+     * test in the runtime (including the one right below) answers yes.  The
+     * proc object itself is still perfectly good; only the job that owned it
+     * is gone, and prte_local_children holds the daemon's own reference. */
+    for (i = 0; i < prte_local_children->size; i++) {
+        proct = (prte_proc_t *) pmix_pointer_array_get_item(prte_local_children, i);
+        if (NULL == proct || !PMIX_CHECK_PROCID(&proct->name, proc)) {
+            continue;
+        }
+        if (PRTE_FLAG_TEST(proct, PRTE_PROC_FLAG_ALIVE)) {
+            PRTE_FLAG_UNSET(proct, PRTE_PROC_FLAG_ALIVE);
+            PMIx_server_deregister_client(proc, NULL, NULL);
+        }
+        if (proct->state < PRTE_PROC_STATE_TERMINATED) {
+            proct->state = PRTE_PROC_STATE_TERMINATED;
+        }
+        break;
+    }
+
+    /* nothing concludes while a local child is still running - this is the
+     * same guard the accounted termination paths apply before exiting */
+    for (i = 0; i < prte_local_children->size; i++) {
+        proct = (prte_proc_t *) pmix_pointer_array_get_item(prte_local_children, i);
+        if (NULL != proct && PRTE_FLAG_TEST(proct, PRTE_PROC_FLAG_ALIVE)) {
+            pmix_output_verbose(5, prte_state_base_framework.framework_output,
+                                "%s state:base orphaned proc %s, but %s is still alive",
+                                PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(proc),
+                                PRTE_NAME_PRINT(&proct->name));
+            return;
+        }
+    }
+
+    if (!PRTE_PROC_IS_MASTER) {
+        /* a daemon concludes only when it has been told to go and its routes
+         * are gone - the identical condition its accounted path checks */
+        if (prte_prteds_term_ordered && 0 == prte_rml_base.n_children) {
+            pmix_output_verbose(5, prte_state_base_framework.framework_output,
+                                "%s state:base orphaned proc, all routes and children gone"
+                                " - exiting",
+                                PRTE_NAME_PRINT(PRTE_PROC_MY_NAME));
+            PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_DAEMONS_TERMINATED);
+        }
+        return;
+    }
+
+    /* On the master: a persistent DVM outlives its jobs and must stay up
+     * whatever it has lost - a later job is still perfectly launchable.  A
+     * one-shot DVM exists only to run these jobs, so once none of the ones
+     * it CAN still see is running, it has to end.  prte_prteds_term_ordered
+     * says the teardown is already under way (terminate_orteds sets it), so
+     * this stays a one-shot however many orphans arrive. */
+    if (prte_persistent || prte_prteds_term_ordered) {
+        return;
+    }
+    for (i = 0; i < prte_job_data->size; i++) {
+        jptr = (prte_job_t *) pmix_pointer_array_get_item(prte_job_data, i);
+        if (NULL == jptr ||
+            PMIX_CHECK_NSPACE(jptr->nspace, PRTE_PROC_MY_NAME->nspace)) {
+            continue;
+        }
+        if (jptr->state < PRTE_JOB_STATE_TERMINATED) {
+            /* something we can still account for is running */
+            return;
+        }
+    }
+
+    pmix_output_verbose(5, prte_state_base_framework.framework_output,
+                        "%s state:base orphaned proc and no job left running - terminating",
+                        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME));
+    /* the run did not do what was asked of it - do not report success */
+    PRTE_UPDATE_EXIT_STATUS(1);
+    prte_plm.terminate_orteds();
 }
 
 void prte_state_base_track_procs(int fd, short argc, void *cbdata)
@@ -436,6 +591,7 @@ void prte_state_base_track_procs(int fd, short argc, void *cbdata)
 
     /* get the job object for this proc */
     if (NULL == (jdata = prte_get_job_data_object(proc->nspace))) {
+        prte_state_base_orphaned_proc(proc, state);
         goto cleanup;
     }
     if (PRTE_PROC_STATE_READY_FOR_DEBUG == state) {
@@ -543,6 +699,15 @@ void prte_state_base_track_procs(int fd, short argc, void *cbdata)
             goto cleanup;
         }
         PRTE_FLAG_SET(pdata, PRTE_PROC_FLAG_RECORDED);
+
+        /* If this proc was connected to others, they are owed an event: the
+         * PMIx definition of "connected" is that a member which departs
+         * without first calling PMIx_Disconnect is a reportable event for
+         * the rest of the assemblage.  This is the one place that sees every
+         * proc in the DVM stop, whether it exited, failed, or was on a node
+         * whose daemon died, and the RECORDED flag just set above is what
+         * makes it exactly once per proc. */
+        prte_pmix_server_connection_terminated(pdata);
 
         /* update the proc state */
         PRTE_FLAG_UNSET(pdata, PRTE_PROC_FLAG_ALIVE);

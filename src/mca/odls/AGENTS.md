@@ -118,7 +118,7 @@ returning up the stack, because the launch runs asynchronously on the
 event loop (`PRTE_ACTIVATE_PROC_STATE(..., PRTE_PROC_STATE_FAILED_TO_LAUNCH)`,
 `PRTE_ACTIVATE_JOB_STATE(..., PRTE_JOB_STATE_NEVER_LAUNCHED)`).
 
-The version macro is `PRTE_ODLS_BASE_VERSION_2_0_0`.
+The version macro is `PRTE_MCA_BASE_VERSION(odls)`.
 
 ---
 
@@ -143,56 +143,10 @@ Because there is only one component and it delegates almost everything,
 message construction, parsing, wireup, environment assembly, threading,
 `waitpid` interpretation, and cleanup. Walk these in order.
 
-### 1. Framework globals and the spawn-thread pool (`odls_base_frame.c`)
+### 1. Framework globals (`odls_base_frame.c`)
 
 `prte_odls_globals` (`prte_odls_globals_t` in `base.h`) holds:
 
-- **`ev_bases` / `ev_threads` / `num_threads` / `max_threads` / `cutoff` /
-  `next_base`** — a pool of libevent progress threads used to *parallelize
-  forking* when a node hosts many local procs. `prte_odls_base_start_threads()`
-  decides how many to spin up: a persistent DVM uses `max_threads` (default
-  16); otherwise, below `cutoff` (default 32) local procs it uses **zero**
-  dedicated threads (fork straight on `prte_event_base`), and above it
-  scales to `num_local_procs / 8` capped at `max_threads`.
-  `prte_odls_base_harvest_threads()` tears them down and resets the pool
-  state to "nothing built yet".
-
-  Two things about this that are easy to get wrong, because both failures
-  are invisible:
-  - **"Have we built a pool?" is `ev_bases != NULL`, not
-    `ev_threads != NULL`.** `ev_threads` holds the *names* of dedicated
-    threads and stays NULL whenever the answer was "no dedicated threads
-    at all", so keying the guard off it re-entered the sizing code on
-    every job.
-  - **`num_threads` is both the request and the answer**, which makes it
-    dangerous to reset. It is registered at `-1` ("you decide") and
-    `start_threads` *overwrites* it with the size it picked. So `-1` in
-    that variable is a standing invitation to size a pool from whatever
-    job comes next — and `harvest_threads` runs from framework **close**.
-    Putting the sentinel back there let a `start_threads` call arriving
-    during teardown build a whole new pool of real threads on the way out
-    (a 40-proc node printed `START 5 LAUNCH THREADS` twice, the second
-    time after `kill_local_procs`). Harvest records `0` — "no threads" —
-    and `start_threads` returns immediately once `prte_finalizing` is set.
-    Do not "restore" the sentinel there.
-
-  **`prte_persistent` is what makes the difference here, and a daemon has
-  to be *told* it.** `start_threads` short-circuits to `max_threads` (16)
-  when `prte_persistent` is set, on the reasoning that a persistent DVM
-  will service many jobs and should size for the worst of them. That flag
-  is decided in `prte()` (`src/prted/prte.c`) — which only the HNP runs.
-  It used to default to **true** and be assigned nowhere else, so every
-  daemon believed it was persistent no matter how the DVM had started: a
-  plain `prterun -n 1 hostname` spun 16 progress threads on each compute
-  node, and the cutoff/`num_local_procs / 8` scaling below was dead
-  everywhere but the head node. It is now an MCA parameter that the HNP
-  appends to each daemon's command line
-  (`prte_plm_base_prted_append_basic_args`), defaulting to false; a
-  bootstrapped daemon, which has no launcher to tell it anything, sets it
-  for itself because that DVM is persistent by construction. If you add
-  daemon-side code that reads `prte_persistent`, it now means what it
-  says — but check `--prtemca odls_base_verbose 5` for `START n LAUNCH
-  THREADS` if you are ever unsure which way a given daemon decided.
 - **`xterm_ranks` / `xtermcmd`** — support for `--xterm`: a list of ranks
   whose output should be shown in separate `xterm` windows, parsed at
   framework open from the `prte_xterm` global.
@@ -200,11 +154,32 @@ message construction, parsing, wireup, environment assembly, threading,
   go to the child only or its whole process group.
 - **`exec_agent`** — an optional wrapper command to exec instead of the app.
 
-MCA params, all under `prte odls base`: `max_threads`, `num_threads`,
-`cutoff`, `signal_direct_children_only`, `exec_agent`. Framework open also
-**unblocks `SIGCHLD`** (odls must see child deaths) and builds the xterm
-command vector. Framework close reaps the thread pool and releases the
-global `prte_local_children` array.
+**Forking is parallelized on the process-wide worker pool, which odls does
+not own.** The launch walk asks `prte_worker_pool_assign()`
+([`src/runtime/prte_worker_pool.h`](../../runtime/prte_worker_pool.h)) for a
+base per child and posts the fork there; the pool is sized by
+`prte_num_worker_threads` (default 8) and is shared with the OOB, which puts
+peer sockets on the same threads. odls used to carry a pool of its own —
+`ev_bases`/`ev_threads`/`num_threads`/`max_threads`/`cutoff`/`next_base`, sized
+from the first job it was handed — and every one of those fields and
+parameters is gone. Two of its failure modes are worth remembering, because
+anything that reintroduces per-subsystem sizing invites them back: the "have
+we built a pool yet?" guard has to key off the pool itself and not off the
+*names* of the threads (which stay NULL whenever the answer was "no dedicated
+threads"), and a variable that is both the request and the answer must not
+have its "you decide" sentinel restored by a teardown path, or a call arriving
+during finalize builds a whole new set of real threads on the way out.
+
+MCA params, all under `prte odls base`: `signal_direct_children_only`,
+`exec_agent`, `scatter_cpusets`, and `fork_publish_delay` — a
+fault-injection hook, like `prte_daemon_fail`, that stalls between the
+fork and the store of the child's pid so the launch/reap race described
+below can be reproduced deterministically from a single `prterun`. It is
+**not** restricted to a debug build, on purpose: an optimized build is a
+different race, so a hook that exists only in a debug one cannot say
+anything about the build that ships. Framework open also **unblocks `SIGCHLD`**
+(odls must see child deaths) and builds the xterm command vector. Framework
+close releases the global `prte_local_children` array.
 
 This file also defines the two caddy classes (below) via
 `PMIX_CLASS_INSTANCE`.
@@ -245,6 +220,8 @@ message cost per proc before any of this. `plm_base_verbose 2` prints the
 size; `--rtos donotlaunch` will size a job of any shape without launching
 it.
 
+**And the cpuset does not go in this message at all** — see 2a below.
+
 It then calls `PMIx_server_setup_application()` **asynchronously and does
 not wait**. It returns `PRTE_SUCCESS` immediately, having handed a
 `prte_odls_jcaddy_t` to PMIx; the completion callback `setup_cbfunc()`
@@ -255,6 +232,68 @@ activates `PRTE_JOB_STATE_SEND_LAUNCH_MSG` — which is what actually
 continues the launch. **Nothing blocks**: a `PRTE_SUCCESS` return here
 means "the callback will fire", and an error return means it never will
 (the caddy is released on the spot).
+
+### 2a. The half addressed to one daemon — `prte_odls_base_send_cpuset_slices()`
+
+A proc's binding is read by exactly one daemon, the one that forks it, and
+it is the largest of the three things a proc still costs the launch message
+(~6 B/proc raw on a 176-core node, ~40% of the message). Broadcasting it
+put every daemon's bindings on every link of the tree. So the launch message
+is packed `PRTE_JOB_PACK_NO_CPUSETS` and each daemon is sent its own
+bindings point to point, from `prte_plm_base_send_launch_msg()` immediately
+before the broadcast. No new data movement was needed: `prte_rml_get_route()`
+sends each one toward its target, so the bytes leaving the master are the
+*sum* of the slices rather than the sum replicated per daemon.
+
+The slice is `nspace`, a count, and then `(rank, cpuset)` per proc. **The
+rank is carried, not implied by position** — the receiver would otherwise
+have to reproduce the order the sender's loop happened to walk in, and
+getting that wrong binds processes to each other's cpus without failing
+anywhere.
+
+**The two halves are independent messages and arrive in either order.**
+Neither order is the rare one — the broadcast takes more hops, the slices
+are sent one at a time — so both are handled the same way, by a rendezvous
+on `prte_odls_globals.pending_slices`: whichever arrives first parks, and
+whichever arrives second finds it and completes the launch.
+`construct_child_list` therefore does **not** always register the nspace
+before it returns; when it parks, `prte_odls_base_recv_cpuset_slice()` is
+what calls `start_registration()` later. Both run on `prte_event_base`, so
+the list needs no lock.
+
+Three cases that must not wait, and each is a hang if you get it wrong:
+
+- **the master**, which keeps its own fully populated job object and is
+  never sent a slice;
+- **a daemon hosting none of the job's procs** — the broadcast reaches every
+  daemon, the slices only the ones in the map. It has nothing to bind, so
+  it waits for nothing (and discards anything parked for that job);
+- **`PRTE_JOB_PACK_ALL`**, the shape a spawn request and the job catchup
+  use, where the cpusets were in the buffer all along. The receiver keys off
+  the mode byte it unpacked, not off its own MCA parameter, so a daemon can
+  never wait for a slice the master did not send.
+
+`--prtemca odls_base_scatter_cpusets 0` turns it off and broadcasts the
+bindings as before; it is an A/B switch, not a supported difference in
+behavior.
+
+**What this costs:** a daemon no longer *holds* the binding of a proc it
+does not host, so a `PMIx_Get` for a remote proc's `PMIX_CPUSET` or
+`PMIX_LOCALITY_STRING` becomes a direct modex to the daemon that does -
+which answers it out of its own job object without waiting on the process.
+The value is unchanged; what it costs is one round trip, once, since PMIx
+caches the reply. Nothing else on a proc is affected, and a proc on the
+asker's own node - the only place a locality string means anything - is
+held locally as before.
+
+**Three states that had to be told apart** to make that referral safe, and
+the whole of [`src/prted/pmix/AGENTS.md`](../../prted/pmix/AGENTS.md)'s
+dmodex section is about them. The hosting daemon may not have the answer
+*yet* (its own slice is still in flight - `prte_odls_base_awaiting_cpusets()`
+says so, and the request waits); it may never have it *again* (its share of
+the job finished and it released the job object - it answers NOT_FOUND);
+or it may simply not have been reached by the launch message yet (it waits).
+Confusing the second with the third is a hang with nothing logged.
 
 ### 3. Parsing the message and wiring up — `prte_odls_base_default_construct_child_list()`
 
@@ -403,8 +442,9 @@ Binding is split across the fork so the child stays async-signal-safe:
   the async-signal-safe window before `execve`. It only *issues the bind
   syscalls*: a bare `sched_setaffinity` with the precomputed mask on Linux,
   or `hwloc_set_cpubind` as the `#else` fallback (macOS and other platforms
-  without `sched_setaffinity`), plus `hwloc_set_membind`. It allocates
-  nothing and renders nothing.
+  without `sched_setaffinity`), and a bare `set_mempolicy` with the
+  precomputed mode and nodemask (`hwloc_set_membind` as the `#else`). It
+  allocates nothing and renders nothing.
 
 Because the child is not a real PRTE process — and runs in that
 async-signal-safe window — **it cannot use normal error reporting or
@@ -420,10 +460,54 @@ warning depends on `PRTE_BINDING_REQUIRED` and `PRTE_BINDING_POLICY_IS_SET`
 defaulted one degrades to a warning). If the proc has no cpuset but the
 daemon itself is bound, the proc is "freed" to all allowed cpus.
 
-The one remaining hwloc call in the child is `hwloc_set_membind` (memory
-binding), which still allocates internally; converting it to a bare
-`set_mempolicy`/`mbind` syscall would mean reproducing hwloc's NUMA
-nodeset handling and is left for later.
+**The child calls into hwloc on no platform that has the syscalls.** Both
+bind calls hwloc offers allocate — `hwloc_set_membind` several times, on its
+way to the single `set_mempolicy(2)` it issues underneath — and a `malloc`
+in a forked child deadlocks whenever another thread of the daemon held the
+arena lock at `fork` time. The daemon is multi-threaded (the PMIx progress
+thread, plus the shared worker pool the forks themselves run on), so that
+window is real. `prte_odls_base_prepare_mempolicy()` therefore does hwloc's
+work in the parent: the cpuset→nodeset conversion (`hwloc_set_membind` →
+`hwloc_fix_membind_cpuset` → `hwloc_fix_membind`), the policy→`MPOL_*`
+translation, and the kernel nodemask
+(`hwloc_linux_membind_mask_from_nodeset`). It is compiled on every platform,
+not only the ones that can issue the syscall, so that the unit test covers
+it wherever it runs; `PRTE_HAVE_SET_MEMPOLICY` (`config/prte_check_mempolicy.m4`)
+gates only the syscall, with the old `hwloc_set_membind` left as the `#else`.
+
+Three decisions the parent makes so the child has only the one call left:
+
+- **A topology that is not this machine gets no memory binding at all.**
+  Under `hwloc_use_topo_file` the topology describes some *other* machine,
+  and hwloc gives such a topology no-op binding hooks that report success
+  without touching anything. Aiming a real `set_mempolicy` at another
+  machine's NUMA numbering would not be reproducing that — it would be
+  binding a process by numbers that mean nothing here — so `do_membind` is
+  cleared. (Note the asymmetry with *cpu* binding, which goes through
+  `sched_setaffinity` and *is* applied from such a topology.)
+- **A platform with no memory binding is answered as hwloc would**, with
+  `ENOSYS` recorded in `cd->membind_prep_errno` for the child to report.
+  The support bits are read through `hwloc_topology_get_support()` and are
+  only meaningful for a this-system topology — `set_topology()` in
+  [`src/hwloc/hwloc_base_util.c`](../../hwloc/hwloc_base_util.c) asserts
+  them back on for an imported one, so they say nothing there.
+- **Only `MPOL_DEFAULT` and `MPOL_BIND` are expressed**, because
+  `prte_hwloc_base_map` only ever asks for `HWLOC_MEMBIND_DEFAULT` or
+  `HWLOC_MEMBIND_BIND|STRICT`. Anything else records `ENOSYS` rather than
+  guessing. If a third memory policy is ever added, this is what has to
+  grow with it.
+
+**A failure to apply the *default* policy is not a memory-binding failure.**
+With `mem_alloc_policy=none` — the default — the call is a reset to the
+system default, not a binding: nothing ends up bound to the wrong place and
+nothing is degraded, so it is not reported at all, whatever the errno and
+whatever `mem_bind_failure_action` says (that parameter governs an explicit
+binding, and its own help text says so). The rule used to be narrower —
+`ENOSYS` alone — which covered the platform that *cannot* bind memory but
+not the one that *refuses* to: Docker's default seccomp profile denies
+`set_mempolicy` with `EPERM`, and every bound launch inside a container
+announced that "the memory was left unbound", aborting the job outright
+under `mem_bind_failure_action=error`.
 
 ### 7. Reaping children — `prte_odls_base_default_wait_local_proc()`
 
@@ -486,11 +570,12 @@ computed proc state.
 - **Message build/parse, wireup, waitpid interpretation, kill/signal, and
   state activation** all run on the **progress thread** (`prte_event_base`)
   — the normal PRRTE event-driven model.
-- **Only the fork/exec spawn step** may be off-loaded to the **odls
-  worker-thread pool** (`prte_odls_globals.ev_bases`) to parallelize
-  launching many procs. Each spawn is a self-contained caddy handed to one
-  worker base; it touches only its own child, so no shared-state locking is
-  needed on the hot path.
+- **Only the fork/exec spawn step** may be off-loaded to the **process-wide
+  worker pool** (`prte_worker_pool_assign()`) to parallelize launching many
+  procs. Each spawn is a self-contained caddy handed to one worker base; it
+  touches only its own child, so no shared-state locking is needed on the hot
+  path. The pool is shared with the OOB — a worker base servicing your fork
+  may also be servicing a peer socket.
 - `SIGCHLD` must stay unblocked (done at framework open); child death is
   delivered through `src/runtime/prte_wait.c`, which fires the registered
   `wait_local_proc` callback on `prte_event_base`.
@@ -591,6 +676,14 @@ computed proc state.
   a bare `return` in the middle — a stray `return` there both leaks and, on
   the daemon side, skips the `NEVER_LAUNCHED` activation that keeps the HNP
   from hanging.
+- **A child must not be able to die before its pid is recorded.** The fork
+  happens on a worker thread, and the `SIGCHLD` reaper on the progress
+  thread has nothing but `child->pid` with which to attribute what it
+  reaps — a status it cannot attribute is discarded, and the proc then
+  never leaves `RUNNING` and the job never completes. `fork_local_proc`
+  holds the child on a second pipe until the store is done; see
+  [`pdefault/AGENTS.md`](pdefault/AGENTS.md), "The gate". A fork primitive
+  added to a new component owes the same.
 - **A launch that never forked owes a `prte_wait_cb_cancel`.**
   `launch_local` flags a child `ALIVE` and registers its waitpid *before*
   the IOF setup and the dispatch to `spawn_proc`, so anything that fails in
@@ -651,9 +744,9 @@ prun --xterm 0,1 ...                        # route ranks 0,1 to xterm windows (
 prun --report-bindings ...                  # print each child's applied binding (odls_base_bind.c)
 ```
 
-Useful tuning params: `--prtemca odls_base_num_threads N` /
-`odls_base_cutoff N` (spawn-thread pool sizing),
-`--prtemca odls_base_exec_agent CMD` (wrap every exec),
+Useful tuning params: `--prtemca prte_num_worker_threads N` (the process-wide
+worker pool the forks are dispatched to; `0` forks on the main progress
+thread), `--prtemca odls_base_exec_agent CMD` (wrap every exec),
 `--prtemca odls_base_signal_direct_children_only 1` (don't signal the
 child's whole process group).
 
@@ -705,7 +798,7 @@ code sorts after every fatal code); and the two caddy classes
 the documented NULL/zero defaults and destruct cleanly (both the
 all-NULL and the fully-populated paths).
 
-Three cases go further than structure, because the code under them is a
+Two cases go further than structure, because the code under them is a
 pure function of its inputs:
 
 - **`prte_odls_base_process_envars`** — exported (rather than file-static)
@@ -716,11 +809,10 @@ pure function of its inputs:
 - **The child→parent pipe record** — `child_warn` across a real pipe, and
   `child_fail` across a real `fork`, checking both the decoded record and
   that the child died with the exit status it was handed.
-- **The spawn-thread pool sizing** — that the "already built?" guard and
-  the `-1` sentinel survive a `harvest_threads`. The persistent-DVM branch
-  is *not* exercised: it spins `max_threads` real progress threads, which a
-  bare test process cannot start and stop, so the test clears
-  `prte_persistent` first.
+
+The worker pool the spawns are dispatched to is no longer odls's, so its
+sizing and rotation are covered in `test/unit/runtime/test_runtime.c`
+(`test_worker_pool`) rather than here.
 
 Add structural regression guards here; anything that needs a running
 launch belongs in the swarm harness or the integration harness.
