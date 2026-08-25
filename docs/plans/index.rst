@@ -7,8 +7,10 @@ Detailed implementation plans for in-progress and upcoming features.
    :maxdepth: 2
 
    per_app_mapping/index.rst
+   per_device_mapping/index.rst
    node_reservation/index.rst
    elastic_dvm/index.rst
    bootstrap/index.rst
-   ft_group.rst
-   scalable_collectives.rst
+   ft_group/index.rst
+   scalable_collectives/index.rst
+   cross_dvm_data_server/index.rst

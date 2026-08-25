@@ -95,6 +95,7 @@
 
 #include "src/mca/errmgr/errmgr.h"
 #include "src/mca/ess/base/base.h"
+#include "src/mca/odls/base/base.h"
 #include "src/mca/odls/odls.h"
 #include "src/mca/plm/plm.h"
 #include "src/mca/rmaps/base/base.h"
@@ -635,7 +636,9 @@ PRTE_EXPORT int prte(int argc, char *argv[])
         }
 
         // open the ess framework so it can init the signal forwarding
-        // list - we don't actually need the components
+        // list - we don't actually need the components.  prun_common()
+        // closes it, because it has to be closed before PMIx_tool_finalize
+        // unloads our components with its own; see the note there.
         rc = pmix_mca_base_framework_open(&prte_ess_base_framework,
                                         PMIX_MCA_BASE_OPEN_DEFAULT);
         if (PMIX_SUCCESS != rc) {
@@ -645,7 +648,6 @@ PRTE_EXPORT int prte(int argc, char *argv[])
         }
         rc = prun_common(&results, schizo, argc, argv);
 
-        (void) pmix_mca_base_framework_close(&prte_ess_base_framework);
         exit(rc);
     }
 
@@ -1120,6 +1122,10 @@ PRTE_EXPORT int prte(int argc, char *argv[])
      * prte_daemon_recv ignores the tag it was delivered on. */
     PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_DAEMON_LAUNCH,
                   PRTE_RML_PERSISTENT, prte_daemon_recv, NULL);
+    /* The half of the launch message addressed to us alone: the bindings
+     * of the procs we are about to fork. */
+    PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_LAUNCH_SLICE,
+                  PRTE_RML_PERSISTENT, prte_odls_base_recv_cpuset_slice, NULL);
 
     /* setup to capture job-level info */
     PMIX_INFO_LIST_START(jinfo);
@@ -1349,7 +1355,12 @@ PRTE_EXPORT int prte(int argc, char *argv[])
     PRTE_PMIX_CONSTRUCT_LOCK(&lock);
     ret = PMIx_Spawn_nb(iptr, ninfo, papps, napps, spcbfunc, &lock);
     if (PMIX_SUCCESS != ret) {
-        pmix_output(0, "PMIx_Spawn failed (%d): %s", ret, PMIx_Error_string(ret));
+        /* SILENT means the DVM has already explained itself through
+         * show_help - restating it as a bare error code contradicts what the
+         * code means and buries the explanation the user was given */
+        if (PMIX_ERR_SILENT != ret) {
+            pmix_output(0, "PMIx_Spawn failed (%d): %s", ret, PMIx_Error_string(ret));
+        }
         rc = ret;
         PRTE_UPDATE_EXIT_STATUS(rc);
         goto DONE;
@@ -1367,9 +1378,12 @@ PRTE_EXPORT int prte(int argc, char *argv[])
          * trace of the failure is the status handed back through the
          * callback. Say the same thing the synchronous failure above says,
          * so which side of the call detected it is not something the user
-         * has to care about. */
-        pmix_output(0, "PMIx_Spawn failed (%d): %s", lock.status,
-                    PMIx_Error_string(lock.status));
+         * has to care about - including its silence on SILENT, which is the
+         * DVM saying it has already printed the explanation itself. */
+        if (PMIX_ERR_SILENT != lock.status) {
+            pmix_output(0, "PMIx_Spawn failed (%d): %s", lock.status,
+                        PMIx_Error_string(lock.status));
+        }
         rc = lock.status;
         PRTE_UPDATE_EXIT_STATUS(rc);
         goto DONE;

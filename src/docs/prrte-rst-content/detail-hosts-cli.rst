@@ -59,4 +59,47 @@ them is an error, reported as:
       Missing requested host: node9
 
 To bring a new host into a DVM that is already running, use
-``--add-host`` or ``--add-hostfile`` instead.
+``--add-host`` or ``--add-hostfile`` instead.  If the host is one the
+allocation already contains but that carries no daemon |mdash| because
+the DVM was started across only some of the allocation, or because a
+reservation holding it was released |mdash| use ``--activate``, which
+only starts a daemon and so is permitted even under a resource
+manager's allocation.
+
+The ``:slots`` count applies to *placement*, and not merely to the size
+of the job: it is the number of processes that may be placed on that
+host, whatever mapping policy is in effect. So
+
+.. code::
+
+   prterun --host node1:1,node2:1,node3:1 -n 3 ./app
+
+puts one process on each of the three hosts under every ``--map-by``
+directive, and not three on ``node1``.
+
+Asking for more slots on a host than it has depends on who decided how
+big the host is:
+
+* Under a resource manager, the number of slots on a host was set by
+  the scheduler, and PRRTE cannot hand a job more of a host than was
+  allocated to it. Naming a larger count is an error. Add the
+  ``:OVERSUBSCRIBE`` qualifier to your mapping directive if you really
+  do want more processes than slots.
+
+* Without a resource manager, the slot count is only a description you
+  gave PRRTE, so a larger ``:slots`` count re-states it: the host is
+  taken to have that many slots **for that job**. The allocation itself
+  is unchanged, and the next job sees the host at its original size.
+  Use ``--add-host`` to change the allocation.
+
+Permission to oversubscribe does not change how processes are spread
+over the hosts you named, only how many a host may end up with. Each
+host is given the number of slots you asked for first, and the processes
+left over after that are then divided evenly among the hosts. So
+
+.. code::
+
+   prterun --host a:2,b:2,c:2 -n 12 --map-by core:oversubscribe ./app
+
+puts four processes on each host, and not eight on ``a``. Every mapping
+directive divides the overflow the same way.

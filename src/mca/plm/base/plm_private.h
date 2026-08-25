@@ -94,6 +94,21 @@ PRTE_EXPORT bool prte_plm_base_grow_target_failed(pmix_rank_t rank);
 PRTE_EXPORT void prte_plm_base_reset_dvm_node(prte_node_t *node);
 PRTE_EXPORT bool prte_plm_base_job_needs_remap(prte_job_t *jdata);
 PRTE_EXPORT void prte_plm_base_reset_proc_map(prte_job_t *jdata);
+/* Record a requester for the NEXT grow campaign to answer.  A grow normally
+ * resolves its requesters from the session that owns the nodes it launches
+ * on; an activation creates no session (it names nodes the allocation already
+ * held), so its requester is carried here from the moment the request is
+ * granted until a campaign exists to answer it.  Only worth calling where a
+ * campaign is expected - i.e. in elastic mode - though an entry no campaign
+ * adopts is answered rather than stranded. */
+PRTE_EXPORT int prte_plm_base_add_grow_requester(const pmix_proc_t *requester,
+                                                 const char *alloc_id,
+                                                 const char *req_id);
+
+/* Answer, with failure, every requester still waiting for a campaign that
+ * will now never be recorded.  Called when the framework closes. */
+PRTE_EXPORT void prte_plm_base_flush_grow_requesters(void);
+
 /* emit the spec's phase-two completion event to the size-change requester:
  * PMIX_DVM_IS_READY when success, else PMIX_ERR_DVM_MOD carrying `cause`.
  * Compiles to a no-op when PMIx lacks the DVM modification event codes. */
@@ -107,6 +122,7 @@ PRTE_EXPORT void prte_plm_base_dvm_mod_notify(const pmix_proc_t *requester,
  * Utilities for plm components that use proxy daemons
  */
 PRTE_EXPORT int prte_plm_base_prted_exit(prte_daemon_cmd_flag_t command);
+PRTE_EXPORT int prte_plm_base_prted_exit_late(const pmix_proc_t *daemon);
 PRTE_EXPORT int prte_plm_base_prted_terminate_job(pmix_nspace_t jobid);
 PRTE_EXPORT int prte_plm_base_prted_kill_local_procs(pmix_pointer_array_t *procs);
 PRTE_EXPORT int prte_plm_base_prted_signal_local_procs(pmix_nspace_t job, int32_t signal);

@@ -1,6 +1,6 @@
 .. -*- rst -*-
 
-   Copyright (c) 2022-2023 Nanook Consulting.  All rights reserved.
+   Copyright (c) 2022-2026 Nanook Consulting.  All rights reserved.
    Copyright (c) 2023      Jeffrey M. Squyres.  All rights reserved.
 
    $COPYRIGHT$
@@ -35,6 +35,16 @@ including a designated number of "slots":
 
 Blank lines and lines beginning with a ``#`` are ignored.
 
+A node name may carry the account PRRTE is to use when reaching that
+node, written in front of it and separated by a single ``@``:
+
+.. code:: sh
+
+   user01@node01  slots=4
+
+An entry may contain at most one ``@``; a second one is reported as a
+parse error naming the hostfile and the line it is on.
+
 A "slot" is the PRRTE term for an allocatable unit where we can launch
 a process.  See the section on definition of the term ``slot`` for a
 longer description of slots.
@@ -46,3 +56,11 @@ RM.
 
 .. important:: If using a resource manager, the user-specified number
                of slots is capped by the RM-assigned value.
+
+A hostfile given to a job that is being submitted to an already-running
+DVM *selects within* the DVM's allocation: it names the subset of nodes
+that job may use, and a ``slots`` count smaller than the node's own is
+the number of slots that job may take there.  It says nothing about how
+big the node is, so it applies to that job alone |mdash| the node is
+back to its allocated size for the next job, which may be someone
+else's.  Changing the allocation is what ``--add-hostfile`` is for.

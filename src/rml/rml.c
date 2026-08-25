@@ -56,6 +56,7 @@ prte_rml_base_t prte_rml_base = {
     .global_failed_dmns = { .super = PMIX_OBJ_STATIC_INIT(pmix_bitmap_t) },
     .dead_dmns = { .super = PMIX_OBJ_STATIC_INIT(pmix_bitmap_t) },
     .absent_dmns = { .super = PMIX_OBJ_STATIC_INIT(pmix_bitmap_t) },
+    .revived_dmns = { .super = PMIX_OBJ_STATIC_INIT(pmix_bitmap_t) },
     .lateral_links = { .super = PMIX_OBJ_STATIC_INIT(pmix_bitmap_t) },
     .lateral_lost_cb = NULL,
     .peer_epochs = NULL,
@@ -71,11 +72,11 @@ static char *dead_dmns_spec = NULL;
 
 /* The incarnation table is the one piece of RML state a peer's socket handler
  * reaches directly, and that handler runs on whichever base is servicing the
- * peer - one of the OOB progress threads when any were configured (see
- * prte_oob_base.num_progress_threads).  Two of them arriving at once would
- * both realloc the array.  The lock is taken only on the bootstrap incarnation
- * check, which is a handful of instructions per message and uncontended
- * whenever the OOB is running on the main thread alone. */
+ * peer - one of the process-wide worker threads when any are configured (see
+ * prte_num_worker_threads).  Two of them arriving at once would both realloc
+ * the array.  The lock is taken only on the bootstrap incarnation check, which
+ * is a handful of instructions per message and uncontended whenever the OOB is
+ * running on the main thread alone. */
 static pmix_mutex_t epoch_lock = PMIX_MUTEX_STATIC_INIT;
 
 /* Grow the per-rank epoch table so index rank is valid, zero-filling new slots
@@ -325,6 +326,7 @@ void prte_rml_close(void)
     PMIX_DESTRUCT(&prte_rml_base.global_failed_dmns);
     PMIX_DESTRUCT(&prte_rml_base.dead_dmns);
     PMIX_DESTRUCT(&prte_rml_base.absent_dmns);
+    PMIX_DESTRUCT(&prte_rml_base.revived_dmns);
     PMIX_DESTRUCT(&prte_rml_base.lateral_links);
     if (NULL != prte_rml_base.peer_epochs) {
         free(prte_rml_base.peer_epochs);
@@ -366,6 +368,12 @@ int prte_rml_open(void)
      * comes back (the unheal path). Initialized once here for the same reason. */
     PMIX_CONSTRUCT(&prte_rml_base.absent_dmns, pmix_bitmap_t);
     pmix_bitmap_init(&prte_rml_base.absent_dmns, prte_process_info.num_daemons);
+    /* revived_dmns records the ranks that have come back, so that a peer's
+     * report of our lineage - which may predate the return - can never be the
+     * thing that declares one of them dead again. Constructed once here for
+     * the same reason as the two above. */
+    PMIX_CONSTRUCT(&prte_rml_base.revived_dmns, pmix_bitmap_t);
+    pmix_bitmap_init(&prte_rml_base.revived_dmns, prte_process_info.num_daemons);
     /* lateral_links records the peers we hold a non-tree connection to. Like
      * the two above it is constructed once and never re-initialized by a
      * routing recompute: a grow reshapes the tree but does not dissolve the
@@ -616,6 +624,7 @@ PMIX_CLASS_INSTANCE(prte_rml_recv_request_t, pmix_object_t, prq_cons, prq_des);
 static void rscon(prte_rml_recovery_status_t* p){
     p->scope = PRTE_RML_FAULT_SCOPE_LOCAL;
     p->failed_ranks = (pmix_data_array_t) PMIX_DATA_ARRAY_STATIC_INIT;
+    p->epoch = 0;
     p->promoted = false;
     p->demoted = false;
 

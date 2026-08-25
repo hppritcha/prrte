@@ -56,15 +56,16 @@ typedef struct {
     pmix_list_t xterm_ranks;
     /* the xterm cmd to be used */
     char **xtermcmd;
-    /* thread pool */
-    int max_threads;
-    int num_threads;
-    int cutoff;
-    prte_event_base_t **ev_bases; // event base array for progress threads
-    char **ev_threads;            // event progress thread names
-    int next_base;                // counter to load-level thread use
     bool signal_direct_children_only;
     char *exec_agent;
+    /* send each daemon its own procs' bindings instead of broadcasting
+     * everybody's to everybody */
+    bool scatter_cpusets;
+    /* launches and cpuset slices that are waiting for each other */
+    pmix_list_t pending_slices;
+    /* microseconds to stall between fork() and the store of the child's
+     * pid - a fault-injection hook, see odls_base_frame.c */
+    int fork_publish_delay;
 } prte_odls_globals_t;
 
 PRTE_EXPORT extern prte_odls_globals_t prte_odls_globals;
@@ -92,6 +93,24 @@ PRTE_EXPORT int prte_odls_base_default_get_add_procs_data(pmix_data_buffer_t *da
 PRTE_EXPORT int prte_odls_base_default_construct_child_list(pmix_data_buffer_t *data,
                                                             pmix_nspace_t *job,
                                                             prte_odls_base_fork_local_proc_fn_t fork_local);
+
+/* Send each daemon in the job's map the bindings of the procs it is about
+ * to fork - the part of the launch message that is of no use to anybody
+ * else.  Called on the master, immediately before the launch message is
+ * broadcast; the two arrive in either order and the receiver waits for
+ * whichever is second. */
+PRTE_EXPORT int prte_odls_base_send_cpuset_slices(prte_job_t *jdata);
+
+/* True while this daemon holds the job but has not yet been sent the
+ * bindings of the procs it will fork.  A binding question about one of them
+ * has no answer yet - and "no cpuset" would be the wrong one. */
+PRTE_EXPORT bool prte_odls_base_awaiting_cpusets(const pmix_nspace_t nspace);
+
+/* Receive one - registered on PRTE_RML_TAG_LAUNCH_SLICE by every daemon,
+ * including the master (which never receives one). */
+PRTE_EXPORT void prte_odls_base_recv_cpuset_slice(int status, pmix_proc_t *sender,
+                                                  pmix_data_buffer_t *buffer,
+                                                  prte_rml_tag_t tag, void *cbdata);
 
 PRTE_EXPORT void prte_odls_base_spawn_proc(int fd, short sd, void *cbdata);
 
@@ -124,6 +143,11 @@ typedef struct {
     bool do_membind;                    /* also apply the memory binding policy */
     hwloc_membind_policy_t membind_policy;
     int membind_flags;
+    int membind_prep_errno;             /* nonzero: report this instead of
+                                           attempting the memory binding */
+    int membind_mode;                   /* MPOL_* mode for set_mempolicy() */
+    unsigned long *membind_nodemask;    /* NULL for MPOL_DEFAULT */
+    unsigned long membind_maxnode;      /* bits in membind_nodemask */
 #if PRTE_HAVE_SCHED_SETAFFINITY
     cpu_set_t *bind_mask;               /* CPU_ALLOC'd mask for sched_setaffinity */
     size_t bind_masksize;               /* CPU_ALLOC_SIZE of bind_mask */
@@ -180,10 +204,6 @@ PRTE_EXPORT int prte_odls_base_default_restart_proc(prte_proc_t *child,
  */
 PRTE_EXPORT int prte_odls_base_preload_files_app_context(prte_app_context_t *context);
 
-PRTE_EXPORT void prte_odls_base_start_threads(prte_job_t *jdata);
-
-PRTE_EXPORT void prte_odls_base_harvest_threads(void);
-
 /* Binding support.
  *
  * prte_odls_base_prepare_binding runs in the parent before the fork: it
@@ -194,6 +214,14 @@ PRTE_EXPORT void prte_odls_base_harvest_threads(void);
  * in the async-signal-safe window before execve(), and only issues the
  * bind syscalls, reporting failures up the pipe. */
 PRTE_EXPORT void prte_odls_base_prepare_binding(prte_odls_spawn_caddy_t *cd);
+
+/* Translate the caddy's cpu binding into the mode and kernel nodemask that
+ * set_mempolicy(2) takes, exactly as hwloc_set_membind() would - the child
+ * then has only the syscall left to issue. Called by
+ * prte_odls_base_prepare_binding in the parent; exported (and compiled on
+ * every platform, not just the ones that can issue the syscall) so the unit
+ * tests can drive it directly against a known topology. */
+PRTE_EXPORT void prte_odls_base_prepare_mempolicy(prte_odls_spawn_caddy_t *cd);
 PRTE_EXPORT void prte_odls_base_set(prte_odls_spawn_caddy_t *cd, int write_fd);
 
 /*

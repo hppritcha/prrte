@@ -109,7 +109,8 @@ static int rank_cmp(const void *a, const void *b)
     return (x < y) ? -1 : ((x > y) ? 1 : 0);
 }
 
-static int unpack_layout(pmix_data_buffer_t *bkt, prte_job_t *jptr)
+static int unpack_layout(pmix_data_buffer_t *bkt, prte_job_t *jptr,
+                         bool devices, prte_job_pack_mode_t mode)
 {
     int32_t nnodes, n, cnt = 1;
     int rc, a, i, j;
@@ -242,7 +243,7 @@ static int unpack_layout(pmix_data_buffer_t *bkt, prte_job_t *jptr)
             rc = PRTE_ERR_NOT_FOUND;
             goto cleanup;
         }
-        rc = prte_proc_unpack(bkt, proc);
+        rc = prte_proc_unpack(bkt, proc, devices, mode);
         if (PRTE_SUCCESS != rc) {
             PRTE_ERROR_LOG(rc);
             goto cleanup;
@@ -272,7 +273,8 @@ cleanup:
     return rc;
 }
 
-int prte_job_unpack(pmix_data_buffer_t *bkt, prte_job_t **job)
+int prte_job_unpack(pmix_data_buffer_t *bkt, prte_job_t **job,
+                    prte_job_pack_mode_t *mode)
 {
     int rc;
     int32_t k, n, count, bookmark;
@@ -283,12 +285,34 @@ int prte_job_unpack(pmix_data_buffer_t *bkt, prte_job_t **job)
     prte_info_item_t *val;
     pmix_info_t pval;
     pmix_list_t *cache;
+    prte_job_pack_mode_t md;
+    bool devices;
 
     /* create the prte_job_t object */
     jptr = PMIX_NEW(prte_job_t);
     if (NULL == jptr) {
         PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
         return PRTE_ERR_OUT_OF_RESOURCE;
+    }
+
+    /* what this buffer contains - see prte_job_pack */
+    n = 1;
+    rc = PMIx_Data_unpack(NULL, bkt, &md, &n, PMIX_UINT8);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        PMIX_RELEASE(jptr);
+        return prte_pmix_convert_status(rc);
+    }
+    if (NULL != mode) {
+        *mode = md;
+    }
+    /* whether the procs carry a device assignment - see prte_job_pack */
+    n = 1;
+    rc = PMIx_Data_unpack(NULL, bkt, &devices, &n, PMIX_BOOL);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        PMIX_RELEASE(jptr);
+        return prte_pmix_convert_status(rc);
     }
 
     /* unpack the nspace */
@@ -439,7 +463,7 @@ int prte_job_unpack(pmix_data_buffer_t *bkt, prte_job_t **job)
      *               have broken that correspondence, update_local_ranks(),
      *               had no callers and is gone.)
      */
-    rc = unpack_layout(bkt, jptr);
+    rc = unpack_layout(bkt, jptr, devices, md);
     if (PRTE_SUCCESS != rc) {
         PRTE_ERROR_LOG(rc);
         PMIX_RELEASE(jptr);
@@ -612,11 +636,11 @@ int prte_node_unpack(pmix_data_buffer_t *bkt, prte_node_t **nd)
 /*
  * PROC
  */
-int prte_proc_unpack(pmix_data_buffer_t *bkt, prte_proc_t *proc)
+int prte_proc_unpack(pmix_data_buffer_t *bkt, prte_proc_t *proc, bool devices,
+                     prte_job_pack_mode_t mode)
 {
     pmix_status_t rc;
-    int32_t n, count, k;
-    prte_attribute_t *kv;
+    int32_t n;
 
     /* Everything the job's maps already say has been set on this proc by
      * prte_job_unpack before we are called - its rank, its hosting daemon,
@@ -641,39 +665,56 @@ int prte_proc_unpack(pmix_data_buffer_t *bkt, prte_proc_t *proc)
         return prte_pmix_convert_status(rc);
     }
 
-    /* unpack the cpuset */
-    n = 1;
-    rc = PMIx_Data_unpack(NULL, bkt, &proc->cpuset, &n, PMIX_STRING);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
-        return prte_pmix_convert_status(rc);
+    /* The cpuset, if this buffer is carrying it.  When it is not, the proc
+     * keeps the NULL its constructor gave it and the daemon that forks it
+     * fills it in from the slice it is sent - see prte_proc_pack. */
+    if (PRTE_JOB_PACK_NO_CPUSETS != mode) {
+        n = 1;
+        rc = PMIx_Data_unpack(NULL, bkt, &proc->cpuset, &n, PMIX_STRING);
+        if (PMIX_SUCCESS != rc) {
+            PMIX_ERROR_LOG(rc);
+            return prte_pmix_convert_status(rc);
+        }
     }
 
-    /* unpack the attributes */
-    n = 1;
-    rc = PMIx_Data_unpack(NULL, bkt, &count, &n, PMIX_INT32);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
-        return prte_pmix_convert_status(rc);
-    }
-    for (k = 0; k < count; k++) {
-        kv = PMIX_NEW(prte_attribute_t);
+    /* The device this proc was mapped against, present only for a job that
+     * was mapped by device - the same condition prte_proc_pack tests, read
+     * from the job's mapping policy, which arrived before this. */
+    if (devices) {
+        pmix_data_array_t *darray;
+        uint16_t ndevs = 0;
         n = 1;
-        rc = PMIx_Data_unpack(NULL, bkt, &kv->key, &n, PMIX_UINT16);
+        rc = PMIx_Data_unpack(NULL, bkt, &ndevs, &n, PMIX_UINT16);
         if (PMIX_SUCCESS != rc) {
             PMIX_ERROR_LOG(rc);
-            PMIX_RELEASE(kv);
             return prte_pmix_convert_status(rc);
         }
-        rc = PMIx_Data_unpack(NULL, bkt, &kv->data, &n, PMIX_VALUE);
-        if (PMIX_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
-            PMIX_RELEASE(kv);
-            return prte_pmix_convert_status(rc);
+        if (0 < ndevs) {
+            PMIX_DATA_ARRAY_CREATE(darray, ndevs, PMIX_DEVICE);
+            if (NULL == darray) {
+                return PRTE_ERR_OUT_OF_RESOURCE;
+            }
+            n = ndevs;
+            rc = PMIx_Data_unpack(NULL, bkt, darray->array, &n, PMIX_DEVICE);
+            if (PMIX_SUCCESS != rc) {
+                PMIX_DATA_ARRAY_FREE(darray);
+                PMIX_ERROR_LOG(rc);
+                return prte_pmix_convert_status(rc);
+            }
+            /* LOCAL: it has arrived, and must not be re-packed by a daemon
+             * that forwards this job onward */
+            prte_set_attribute(&proc->attributes, PRTE_PROC_DEVICE_ID,
+                               PRTE_ATTR_LOCAL, darray, PMIX_DATA_ARRAY);
+            PMIX_DATA_ARRAY_FREE(darray);
         }
-        kv->local = PRTE_ATTR_GLOBAL; // obviously not a local value
-        pmix_list_append(&proc->attributes, &kv->super);
     }
+
+    /* No attribute list is on the wire - see the comment in prte_proc_pack.
+     * The proc's list stays as its constructor left it, empty, which is what
+     * every job has ever put on the wire anyway. If you restore the packing,
+     * restore the unpacking in the same commit: these two are hand-written
+     * mirrors with no version and nothing that catches a half-done edit. */
+
     return PRTE_SUCCESS;
 }
 

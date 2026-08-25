@@ -315,6 +315,8 @@ Process Mapping / Ranking / Binding Options
 
   * "pe-list"
 
+  * "device=<class|name>"
+
   Any object can include qualifiers by adding a colon (":") and any
   colon-delimited combination of one or more of the following to the "
   --mapby" options:
@@ -350,6 +352,20 @@ Process Mapping / Ranking / Binding Options
 
   * "FILE=<path>" (path to file containing sequential or rankfile
     entries).
+
+  * "INTERLEAVE[=<level>]" only applies to the "device" directive;
+    reorders the device list so consecutive procs land on different
+    objects of the given level (default "package")
+
+  * "SHARED[=true|false]" only applies to the "device" directive;
+    permits several procs to be assigned the same device (default
+    false)
+
+  * "NDEV=<n>" only applies to the "device" directive; assigns n
+    devices to each proc rather than one. The proc is then local to
+    whatever contains all of them - two GPUs on different NUMA domains
+    make their package the locality - so a binding refused with one
+    device per proc may be legitimate with several
 
   * "ORDERED" only applies to the PE-LIST option to indicate that
     procs are to be bound to each of the specified CPUs in the order
@@ -621,6 +637,168 @@ And here is a MIMD example:
 This will launch process 0 running "hostname" on node "aa" and
 processes 1 and 2 each running "uptime" on nodes "bb" and "cc",
 respectively.
+
+
+Mapping to Devices
+==================
+
+Consider a two-socket node with eight NUMA domains and four GPUs,
+where the GPUs are attached to NUMA domains 1 and 2 on the first
+socket but 6 and 7 on the second. This asymmetry is the case device
+mapping exists for: no "--mapby numa" or "--mapby package" expression
+selects those four domains, because they are not at the same position
+within each socket.
+
+   $ prun -n 4 --mapby device=gpu --bindto core ./a.out
+
+places one process per GPU, in PCI bus order, each bound to the first
+available core in the CPUs local to its own GPU - on the machine
+described above, cores 16, 32, 96, and 112.
+
+Binding may be any object at or below the device's locality:
+
+   $ prun -n 1 --mapby device=gpu --bindto numa ./a.out
+
+binds the process to the whole NUMA domain its GPU is attached to,
+while "--bindto l3cache" binds it to one L3 cache within that domain,
+and "--bindto core" to a single core. Asking for "--bindto package"
+on this machine is an error: a package contains the GPU's NUMA domain
+and three others, so binding there would place the process on CPUs the
+GPU is not local to.
+
+A device is assigned to a process rather than subdivided between
+processes, so by default each device takes one process: asking for more
+processes than there are devices is an error. Where sharing the devices
+is intended, say so with the "shared" qualifier:
+
+   $ prun -n 8 --mapby device=gpu:shared --bindto core ./a.out
+
+On the four-GPU machine above that runs two processes per GPU. Note the
+processes still get separate cores: sharing a device and overloading a
+CPU are different resources and different decisions, which is why they
+have different qualifiers - "shared" here, and "overload-allowed" on
+"--bindto" for the CPUs.
+
+Where a job wants its processes spread across sockets rather than
+filling the first, add the "interleave" qualifier:
+
+   $ prun -n 2 --mapby device=gpu:interleave --bindto core ./a.out
+
+This reorders the device list so consecutive processes land on
+different packages - on the machine above, cores 16 and 96 rather than
+16 and 32. The level may be given explicitly ("interleave=numa", for
+instance); it defaults to "package".
+
+Where a process needs more than one device, "ndev" says how many:
+
+   $ prun -n 2 --mapby device=gpu:ndev=2 --bindto package ./a.out
+
+gives each of the two processes two GPUs. A process holding devices in
+different NUMA domains is local to neither of them alone, so its
+locality becomes whatever contains them both - here the package, which
+is why binding to a package is legal in this case and an error without
+"ndev".
+
+Because the devices are handed out in groups taken in order from the
+device list, "interleave" composes with "ndev": the interleaving decides
+the order, and the grouping then takes contiguous runs of it.
+
+Mapping by a GPU requires one thing of the machine that the other
+device classes do not: that the GPUs can be named to the vendor's
+runtime. hwloc learns a GPU's vendor identity - an NVIDIA "GPU-<uuid>"
+and its AMD and Intel equivalents - only from that vendor's backend
+(NVML, RSMI, Level Zero), which has to be enabled when hwloc is built.
+Without it, the GPUs are still discovered and processes are still
+placed correctly beside them, but no process can be told which GPU it
+was given in terms the library it links will accept. PRRTE refuses the
+request in that case. Mapping and then quietly telling the process
+nothing looks identical to a working job - the map is right, and the
+only symptom is that every process on the node uses the same GPU.
+
+The hwloc that decides this is the one PRRTE was built against, since
+each daemon discovers its own node; installing another hwloc alongside
+does not change it. Network, fabric and block devices are unaffected,
+being named by identifiers hwloc always has.
+
+Where the identity is available, each process is also handed its GPUs in
+the environment variable its vendor's runtime reads:
+
+   CUDA_VISIBLE_DEVICES   NVIDIA
+   ROCR_VISIBLE_DEVICES   AMD
+   ZE_AFFINITY_MASK       Intel
+
+named, for NVIDIA and AMD, by the vendor's own identifier rather than by
+an index; Intel is the exception, and is described below. Only processes
+actually mapped against a device are given one, and a value already in
+the environment is replaced - "--map-by device=" is the more specific
+request, and because the identifiers name devices absolutely they compose
+correctly with a set a resource manager has already narrowed.
+
+PRRTE never sets the vendor's device ORDERING variable
+(CUDA_DEVICE_ORDER and its equivalents). The identifiers do not depend
+on it, which is precisely why they are used, and changing it would
+renumber every device for the rest of the process's life.
+
+Intel is the exception to "identity rather than index". ZE_AFFINITY_MASK
+has no identifier form - it takes Level Zero device ordinals - but the
+ordinals are not guessed. hwloc's Level Zero backend records the driver
+and device index that zeDeviceGet returned for each device, so the value
+is read from that enumeration rather than predicted, and it is read on
+the node that will run the process.
+
+An ordinal is not a complete statement on its own: a Level Zero driver
+reads ZE_FLAT_DEVICE_HIERARCHY first and then interprets the mask against
+the devices that model exposes, so the same ordinals name a card under
+COMPOSITE and a tile under FLAT. The model is therefore stated alongside
+the mask whenever the process's environment does not already name one.
+If it does name one and it disagrees, nothing is set and a message says
+so - overriding a deliberate choice would change how many devices the
+program sees, and writing a mask that will be read under a different
+model would silently hand it half the hardware it was assigned.
+
+A process mapped against a network device is handed it the same way, in
+the environment variables the fabric libraries read:
+
+   NCCL_IB_HCA          Mellanox / NVIDIA InfiniBand adapters
+   UCX_NET_DEVICES      Mellanox / NVIDIA InfiniBand adapters
+   PSM3_NIC             Intel Omni-Path adapters
+
+named as those libraries name the device - "mlx5_0" - which is the name
+hwloc gave it. Unlike a GPU's vendor identity that name is always there,
+so the identity check above does not apply to this class.
+
+No variable that names an adapter by its unit NUMBER is set - HFI_UNIT
+and FI_OPX_HFI_SELECT among them. A unit number is meaningful only
+against the enumeration it came from, which is the driver's rather than
+one PRRTE performed, and a wrong number in these variables does not fail
+- it quietly puts the process on a different adapter. Nothing is set at
+all for an adapter whose fabric has no support behind it, rather than
+guessing at a variable it might read.
+
+The assignment can also be read directly, whether or not a device
+variable was set, from the process's own job data under PMIX_DEVICE_ID.
+
+The reverse ratio - several processes on each device rather than several
+devices for each process - is a "ppr" pattern, spelled the same way as
+every other:
+
+   $ prun --mapby ppr:2:device=gpu --bindto core ./a.out
+
+places two processes on each GPU, each bound to its own core within that
+GPU's locality. As with any ppr pattern, the process count follows from
+the pattern when "-n" is not given: four GPUs yield eight processes.
+
+Naming a single device instead of a class places every process near
+that one device, which is useful for a job whose performance depends
+on one particular fabric interface:
+
+   $ prun -n 8 --mapby device=mlx5_0 --bindto core ./a.out
+
+Other classes are selected the same way - "device=network" for the
+node's network interfaces and "device=block" for block devices.
+"device=nic", "device=fabric" and "device=openfabrics" all mean
+"device=network": a card that presents both an OpenFabrics device
+and a network interface is one device under any of them.
 
 
 Per-App-Context Mapping Example
@@ -970,6 +1148,65 @@ command line via the "--mapby" option, include:
 * "RANKFILE": (often accompanied by the "file=<path>" qualifier)
   assigns one process to the node/resource specified in each entry of
   the file, one per line of the file.
+
+* "DEVICE=<class|name>": assigns one process to each device in the
+  node's topology, in PCI bus order.
+
+Mapping by device is unlike the other directives in one respect worth
+understanding, because it governs what binding can then do.
+
+Every other mapping target is an object the user names directly - a
+core, a NUMA domain, a package - and binding descends within it. A
+device is not such an object: it hangs off the I/O side of the
+topology and has no CPUs of its own. What a process is actually
+placed against is the device's *locality*, meaning the nearest object
+in the topology that both contains the device and has CPUs. On one
+machine that may be a NUMA domain, on another a whole package,
+depending on where the hardware attaches the device.
+
+Two consequences follow, and both are deliberate:
+
+1. Binding descends from the locality, not from the device. So
+   "--mapby device=gpu --bindto core" binds each process to one core
+   within the CPUs local to its GPU.
+
+2. Asking to bind to an object larger than the locality is an error,
+   not a silent widening. A binding that covers more than the device's
+   locality is not "near the device" at all, which is the whole of what
+   was asked for. Note this cannot be known from the command line
+   alone: whether "--bindto package" is legal depends on where that
+   machine attaches its devices.
+
+PRRTE cannot restrict a process to a device the way it restricts one to
+a set of CPUs - no such mechanism exists - so the assignment is only
+useful if the process can find out about it. Each process is therefore
+told which devices it was mapped against, as the PMIX_DEVICE_ID key of
+its own proc info, which it can retrieve with:
+
+   PMIx_Get(&myproc, PMIX_DEVICE_ID, NULL, 0, &value);
+
+The value is ALWAYS a pmix_data_array_t of pmix_device_t, even when it
+holds a single device: a process given two devices and one given a
+single device are the same kind of answer differing in length, so there
+is no separate single-device form to special-case.
+
+Each entry carries the device UUID, its OS name and its type. The UUID
+rather than an index is what identifies it, because a runtime's own
+device numbering need not match the topology's - CUDA, for example,
+orders devices by speed rather than by bus by default - so an index
+would name a different device than the one PRRTE chose. The same UUID
+appears in the PMIX_DEVICE_DISTANCES a process can query, which is what
+lets the two be matched up.
+
+"--display map" reports it too, as a "Device:" field on each process
+line.
+
+Where every device on a node is equally close to every CPU - which
+happens when they all hang off one PCI complex rather than off
+individual NUMA domains - the job still runs and each process is still
+assigned its own device, but a warning is printed: the binding cannot
+be made any more specific than it would have been without the
+directive.
 
 For example, using the hostfile below:
 

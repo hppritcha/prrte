@@ -24,6 +24,8 @@
 #include "prte_config.h"
 #include "constants.h"
 
+#include <stdio.h>
+
 #include "src/class/pmix_list.h"
 #include "src/util/pmix_printf.h"
 
@@ -47,11 +49,27 @@ typedef struct {
     bool show_launch_progress;
     bool notifyerrors;
     bool autorestart;
+    /* DVM state logging - see state_base_log.c.  log_path is owned by the
+     * MCA variable system; log_file and log_fp are ours. */
+    bool log_jobstate;
+    bool log_procstate;
+    char *log_path;
+    char *log_file;
+    FILE *log_fp;
 } prte_state_base_t;
 PRTE_EXPORT extern prte_state_base_t prte_state_base;
 
 /* select a component */
 PRTE_EXPORT int prte_state_base_select(void);
+
+/*
+ * DVM state logging (state_base_log.c)
+ */
+PRTE_EXPORT int prte_state_base_log_resolve_dir(const char *path, const char *base, char **dir);
+PRTE_EXPORT void prte_state_base_log_open(void);
+PRTE_EXPORT void prte_state_base_log_close(void);
+PRTE_EXPORT void prte_state_base_log_job(prte_job_t *jdata, prte_job_state_t state);
+PRTE_EXPORT void prte_state_base_log_proc(const pmix_proc_t *proc, prte_proc_state_t state);
 
 /* debug tools */
 PRTE_EXPORT void prte_state_base_print_job_state_machine(void);
@@ -59,6 +77,7 @@ PRTE_EXPORT void prte_state_base_print_job_state_machine(void);
 PRTE_EXPORT void prte_state_base_print_proc_state_machine(void);
 
 PRTE_EXPORT int prte_state_base_set_runtime_options(prte_job_t *jdata, char *spec);
+PRTE_EXPORT bool prte_state_base_report_child_sep(const char *spec);
 
 /*
  * Base functions
@@ -87,6 +106,11 @@ PRTE_EXPORT void prte_state_base_report_progress(int fd, short argc, void *cbdat
 PRTE_EXPORT void prte_state_base_track_procs(int fd, short argc, void *cbdata);
 PRTE_EXPORT void prte_state_base_check_fds(prte_job_t *jdata);
 PRTE_EXPORT void prte_state_base_notify_data_server(pmix_proc_t *target);
+
+/* A proc reported a state and we hold no job object to account it against.
+ * Both track_procs implementations call this instead of dropping the
+ * report on the floor - see the comment on the definition. */
+PRTE_EXPORT void prte_state_base_orphaned_proc(pmix_proc_t *proc, prte_proc_state_t state);
 
 // resource recovery
 PRTE_EXPORT void prte_state_base_recover_resources(prte_job_t *jdata, prte_proc_t *pptr);

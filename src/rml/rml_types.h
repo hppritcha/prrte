@@ -122,6 +122,13 @@ typedef void (*prte_rml_buffer_callback_fn_t)(int status, pmix_proc_t *peer,
  * on it. */
 #define PRTE_RML_TAG_DAEMON_LAUNCH 18
 
+/* The part of the launch message that is addressed to one daemon: the
+ * bindings of the procs that daemon is about to fork.  Sent point to point
+ * while the rest of the message is broadcast, so the cpusets cost the tree
+ * their own size once instead of once per daemon they reach.  See
+ * prte_odls_base_send_cpuset_slices(). */
+#define PRTE_RML_TAG_LAUNCH_SLICE 19
+
 #define PRTE_RML_TAG_XCAST         15
 #define PRTE_RML_TAG_XCAST_ACK     16
 /* The bulk broadcast's allgather phase, and the request to abandon it.  Kept
@@ -210,6 +217,10 @@ typedef void (*prte_rml_buffer_callback_fn_t)(int status, pmix_proc_t *peer,
 /* a daemon's rendered show_help text, on its way to the HNP - see
  * src/util/prte_show_help.c for why a prted cannot emit its own */
 #define PRTE_RML_TAG_SHOW_HELP            82
+
+/* the membership of a PMIx_Connect assemblage, on its way to the DVM master,
+ * which is where it is held - see src/prted/pmix/pmix_server_connect.c */
+#define PRTE_RML_TAG_CONNECTED            83
 
 #define PRTE_RML_TAG_MAX                 100
 
@@ -354,6 +365,23 @@ typedef struct {
                        //   up, not necessarily related to failures
 } prte_rml_routed_tree_node_t;
 
+/* Outcome of reconciling a peer's report of THIS daemon's ancestor list
+ * against our own view of it - see prte_rml_reconcile_ancestry(). */
+typedef enum {
+    /* The two views agree once our own failure knowledge has been applied to
+     * the report: the peer told us nothing we did not already know. */
+    PRTE_RML_ANCESTRY_AGREED,
+    /* The peer knows of ancestor deaths we do not.  The inferred array holds
+     * the ranks that must have failed for its view to be the correct one. */
+    PRTE_RML_ANCESTRY_INFERRED,
+    /* Reconciling would require declaring a rank dead that has RETURNED, so
+     * the report necessarily predates the return and says nothing current.
+     * A race to be ignored, not an error. */
+    PRTE_RML_ANCESTRY_STALE,
+    /* No set of ancestor deaths reconciles the two views. */
+    PRTE_RML_ANCESTRY_INCONSISTENT
+} prte_rml_ancestry_t;
+
 /* struct for passing information about a daemon fault to MCA components */
 typedef struct {
     pmix_object_t super;
@@ -374,6 +402,18 @@ typedef struct {
     } scope;
 
     pmix_data_array_t failed_ranks;
+
+    // The collective recovery epoch this event moves the DVM to, and the
+    // reason it is carried here rather than counted by each handler: it is
+    // issued by the HNP when it originates the global notice, so every daemon
+    // adopts the same number no matter how many notices it has seen. A daemon
+    // that missed one - which a daemon launched into an already-recovered DVM
+    // necessarily has - is corrected by the next one that reaches it, and by
+    // the WIREUP broadcast it receives on joining.
+    //
+    // Only meaningful when scope is GLOBAL; zero on the local pass, which
+    // does not move the epoch.
+    uint32_t epoch;
 
     // Ancestor deaths could lead to this rank substituting for a hole further
     // up the tree. If we've been promoted, our subtree has grown. At most, one

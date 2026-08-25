@@ -165,7 +165,51 @@ it finds, and a broken cluster would make all of them lie.
 **`test_ras_alloc`** — what an allocation *means* to the DVM. The DVM forms
 across the whole allocation with no `--host`; the slot count is SLURM's, not
 the core count; `--host` selects within the allocation and refuses outside
-it. Two cases here cannot exist anywhere else:
+it. Several cases here cannot exist anywhere else:
+
+- **Who owns the allocation.** `ras` selects a single module, and this is the
+  only harness where the choice is a real one: `ras/slurm` (priority 50) and
+  `ras/hosts` (1) both answer the query, so a regression to keeping both is
+  visible here and nowhere else. In an unmanaged environment only one
+  component answers and single- and multi-select look identical. The case
+  reads the selector's own verbose output for both candidates, exactly one
+  winner, and the `scheduler-owned` mark.
+- **`--add-host` against an allocation PRRTE does not own.** Refused, with the
+  reason named, and — the half that matters — the DVM survives the refusal.
+  Before, the node was inserted and the daemon launch on it failed, which
+  takes the whole DVM down rather than just the job that asked.
+- **A `--host` claiming more of a node than SLURM allocated.** Refused, and
+  the message names the node and both counts. Same authority as the entry
+  above, applied to how much of a node a job may take rather than to which
+  nodes exist — and, like it, only reachable here: where PRRTE owns the node
+  counts a larger `:N` re-describes the node instead, so the refusing arm has
+  no other home. The case also runs a `--host` within the allocation, since a
+  check that refuses everything would pass the first half.
+- **`--activate` against the same allocation.** *Allowed* — the case that
+  gives the refusal above its shape. A DVM started with `--host` forms across
+  only part of its allocation, and `--activate` starts a daemon on one of the
+  nodes left out. It names only what SLURM already granted, so it needs none
+  of the authority add-host lacks, and refusing it would have made the
+  ownership check a blanket ban on ever growing the DVM. This distinction is
+  invisible everywhere else: where PRRTE owns the allocation, add-host would
+  serve the same request, so nothing separates "allowed because it adds
+  nothing" from "allowed because we own it". The case runs both forms — a
+  name and `file=<hostfile>`, the form a user under SLURM actually has to
+  hand — and pins the two edges: a node SLURM never granted is refused here
+  too, with a *different* message ("not part of this DVM's allocation", not
+  "owned by a resource manager"); and a `slots=` in the hostfile is **not**
+  applied, since PRRTE has no more authority over a scheduler's slot count
+  than over its node list.
+
+  The same case then asks for the same thing through the API, with
+  `PMIX_ALLOC_ACTIVATE` (`elastic activate`). That is a property of its own
+  rather than a repeat: the directive reaches `ras` through
+  `prte_ras_base_modify`, where `ras/slurm` owns the allocation and would have
+  to refuse anything needing the scheduler's consent, so "served under a
+  scheduler" has to be shown for the request as well as for the command line
+   — and, again, nowhere else can show it. The DVM here is not in elastic
+  mode, so no campaign is recorded and the grant is the whole answer; the
+  two-phase completion is exercised by the sibling harness instead.
 
 - **SLURM's compressed node list.** SLURM hands out `node[2,4,6]`, and
   `ras/slurm` has its own parser for that notation — a fake scheduler handing
@@ -194,15 +238,22 @@ a scheduler that can say no: `salloc` really allocates a job, `scontrol show job
 --json` really emits SLURM's own schema, `scontrol update` really has to be a
 resize SLURM accepts **on a running job**, and `scancel` really removes an
 allocation. Note the request shapes differ from a plain elastic grow:
-`elastic grow <nodes>` is `PMIX_ALLOC_NEW` naming hosts, which the *base*
-serves without consulting the ras. `ras/slurm`'s `modify()` accepts only
-`PMIX_ALLOC_EXTEND`+`NUM_NODES`,
+`elastic grow <nodes>` names hosts with slot counts, which `ras/slurm`
+refuses — Slurm decides the slots. `ras/slurm`'s `modify()` accepts
+(`PMIX_ALLOC_EXTEND`|`PMIX_ALLOC_NEW`)+(`NUM_NODES`|`NODE_LIST`),
 `PMIX_ALLOC_RELEASE`+(`NODE_LIST`|`NUM_NODES`|`ALLOC_ID`) and
-`PMIX_ALLOC_REQ_CANCEL` — which nodes an extend lands on is the scheduler's
-choice. Hence `elastic extend|release|release-id|cancel`.
+`PMIX_ALLOC_REQ_CANCEL` — which nodes a grow lands on is the scheduler's
+choice. Hence `elastic extend|new|release|release-id|cancel`. The two grow
+directives are one request to this component.
 
-Two cases are worth calling out:
+Five cases are worth calling out:
 
+- **The expander job's deadline.** `ras/slurm` asks for the parent's remaining
+  time and resets the limit once SLURM starts the job; both cases assert
+  SLURM's own `EndTime` for the expander is not later than the parent's. The
+  reset only does work when the parent's end moves while the expander queues,
+  so `elastic_trim_group` arranges that. `test_elastic` allocates with
+  `--time` because the partition's `MaxTime` is `INFINITE`.
 - **The in-place resize.** A partial release keeps the SLURM job and shrinks
   it with `scontrol update job <id> ReqNodeList=<survivors>`. Whether SLURM
   accepts that on a RUNNING job is precisely the assumption a fake scheduler
@@ -212,6 +263,32 @@ Two cases are worth calling out:
   *told* to make a job pend. Here the case asks for more nodes than the
   cluster has free and SLURM queues it PENDING by itself, which is the state
   `PMIX_ALLOC_REQ_CANCEL` exists for.
+- **An extend that lands on a node an earlier release gave back.** Reported
+  as a hang, and the half of it `ras/slurm` owns: a grow completes only
+  through `DAEMONS_REPORTED` → `VM_READY`, and neither of the counters that
+  gate it is decremented when a daemon departs, so the fence the extend
+  raises comes down only if the daemon on the reused node reports in. Which
+  node an extend lands on is the *scheduler's* choice, so the case has to
+  leave SLURM no alternative: the first extend asks for the **whole free
+  pool**, and after two of those nodes are released they are the only nodes
+  left to grant. Do not shrink that first request to a fixed size — with a
+  spare node anywhere in the cluster the scheduler may grant one that was
+  never in the DVM, and the case would assert nothing while looking like it
+  passed. The completion assertion runs whatever node was granted (an extend
+  that does not complete is a bug wherever it landed); only the claim that a
+  *reuse* happened is downgraded to a skip when the scheduler had a spare.
+  (The sibling harness covers the same shape chosen by *hostname*; [#2491]
+  closed the routing half of it.)
+- **Which brings in the one piece of SLURM bookkeeping this suite has to
+  work around.** A node released by an in-place resize can sit in state
+  `IDLE` with its cores still accounted to the job that was shrunk off it —
+  `scontrol show node` reports `State=IDLE` and `CPUAlloc=8` together, and
+  slurmctld frees them on its own schedule — so an allocation naming that
+  node pends on `Reason=Resources` until the queue drains. `sinfo -t idle`
+  cannot see the difference; `grantable_nodes()` asks for the free-CPU count
+  as well, and every case that needs to know what the scheduler can hand out
+  must go through it. A case that takes `IDLE` at face value waits out its
+  timeout and then reports the scheduler's accounting as a PRRTE failure.
 
 The tainted-hostname case is carried over from the sibling harness because
 the stakes are different here: the command that would be built is one a live
@@ -240,6 +317,7 @@ than the run before. A group that gives up now says what it gave up on, and
 the caller runs the next one regardless.
 
 [#2617]: https://github.com/openpmix/prrte/issues/2617
+[#2491]: https://github.com/openpmix/prrte/issues/2491
 
 **`test_launch`** — a deliberately short smoke test. Ranks spread over the
 allocated nodes, output forwarded back, a failing job reported as failing,

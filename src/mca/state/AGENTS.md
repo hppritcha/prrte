@@ -76,6 +76,7 @@ state/
     state_base_frame.c       # framework open/close/register; MCA params; class instances
     state_base_select.c      # PICK-ONE component selection (unlike rmaps)
     state_base_fns.c         # THE machinery: activate/add/set/remove + common handlers
+    state_base_log.c         # the DVM state log (the state_base_log_* params)
     state_base_options.c     # prte_state_base_set_runtime_options (runtime-options parser)
     help-state-base.txt      # user-facing help text
   dvm/                       # HNP/DVM-master machine (pri 100 when PRTE_PROC_IS_MASTER)
@@ -175,7 +176,7 @@ The winning module is copied into the global `prte_state` instance;
 callers reach the vtable through it (`prte_state.activate_job_state(...)`).
 You should almost never call the vtable directly — use the macros.
 
-The version macro is `PRTE_STATE_BASE_VERSION_1_0_0`.
+The version macro is `PRTE_MCA_BASE_VERSION(state)`.
 
 ### Return protocol
 
@@ -380,6 +381,16 @@ defaults it reads are this framework's MCA params.
 > param. The `!prte_persistent` gate on that copy matches where it is
 > read: only a one-shot DVM reports an exit status, so a job spawned into
 > a persistent DVM cannot change the policy for everyone else.
+>
+> On a **persistent** DVM the same policy therefore has to be applied by
+> the *tool*, which is the process that has an exit status to report, and
+> `prun` does it with `prte_state_base_report_child_sep()` — the reader
+> that lives beside the walk in `state_base_options.c` so the directive has
+> one spelling and one set of truth rules. The DVM sends `prun` the facts
+> it needs and no policy: `dvm_notify()` stamps every `PMIX_EVENT_JOB_END`
+> with `PMIX_SPAWN_TREE_ROOT` (`prte_job_t::launcher`, or the job itself
+> when nothing spawned it) and `PMIX_SPAWN_TREE_ACTIVE` (how many jobs in
+> that tree have yet to terminate). See `src/prted/AGENTS.md`.
 
 > **Do not use the directive loop's index as a scratch variable.** The
 > walk is `for (n = 0; NULL != options[n]; n++)`. Two branches used to
@@ -405,11 +416,72 @@ framework-wide toggles, several registered as MCA params:
 | `show_launch_progress` | `state_base_show_launch_progress` | Emit DVM-startup progress reports. |
 | `notifyerrors` | `state_base_notify_errors` | Raise a PMIx event on reportable proc errors. |
 | `autorestart` | `state_base_autorestart` | Auto-restart failed procs up to the limit. |
+| `log_jobstate` | `state_base_log_jobstate` | Record every job-state transition this process orders. |
+| `log_procstate` | `state_base_log_procstate` | Record every proc-state transition this process orders. |
+| `log_path` | `state_base_log_path` | Directory the state log is written into. |
+| `log_file` / `log_fp` | (not params) | The resolved file name and its handle; owned by `state_base_log.c`. |
 | `parent_fd` / `ready_msg` | (not params) | Startup handshake back to a parent launcher; "DVM ready" gating. |
 
 `state_base_frame.c` also declares the framework
 (`PMIX_MCA_BASE_FRAMEWORK_DECLARE`) and the `PMIX_CLASS_INSTANCE`s for
 `prte_state_t` and `prte_state_caddy_t`.
+
+---
+
+## The DVM state log (`state_base_log.c`)
+
+The three `log_*` parameters above are the whole interface to this facility,
+and deliberately so. An early draft of the bootstrap configuration file
+carried `ControllerLogJobState` / `ControllerLogProcState` /
+`ControllerLogPath` and their `PRTEDLog*` twins; they were **removed from the
+format** (`docs/configuration.rst`, `docs/plans/bootstrap/`). A key in
+`prte.conf` is written once and then applies to every daemon of every DVM the
+cluster starts, with nobody watching, while the volume of a per-transition
+record scales with the processes launched and fills the same disk the session
+directories live on. So: an MCA parameter, asked for by the run that wants
+it. Off by default, and the framework never opens a file unless one of the
+two booleans is set.
+
+`prte_state_base_log_open()` runs from the framework's `open`, which is early
+in `ess` init and late enough that the three things naming the file — the
+hostname, the session-directory base, and the role — are all settled. The
+file is `<dir>/prtectrlr-<host>-log` for the master and
+`<dir>/prted-<host>-log` for a daemon, so a controller co-resident with a
+`prted` does not contend with it. Records are emitted from the top of
+`prte_state_base_activate_job_state` / `..._proc_state`, **ahead of the
+dispatch walk** — the documented content is the moment a transition was
+*ordered*, and a state no handler is registered for is exactly the thing
+someone reads this log to discover, so it has to appear even though the
+dispatcher drops it.
+
+Three things about the implementation are deliberate and easy to undo by
+accident:
+
+- **It does not use `pmix_output`'s file support.** A `pmix_output` stream
+  resolves its filename **lazily, at the first write**, from the *global*
+  `output_dir`/`output_prefix` that `pmix_output_set_output_file_info()` last
+  set — and `ess/hnp` and `ess_base_std_prted.c` both set those to the proc
+  session directory during init. The save/set/open/restore idiom the
+  `pmix_output.h` header describes therefore does **not** put a stream in a
+  chosen directory: the stream lands wherever the globals point when the
+  first record fires. A plain `FILE*` is both simpler and correct here.
+- **The file is opened for append, line-buffered, and `FD_CLOEXEC`.** Append
+  because the name carries only the host and the role, so a restart would
+  otherwise erase the previous run (a `#` banner separates them);
+  line-buffered so a record is on disk before the transition it names has
+  been acted on, which is the point of keeping the log; close-on-exec because
+  the `odls` forks application processes.
+- **A failed open disables the flags.** Leaving them set would cost a branch
+  on every transition for a file nobody is writing, and the `show_help` has
+  already been shown once.
+
+Records from two threads can appear out of timestamp order by microseconds —
+`odls` activates `RUNNING` from a worker thread while the terminate join runs
+on the progress thread (see the out-of-order note under "Conventions"). The
+lines themselves never interleave: stdio serializes the write. The timestamp
+is taken before that lock, and deliberately so — it records when each
+transition was ordered, which is the truthful thing when two really were
+ordered concurrently.
 
 ---
 
@@ -455,6 +527,26 @@ contention — the process's role decides which machine it runs.
   whatever ERROR/ANY catch-all is registered, so *any* handler you put on
   a fallback entry will see a `NULL` job sooner or later. `caddy->job_state`
   is always valid; `caddy->jdata` is not.
+- **A proc's state can arrive out of order, and it must never go
+  backwards.** `prte_odls_base_spawn_proc()` activates `RUNNING` at the tail
+  of the launch, from a **worker thread**, while the WAITPID/IOF join that
+  records the termination runs on the progress thread. A proc short-lived
+  enough to die and be reaped before the launch path finishes therefore
+  produces `WAITPID FIRED` → `IOF COMPLETE` → `NORMALLY TERMINATED` →
+  **`RUNNING`**, microseconds apart and in that order. `state/prted`'s
+  `track_procs` must not let that last one overwrite the terminated state,
+  and its launch-complete report must not pack `RUNNING` for a proc already
+  flagged `PRTE_PROC_FLAG_RECORDED`: the join has fired, so nothing is left
+  to correct the lie, and the DVM master believes that proc is alive for the
+  rest of the DVM's life. The job never completes, `terminate_orteds` is
+  never called, and `prterun` hangs with every daemon still up. The
+  `WAITPID_FIRED` arm guards the opposite order for the same reason ("do NOT
+  update the proc state as this can hit while we are still trying to notify
+  the HNP of successful launch for short-lived procs"); the two halves belong
+  together. Anything slow on the parent's launch path widens the window —
+  it was found through hwloc's `memory not bound` warning, which adds a pipe
+  record and a `show_help` render to `do_parent` before the `RUNNING`
+  activation.
 - **Never do real work in the activator.** Activation only queues an
   event; the handler runs later on the progress thread. Don't assume the
   handler has run when `PRTE_ACTIVATE_*_STATE` returns, and don't read
@@ -494,8 +586,8 @@ states invoke.
 
 | Layer | Where | Covers |
 |-------|-------|--------|
-| Unit | [`test/unit/state/test_state.c`](../../../test/unit/state/test_state.c) (`make check`) | the table API and its return protocol; dispatch incl. the ERROR/ANY fallback ordering and the NULL-cbfunc/NULL-proc guards; the caddy initialization contract (the NULL-job case above); `set_runtime_options` directive parsing — boolean sense, directive ordering, unknown/bad-combination refusals; per-role component selection. |
-| Multi-node | `test_state` in [`contrib/dockerswarm/run-tests.sh`](../../../contrib/dockerswarm/run-tests.sh) | the runtime-option directives end-to-end through `prterun` (a real forked child is what makes the boolean sense observable, via `odls`); **`report-child-jobs-separately` against a real parent/child job pair** (see below); a `NULL`-job `NEVER_LAUNCHED` reaching the errmgr fallback and tearing the DVM down promptly instead of hanging; and `check_complete`'s resource accounting, which only shows up as successive jobs re-filling the same allocation on one persistent DVM. |
+| Unit | [`test/unit/state/test_state.c`](../../../test/unit/state/test_state.c) (`make check`) | the table API and its return protocol; dispatch incl. the ERROR/ANY fallback ordering and the NULL-cbfunc/NULL-proc guards; the caddy initialization contract (the NULL-job case above); `set_runtime_options` directive parsing — boolean sense, directive ordering, unknown/bad-combination refusals; `prte_state_base_report_child_sep()` agreeing with that walk on every spelling of the directive; per-role component selection; the state log — the path rule (absolute/relative/absent/no-base), the file name, and that a transition is recorded even when the dispatcher drops it (the test runs with empty tables, so every activation it makes *is* dropped). |
+| Multi-node | `test_state` in [`contrib/dockerswarm/run-tests.sh`](../../../contrib/dockerswarm/run-tests.sh) | **the state log's role split** — the controller and a `prted` writing their own files, which one process wearing both hats cannot show, and which also proves the parameters reach the daemons at all (that is the launch path's job, not this framework's); that no log appears unasked; the runtime-option directives end-to-end through `prterun` (a real forked child is what makes the boolean sense observable, via `odls`); **`report-child-jobs-separately` against a real parent/child job pair** (see below); a `NULL`-job `NEVER_LAUNCHED` reaching the errmgr fallback and tearing the DVM down promptly instead of hanging; and `check_complete`'s resource accounting, which only shows up as successive jobs re-filling the same allocation on one persistent DVM. |
 
 Testing a policy that discriminates between a **primary** job and one it
 **spawned** needs an application that calls `PMIx_Spawn`. The tree ships

@@ -73,11 +73,65 @@ applied at the job level:
   file.
 
 * "PPR:N":resource maps N procs to each instance of the specified
-  resource type in the allocation
+  resource type in the allocation. The resource may be an hwloc object
+  ("ppr:2:package") or a class of device ("ppr:2:device=gpu"), which
+  places N procs on each such device.
 
 * "RANKFILE" (often accompanied by the file=<path> qualifier) assigns
   one process to the node/resource specified in each entry of the
   file, one per line of the file.
+
+* "DEVICE=<class|name>" assigns one proc to each device in the node's
+  topology, in PCI bus order, placing it on the CPUs local to that
+  device. The value is either a class of device - "gpu", "network", or
+  "block" - or the name or UUID of one particular device, such as
+  "mlx5_0", in which case every proc is placed near that one device.
+  "nic", "fabric" and "openfabrics" are accepted as spellings of
+  "network" and mean exactly the same set: one entry per card, whether
+  the node presents it as an OpenFabrics device (mlx5_0), a network
+  interface (ib0), or both.
+  Note there is no bare "--mapby gpu": the class is the value of the
+  "device" directive, which is what allows other classes of device to
+  be supported later without adding a directive for each.
+  A device is assigned to a process rather than subdivided between
+  them, so each device takes one process and asking for more processes
+  than there are devices is an error unless the "SHARED" qualifier is
+  given.
+  Binding descends from the device's locality - the nearest object in
+  the topology that both contains the device and has CPUs. Asking to
+  bind to something larger than that locality is an error rather than a
+  silent widening, because a binding that covers more than the device's
+  locality is not "near the device" at all. On a machine where every
+  device is equally close to every CPU, the job still runs and each
+  proc is still assigned its own device, but a warning is printed
+  because the binding cannot be made any more specific than it would
+  have been without the directive.
+  Mapping by a GPU also requires that the GPUs can be named to the
+  vendor's runtime. hwloc records a GPU's vendor identity - an NVIDIA
+  "GPU-<uuid>" and its AMD and Intel equivalents - only when built with
+  that vendor's backend (NVML, RSMI, Level Zero). Without it the GPUs
+  are still found and still placed against, but no process can be told
+  which one it got in terms its GPU library will accept, so the request
+  is refused rather than silently doing nothing useful. The deciding
+  hwloc is the one PRRTE was built against. Other device classes are
+  unaffected: a network or fabric device is named by its own GUIDs.
+  Given that identity, each process is handed its GPUs in the variable
+  its vendor's runtime reads - CUDA_VISIBLE_DEVICES for NVIDIA,
+  ROCR_VISIBLE_DEVICES for AMD - named by the vendor's own identifier.
+  Only processes mapped against a device get it, and an existing value
+  is replaced. PRRTE never sets the vendor's device ORDERING variable.
+  Intel GPUs get ZE_AFFINITY_MASK, which has no identifier form and takes
+  Level Zero device ordinals - read from the enumeration hwloc's Level
+  Zero backend recorded, not guessed. ZE_FLAT_DEVICE_HIERARCHY is stated
+  alongside it, since a driver interprets the mask against whichever
+  model that names; if the process already names a different model,
+  nothing is set and a message says so.
+  A process mapped against a network device is handed it the same way,
+  in the variables the fabric libraries read - NCCL_IB_HCA and
+  UCX_NET_DEVICES for a Mellanox/NVIDIA adapter, PSM3_NIC for an Intel
+  Omni-Path one - named as those libraries name it ("mlx5_0"). No
+  variable that takes a unit NUMBER is set (HFI_UNIT, FI_OPX_HFI_SELECT):
+  a wrong unit number does not fail, it silently selects another adapter.
 
 * "PE-LIST=a,b" assigns procs to each node in the allocation based on
   the ORDERED qualifier. The list is comprised of comma-delimited
@@ -131,6 +185,39 @@ the "--mapby" option (except where noted):
 
 * "FILE=<path>" (path to file containing sequential or rankfile
   entries).
+
+* "INTERLEAVE[=<level>]" only applies to the "DEVICE" directive. It
+  reorders the device list so that consecutive processes land on
+  different objects of the given level - "package" (the default),
+  "numa", "l3cache", "l2cache" or "l1cache". On a node with two GPUs
+  per socket, "device=gpu:interleave" places the first two processes on
+  different sockets rather than filling the first socket. Note that
+  "node" is not an accepted level: interleaving across nodes is what
+  the "SPAN" qualifier already expresses. A level that does not divide
+  the devices into groups leaves the order unchanged, so the qualifier
+  is safe to leave in a default mapping policy.
+
+* "SHARED[=true|false]" only applies to the "DEVICE" directive. It
+  permits several processes to be assigned the same device. The default
+  is false: a device is assigned to a process rather than subdivided
+  between them, so a job asking for more processes than there are
+  devices is an error unless this is given. Note this is a separate
+  question from the "overload-allowed" qualifier to "--bindto", which
+  concerns running more processes than there are CPUs.
+
+* "NDEV=<n>" only applies to the "DEVICE" directive. It assigns n
+  devices to each process rather than one.
+  This changes what a process is placed against, and that is worth
+  understanding. A process holding two GPUs attached to different NUMA
+  domains is local to neither of them alone - it is local to whatever
+  contains them both. So the locality of a process becomes the common
+  ancestor of its devices' localities, and binding descends from there.
+  On a node with two GPUs per socket, "ndev=2" therefore makes each
+  process package-local, which means "--bindto package" is legitimate in
+  that case and remains an error without "ndev".
+  Devices are handed out in groups taken in order from the device list,
+  so a group is a contiguous run of that order and the "INTERLEAVE"
+  qualifier composes with this one.
 
 * "ORDERED" only applies to the "PE-LIST" option to indicate that
   procs are to be bound to each of the specified CPUs in the order in

@@ -41,7 +41,7 @@ Three concepts govern the whole framework, and they are **orthogonal**:
 | **Binding** | Which CPUs is each proc restricted to? | `--bind-to` | `jdata->map->binding` |
 
 `--map-by slot`/`node`/`core`/`l3cache`/`numa`/`package`/`hwthread`/
-`seq`/`ppr`/`rankfile`/`pe-list=…`/`dist` plus colon modifiers
+`seq`/`ppr`/`rankfile`/`pe-list=…` plus colon modifiers
 (`PE=n`, `SPAN`, `OVERSUBSCRIBE`, `NOLOCAL`, `HWTCPUS`, `INHERIT`,
 `ORDERED`, `FILE=…`, …). `--rank-by slot`/`node`/`fill`/`span`.
 
@@ -294,7 +294,7 @@ A mapper is mostly glue around them:
 | `prte_rmaps_base_get_ncpus()` | How many usable cpus/cores an object (or whole node) offers under the current cpu-type. |
 | `prte_rmaps_base_check_avail()` | Can this node/object take more procs? Also adds the node to `jdata->map->nodes` exactly once and sets `options->target`. **It can also remove and release the node** — see below. |
 | `prte_rmaps_base_check_oversubscribed()` | After placing a proc, flag/deny oversubscription per the node's SLOTS_GIVEN and the job's OVERSUBSCRIBE directive. |
-| `prte_rmaps_base_setup_proc()` | Create the `prte_proc_t`, attach it to the node, assign node rank, bump `slots_inuse`, and **bind it** (`prte_rmaps_base_bind_proc`). |
+| `prte_rmaps_base_setup_proc()` | Create the `prte_proc_t`, attach it to the node, assign node rank, bump `slots_inuse`, draw down `slots_available`, and **bind it** (`prte_rmaps_base_bind_proc`). |
 | `prte_rmaps_base_compute_vpids()` | Assign global ranks by slot/node/fill/span, then derive local & app ranks. |
 | `prte_rmaps_base_bind_proc()` | Bind a proc: dispatch to `bind_generic` / `bind_multiple` (pe>1) / `bind_to_cpuset` (pe-list), or no-op for by-user/bind-none. |
 
@@ -324,6 +324,60 @@ obligations follow:
   passes `NULL` and simply takes the "no" — handing over a list of the wrong
   type meant removing a `prte_node_t` from a list of `seq_node_t`.
 
+### `slots_available` is the per-job budget, and it is not `slots`
+
+`node->slots` is what the node has; `node->slots_available` is what *this
+job* may take from it. `get_target_nodes()` sets the second one, and a `:N`
+suffix on a `-host` entry makes it smaller than the first — that is the whole
+point of the suffix when the `-host` selects within an allocation somebody
+else built. `setup_proc()` consumes one per placed proc, so a mapper caps
+itself on a node by watching `slots_available` run out.
+
+Nothing below the mappers does that for them: `check_avail()` and
+`check_oversubscribed()` both measure against `node->slots`, so a mapper that
+consults neither the field nor its own count of what it has placed will fill
+the node to its slot count and leave the rest of the user's `-host` list
+empty. Every mapper here caps itself: by-slot/by-node/by-cpu and ppr read
+the field before placing, and `map_targets` checks it per placement.
+
+**Permission to oversubscribe lifts the ceiling, it does not change the
+distribution.** Each node gets what it was given first, and the procs left
+over once every node has had its share are then split **evenly** over the
+nodes — the same arithmetic by-slot and by-node use for their second pass, so
+every mapper answers an oversubscribed job alike. (`:SPAN` reaches the same
+balance without that arithmetic: it hands out one target per node per pass,
+so the rotation itself spreads the overflow.) With `-host a:2,b:2,c:2`
+and `--map-by core:oversubscribe`, `-n 8` is 3/3/2, `-n 12` is 4/4/4 and
+`-n 18` is 6/6/6, each identical to `--map-by slot:oversubscribe`. Before
+this, an object map put the whole overflow on the head of the list (8/0/0,
+8/2/2, 14/2/2).
+
+The same machinery covers the other direction, and the other spelling. A
+hostfile `slots=` *smaller* than the node caps the job the same way — that is
+what lets a user subdivide an allocation — and
+`prte_util_filter_hostfile_nodes()` writes it straight onto the pool's node
+object, so it records the resize first. Unrecorded (issue #2698), one job's
+hostfile shrank the node for every job the DVM ran afterwards. See
+[`src/util/hostfile/AGENTS.md`](../../util/hostfile/AGENTS.md).
+
+**A cap that is *larger* than the node is reconciled in `get_target_nodes`,
+and the answer depends on who sized the node.** A resource manager decided
+how much of that node is ours and we cannot hand a job more, so the request
+is refused (`dash-host:slots-exceed-allocation`); an unmanaged allocation is
+only the user's own description of a machine nobody is scheduling, so the
+`:N` re-states it and the node is grown to fit. That growth belongs to the
+map, not to the allocation — `--host` says how many slots *this job* may have
+(`--add-host` is what changes an allocation) — so it is recorded with
+`prte_rmaps_base_record_resize()` and undone by
+`prte_rmaps_base_restore_resized()` at `map_job`'s `cleanup`, on both
+outcomes — along with the node's `PRTE_NODE_FLAG_SLOTS_GIVEN`, which the
+growth sets and which a *later* job reads to decide whether it may
+oversubscribe. `prte_ras_base.total_slots_alloc` describes the allocation and is
+deliberately left alone. `prte_ras_base.scheduler_owned` is what tells the two
+cases apart — the same flag that decides whether `--add-host` may grow the
+pool, and for the same reason: both ask whether the node counts are ours to
+change. See [`src/mca/ras/AGENTS.md`](../ras/AGENTS.md).
+
 ### Who owns what in `options`
 
 `node->available` and `options->job_cpuset` are **never NULL**. The mappers
@@ -337,12 +391,12 @@ offers nothing and is reported unusable through the normal path, and
 [`src/hwloc/AGENTS.md`](../../hwloc/AGENTS.md).
 
 `job_cpuset` and `target` are hwloc bitmaps the mappers recycle per node;
-`cpuset` and `dist_device` are strings the *struct* owns (they come out of an
-attribute, which returns a copy). `bind_to_cpuset` consumes `cpuset` one
+`cpuset` is a string the *struct* owns (it comes out of an attribute, which
+returns a copy). `bind_to_cpuset` consumes `cpuset` one
 entry at a time and rewrites it, so the pointer at the end of a map is
 whatever the mapper left, not what was read in. `prte_rmaps_base_map_job()`
-frees all four at `cleanup`, and the per-app copy gets its own `strdup` of
-the strings so two structs never share one allocation.
+frees all three at `cleanup`, and the per-app copy gets its own `strdup` of
+the string so two structs never share one allocation.
 
 ---
 
@@ -451,6 +505,37 @@ node→session deviation.
 
 ---
 
+## Mapping by device
+
+`--map-by device=<class>` places each proc against a device rather than a
+cpu object. The enumeration is **PMIx's** (`pmix_hwloc_get_devices()`), not
+a walk written here, so that the devices a proc is assigned and the devices
+`PMIX_DEVICE_DISTANCES` reports it can see cannot disagree. Two facts about
+it govern everything in `rmaps_base_devices.c`:
+
+- **Naming a device means naming its node.** A device uuid embeds a
+  hostname, and the mapper reads *other* nodes' topologies, so
+  `prte_rmaps_base_devices_begin()` passes `node->name`. Letting PMIx
+  default it stamps the HNP on every device in the job — the uuid then
+  fails to match what the process computes locally, which is the only thing
+  the uuid is for.
+- **A GPU nothing can name is refused.** hwloc records a GPU's vendor
+  identity (`NVIDIAUUID`, `AMDUUID`, `LevelZeroUUID`) only from its vendor
+  backends, and that identity is the sole handle a GPU runtime accepts. If
+  any GPU on the node lacks one, the request fails with
+  `rmaps:device-not-nameable` rather than mapping and telling the process
+  nothing — those two outcomes are indistinguishable while the job runs,
+  and the second one silently puts every rank on the same GPU. The check is
+  GPU-only: fabric and network devices are named by their own GUIDs.
+
+That second check runs on the HNP against a **shared** topology, and is
+sound anyway: an absent info attribute changes an object's info count,
+hwloc reports that as a "too complex" difference rather than an expressible
+one, and `prte_plm_base_daemon_callback()` records such a node under its
+own `prte_topology_t`. So *whether* identity exists cannot vary inside one
+recorded topology. Its **value** can, and must be read on the node itself —
+never from the HNP's copy, which belongs to whichever node reported first.
+
 ## Conventions specific to this framework
 
 - **Policy bits are packed.** A `prte_mapping_policy_t` holds the policy
@@ -502,7 +587,7 @@ node→session deviation.
   their parsed rank map and rank count in file statics. Reset them at the
   start of every map and reclaim them on *every* exit, success or failure —
   a stale count is handed to the next job as its process count.
-- **The version macro is `PRTE_RMAPS_BASE_VERSION_5_0_0`.** The `4_0_0`
+- **The version macro is `PRTE_MCA_BASE_VERSION(rmaps)`.** The `4_0_0`
   alias is deliberately redefined to `5_0_0` so stale out-of-tree
   components fail loudly instead of silently violating ABI.
 - Standard PRRTE rules still apply: `prte_config.h` first, braces on
@@ -528,6 +613,7 @@ without a node pool, a topology, or a DVM:
 | `test_resolve_options.c` | `resolve_app_options` and the rank/bind default derivations |
 | `test_ranking.c` | `compute_vpids`: by-slot/by-node traversal, the per-app cursor, by-user pass-through, and that a cycling scheme terminates |
 | `test_check_avail.c` | `check_avail`: the map-add-once rule, `max_slots`, and the node-removal contract above |
+| `test_resize.c` | `record_resize`/`restore_resized`: a node re-sized for one map goes back — the count and the SLOTS_GIVEN flag — and the hostfile `slots=` cap that rides the same list |
 | `test_dispatch.c`, `test_<component>.c` | each mapper's accept/defer gate |
 
 `test_ranking.c` builds a job map by hand — synthetic nodes carrying

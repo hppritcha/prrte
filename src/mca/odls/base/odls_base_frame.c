@@ -30,11 +30,9 @@
 #include <signal.h>
 #include <string.h>
 
-#include "src/class/pmix_ring_buffer.h"
 #include "src/hwloc/hwloc-internal.h"
 #include "src/mca/base/pmix_base.h"
 #include "src/mca/mca.h"
-#include "src/runtime/prte_progress_threads.h"
 #include "src/util/pmix_argv.h"
 #include "src/util/pmix_output.h"
 #include "src/util/pmix_path.h"
@@ -73,41 +71,15 @@ prte_odls_globals_t prte_odls_globals = {
     .output = 0,
     .xterm_ranks = PMIX_LIST_STATIC_INIT,
     .xtermcmd = NULL,
-    .max_threads = 0,
-    .num_threads = 0,
-    .cutoff = 0,
-    .ev_bases = NULL,
-    .ev_threads = NULL,
-    .next_base = 0,
     .signal_direct_children_only = false,
-    .exec_agent = NULL
+    .exec_agent = NULL,
+    .scatter_cpusets = true,
+    .pending_slices = PMIX_LIST_STATIC_INIT
 };
-
-static prte_event_base_t **prte_event_base_ptr = NULL;
 
 static int prte_odls_base_register(pmix_mca_base_register_flag_t flags)
 {
     PRTE_HIDE_UNUSED_PARAMS(flags);
-
-    prte_odls_globals.max_threads = 16;
-    (void) pmix_mca_base_var_register("prte", "odls", "base", "max_threads",
-                                      "Maximum number of threads to use for spawning local procs",
-                                      PMIX_MCA_BASE_VAR_TYPE_INT,
-                                      &prte_odls_globals.max_threads);
-
-    /* -1 means "you decide" - start_threads then sizes the pool from the
-     * first job it is handed, and writes its choice back here */
-    prte_odls_globals.num_threads = -1;
-    (void) pmix_mca_base_var_register("prte", "odls", "base", "num_threads",
-                                      "Specific number of threads to use for spawning local procs",
-                                      PMIX_MCA_BASE_VAR_TYPE_INT,
-                                      &prte_odls_globals.num_threads);
-
-    prte_odls_globals.cutoff = 32;
-    (void) pmix_mca_base_var_register("prte", "odls", "base", "cutoff",
-                                      "Minimum number of local procs before using thread pool for spawn",
-                                      PMIX_MCA_BASE_VAR_TYPE_INT,
-                                      &prte_odls_globals.cutoff);
 
     prte_odls_globals.signal_direct_children_only = false;
     (void) pmix_mca_base_var_register("prte", "odls", "base", "signal_direct_children_only",
@@ -122,112 +94,38 @@ static int prte_odls_base_register(pmix_mca_base_register_flag_t flags)
                                       PMIX_MCA_BASE_VAR_TYPE_STRING,
                                       &prte_odls_globals.exec_agent);
 
+    prte_odls_globals.scatter_cpusets = true;
+    (void) pmix_mca_base_var_register("prte", "odls", "base", "scatter_cpusets",
+                                      "Send each daemon the bindings of the procs it will launch, "
+                                      "rather than broadcasting every proc's binding to every daemon",
+                                      PMIX_MCA_BASE_VAR_TYPE_BOOL,
+                                      &prte_odls_globals.scatter_cpusets);
+
+    /* A fault-injection hook, in the same spirit as prte_daemon_fail.  The
+     * daemon forks its children on a worker thread and records each child's
+     * pid there, while the SIGCHLD reaper runs on the progress thread and
+     * has nothing but that pid with which to attribute what it reaps.  A
+     * child short-lived enough to run between the fork and the store used to
+     * be reaped unattributably, and the job then never completed.  The child
+     * is now held until the store is done, and stalling here is what widens
+     * a window that is otherwise microseconds wide and fails in a fraction
+     * of a percent of launches.
+     *
+     * Deliberately NOT restricted to a debug build.  A timing defect has to
+     * be demonstrable in the build that ships, and an optimized build is a
+     * different race from a debug one; a hook that exists only in the latter
+     * cannot say anything about the former.  It costs a load and a
+     * predictable branch per fork(), against a fork/exec pair, and every
+     * launched proc pays the stall itself only if somebody sets it. */
+    prte_odls_globals.fork_publish_delay = 0;
+    (void) pmix_mca_base_var_register("prte", "odls", "base", "fork_publish_delay",
+                                      "Microseconds to stall between forking a child and recording "
+                                      "its pid, to exercise the launch/reap race "
+                                      "[default: 0 => no delay]",
+                                      PMIX_MCA_BASE_VAR_TYPE_INT,
+                                      &prte_odls_globals.fork_publish_delay);
+
     return PRTE_SUCCESS;
-}
-
-void prte_odls_base_harvest_threads(void)
-{
-    int i;
-
-    if (0 < prte_odls_globals.num_threads) {
-        /* stop the progress threads */
-        if (NULL != prte_odls_globals.ev_threads) {
-            for (i = 0; NULL != prte_odls_globals.ev_threads[i]; i++) {
-                prte_progress_thread_finalize(prte_odls_globals.ev_threads[i]);
-            }
-            PMIx_Argv_free(prte_odls_globals.ev_threads);
-            prte_odls_globals.ev_threads = NULL;
-        }
-        /* this pool owned its array (the no-thread case borrows the shared
-         * prte_event_base_ptr instead, freed below) */
-        free(prte_odls_globals.ev_bases);
-    }
-    /* release the shared one-element array used when no dedicated threads
-     * were spun up. Nothing freed it before, so a daemon that launched any
-     * job below the cutoff leaked it at teardown */
-    if (NULL != prte_event_base_ptr) {
-        free(prte_event_base_ptr);
-        prte_event_base_ptr = NULL;
-    }
-    /* the pool is gone. Record that as "no threads" rather than restoring
-     * the -1 "you decide" sentinel: harvest runs from framework close, and
-     * leaving the sizing question open there invites start_threads to
-     * build a WHOLE NEW POOL on the way out if anything calls it again
-     * during teardown - which is exactly what happened (a 40-proc job on
-     * one node spun its five threads a second time while finalizing). */
-    prte_odls_globals.ev_bases = NULL;
-    prte_odls_globals.next_base = 0;
-    prte_odls_globals.num_threads = 0;
-}
-
-void prte_odls_base_start_threads(prte_job_t *jdata)
-{
-    int i;
-    char *tmp;
-
-    /* nothing to build on the way out - and harvest_threads has already
-     * torn down whatever there was */
-    if (prte_finalizing) {
-        return;
-    }
-
-    /* only do this once. NB: test ev_bases, not ev_threads - the
-     * no-dedicated-thread case leaves ev_threads NULL, so keying off it
-     * re-entered here on every subsequent job. */
-    if (NULL != prte_odls_globals.ev_bases) {
-        return;
-    }
-
-    /* if we are a persistent DVM, expect to service lots
-     * of clients */
-    if (prte_persistent) {
-        prte_odls_globals.num_threads = prte_odls_globals.max_threads;
-        goto startup;
-    }
-
-    /* setup the pool of worker threads */
-    prte_odls_globals.ev_threads = NULL;
-    prte_odls_globals.next_base = 0;
-    if (-1 == prte_odls_globals.num_threads) {
-        if ((int) jdata->num_local_procs < prte_odls_globals.cutoff) {
-            /* do not use any dedicated odls thread */
-            prte_odls_globals.num_threads = 0;
-        } else {
-            /* user didn't specify anything, so default to some fraction of
-             * the number of local procs, capping it at the max num threads
-             * parameter value. */
-            prte_odls_globals.num_threads = jdata->num_local_procs / 8;
-            if (0 == prte_odls_globals.num_threads) {
-                prte_odls_globals.num_threads = 1;
-            } else if (prte_odls_globals.max_threads < prte_odls_globals.num_threads) {
-                prte_odls_globals.num_threads = prte_odls_globals.max_threads;
-            }
-        }
-    }
-startup:
-    if (0 >= prte_odls_globals.num_threads) {
-        /* a negative num_threads only reaches here if the user asked for
-         * one; treat it as "no dedicated threads" rather than indexing
-         * ev_bases with it */
-        prte_odls_globals.num_threads = 0;
-        if (NULL == prte_event_base_ptr) {
-            prte_event_base_ptr = (prte_event_base_t **) malloc(sizeof(prte_event_base_t *));
-            /* use the default event base */
-            prte_event_base_ptr[0] = prte_event_base;
-        }
-        prte_odls_globals.ev_bases = prte_event_base_ptr;
-    } else {
-        pmix_output_verbose(5, prte_odls_base_framework.framework_output,
-                            "START %d LAUNCH THREADS", prte_odls_globals.num_threads);
-        prte_odls_globals.ev_bases = (prte_event_base_t **) malloc(prte_odls_globals.num_threads
-                                                                   * sizeof(prte_event_base_t *));
-        for (i = 0; i < prte_odls_globals.num_threads; i++) {
-            pmix_asprintf(&tmp, "PRTE-ODLS-%d", i);
-            prte_odls_globals.ev_bases[i] = prte_progress_thread_init(tmp);
-            PMIx_Argv_append_nosize(&prte_odls_globals.ev_threads, tmp);
-            free(tmp);
-        }
-    }
 }
 
 static int prte_odls_base_close(void)
@@ -242,6 +140,10 @@ static int prte_odls_base_close(void)
     }
     PMIX_DESTRUCT(&prte_odls_globals.xterm_ranks);
 
+    /* anything still here is a launch that never completed, or a slice for
+     * one - PMIX_DESTRUCT would leave the items themselves behind */
+    PMIX_LIST_DESTRUCT(&prte_odls_globals.pending_slices);
+
     /* cleanup the global list of local children and job data */
     for (i = 0; i < prte_local_children->size; i++) {
         if (NULL != (proc = (prte_proc_t *) pmix_pointer_array_get_item(prte_local_children, i))) {
@@ -249,8 +151,6 @@ static int prte_odls_base_close(void)
         }
     }
     PMIX_RELEASE(prte_local_children);
-
-    prte_odls_base_harvest_threads();
 
     return pmix_mca_base_framework_components_close(&prte_odls_base_framework, NULL);
 }
@@ -277,6 +177,7 @@ static int prte_odls_base_open(pmix_mca_base_open_flag_t flags)
 
     /* initialize ODLS globals */
     PMIX_CONSTRUCT(&prte_odls_globals.xterm_ranks, pmix_list_t);
+    PMIX_CONSTRUCT(&prte_odls_globals.pending_slices, pmix_list_t);
     prte_odls_globals.xtermcmd = NULL;
 
     /* ensure that SIGCHLD is unblocked as we need to capture it */
@@ -343,7 +244,7 @@ static int prte_odls_base_open(pmix_mca_base_open_flag_t flags)
     return pmix_mca_base_framework_components_open(&prte_odls_base_framework, flags);
 }
 
-PMIX_MCA_BASE_FRAMEWORK_DECLARE(prte, odls, "PRTE Daemon Launch Subsystem", prte_odls_base_register,
+PRTE_MCA_BASE_FRAMEWORK_DECLARE(odls, "PRTE Daemon Launch Subsystem", prte_odls_base_register,
                                 prte_odls_base_open, prte_odls_base_close,
                                 prte_odls_base_static_components,
                                 PMIX_MCA_BASE_FRAMEWORK_FLAG_DEFAULT);
@@ -374,6 +275,10 @@ static void sccon(prte_odls_spawn_caddy_t *p)
     p->bind_cpuset = NULL;
     p->bind_fatal = false;
     p->do_membind = false;
+    p->membind_prep_errno = 0;
+    p->membind_mode = 0;
+    p->membind_nodemask = NULL;
+    p->membind_maxnode = 0;
 #if PRTE_HAVE_SCHED_SETAFFINITY
     p->bind_mask = NULL;
     p->bind_masksize = 0;
@@ -395,6 +300,9 @@ static void scdes(prte_odls_spawn_caddy_t *p)
     }
     if (NULL != p->bind_cpuset) {
         hwloc_bitmap_free(p->bind_cpuset);
+    }
+    if (NULL != p->membind_nodemask) {
+        free(p->membind_nodemask);
     }
 #if PRTE_HAVE_SCHED_SETAFFINITY
     if (NULL != p->bind_mask) {

@@ -49,6 +49,65 @@
 #include "src/runtime/data_server/prte_data_server.h"
 #include "src/runtime/data_server/ds.h"
 
+/* A parked lookup that was given a PMIX_TIMEOUT gets an event that fires if
+ * nothing satisfies it first.  Without one, a PMIX_WAIT lookup for a key
+ * nobody ever publishes waits forever: the timeout the caller gave reached
+ * the daemon's caddy and went no further, and the request left the pending
+ * list only when a publish matched it or its requestor died. */
+static void lookup_timeout(int sd, short args, void *cbdata)
+{
+    prte_data_req_t *req = (prte_data_req_t *) cbdata;
+    pmix_data_buffer_t *reply;
+    pmix_status_t ret = PMIX_ERR_TIMEOUT;
+    uint8_t command = PRTE_PMIX_LOOKUP_CMD;
+    int rc;
+
+    PRTE_HIDE_UNUSED_PARAMS(sd, args);
+    PMIX_ACQUIRE_OBJECT(req);
+
+    /* the event has fired, so there is nothing left to disarm */
+    req->timer_active = false;
+
+    pmix_output_verbose(1, prte_data_store.output,
+                        "%s data server: parked lookup from %s timed out",
+                        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                        PMIX_NAME_PRINT(&req->requestor));
+
+    /* it is waiting for nothing now */
+    pmix_list_remove_item(&prte_data_store.pending, &req->super);
+
+    /* answer it: room number, the command it is an answer to, and the
+     * status.  A timeout carries no payload, and the daemon-side receiver
+     * knows not to look for one */
+    PMIX_DATA_BUFFER_CREATE(reply);
+    rc = PMIx_Data_pack(NULL, reply, &req->room_number, 1, PMIX_INT);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        goto done;
+    }
+    rc = PMIx_Data_pack(NULL, reply, &command, 1, PMIX_UINT8);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        goto done;
+    }
+    rc = PMIx_Data_pack(NULL, reply, &ret, 1, PMIX_STATUS);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        goto done;
+    }
+    PRTE_RML_RELIABLE_SEND(rc, req->proxy.rank, reply, PRTE_RML_TAG_DATA_CLIENT);
+    if (PRTE_SUCCESS != rc) {
+        PRTE_ERROR_LOG(rc);
+        goto done;
+    }
+    PMIX_RELEASE(req);
+    return;
+
+done:
+    PMIX_DATA_BUFFER_RELEASE(reply);
+    PMIX_RELEASE(req);
+}
+
 pmix_status_t prte_ds_lookup(pmix_proc_t *sender, int room_number,
                              pmix_data_buffer_t *buffer,
                              pmix_data_buffer_t *answer)
@@ -64,8 +123,13 @@ pmix_status_t prte_ds_lookup(pmix_proc_t *sender, int room_number,
     pmix_info_t *info;
     pmix_data_buffer_t pbkt;
     uint32_t uid = UINT32_MAX;
+    uint32_t gid = UINT32_MAX;
+    int timeout = 0;
     bool wait = false;
-    pmix_data_range_t range=PMIX_RANGE_UNDEF;
+    bool denied = false;
+    /* the default range for a lookup is SESSION - see the PMIx
+     * retrieval rules for published data */
+    pmix_data_range_t range = PMIX_RANGE_SESSION;
     prte_data_object_t *data;
     prte_ds_info_t *rinfo;
     prte_info_item_t *ds1, *ds2;
@@ -73,6 +137,7 @@ pmix_status_t prte_ds_lookup(pmix_proc_t *sender, int room_number,
     bool found;
     prte_data_req_t *req, rq;
     pmix_byte_object_t pbo;
+    struct timeval tv;
 
     /* unpack the requestor */
     count = 1;
@@ -130,11 +195,18 @@ pmix_status_t prte_ds_lookup(pmix_proc_t *sender, int room_number,
         for (n = 0; n < ninfo; n++) {
             if (PMIx_Check_key(info[n].key, PMIX_USERID)) {
                 uid = info[n].value.data.uint32;
+            } else if (PMIx_Check_key(info[n].key, PMIX_GRPID)) {
+                gid = info[n].value.data.uint32;
+            } else if (PMIx_Check_key(info[n].key, PMIX_TIMEOUT)) {
+                timeout = info[n].value.data.integer;
             } else if (PMIx_Check_key(info[n].key, PMIX_WAIT)) {
                 /* flag that we wait until the data is present */
                 wait = true;
             } else if (PMIx_Check_key(info[n].key, PMIX_RANGE)) {
                 range = info[n].value.data.range;
+            } else if (PMIx_Check_key(info[n].key, PMIX_REQUESTOR)) {
+                /* a relay looking up on behalf of a process in its own DVM */
+                prte_ds_check_requestor(&requestor, &info[n]);
             }
         }
         /* ignore anything else for now */
@@ -147,6 +219,13 @@ pmix_status_t prte_ds_lookup(pmix_proc_t *sender, int room_number,
     PMIX_CONSTRUCT(&rq, prte_data_req_t);
     memcpy(&rq.requestor, &requestor, sizeof(pmix_proc_t));
     memcpy(&rq.proxy, sender, sizeof(pmix_proc_t));
+    /* the range the requestor gave constrains the search, so it has to be
+     * on the request we hand to the range checks - it used to be unpacked
+     * and then only ever reach a PARKED request, which meant an immediate
+     * lookup searched everything the publishers would let it see */
+    rq.range = range;
+    rq.uid = uid;
+    rq.gid = gid;
 
     for (i = 0; NULL != keys[i]; i++) {
         pmix_output_verbose(10, prte_data_store.output,
@@ -159,17 +238,27 @@ pmix_status_t prte_ds_lookup(pmix_proc_t *sender, int room_number,
             if (NULL == data) {
                 continue;
             }
-            /* for security reasons, can only access data posted by the same user id */
-            if (uid != data->uid) {
-                pmix_output_verbose(10, prte_data_store.output,
-                                    "%s\tMISMATCH UID %u %u",
-                                    PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), (unsigned) uid,
-                                    (unsigned) data->uid);
+            /* Access is decided in two steps, in this order: the
+             * requestor must first satisfy the publisher's access
+             * permissions, and then meet its range constraint. */
+            if (PMIX_SUCCESS != prte_data_server_check_access(&rq, data)) {
+                /* if this item holds the key, the answer is "you may not
+                 * have it" rather than "there is no such thing", and the
+                 * retrieval rules ask us to say so */
+                PMIX_LIST_FOREACH(ds1, &data->info, prte_info_item_t) {
+                    if (PMIx_Check_key(ds1->info.key, keys[i])) {
+                        denied = true;
+                        break;
+                    }
+                }
                 continue;
             }
-
-            /* check the range */
             if (PMIX_SUCCESS != prte_data_server_check_range(&rq, data)) {
+                continue;
+            }
+            /* ...and the requestor's own range constrains which publishers
+             * it asked us to search at all */
+            if (PMIX_SUCCESS != prte_data_server_check_search_range(&rq, data)) {
                 continue;
             }
             /* see if we have this key */
@@ -263,10 +352,21 @@ pmix_status_t prte_ds_lookup(pmix_proc_t *sender, int room_number,
             req->proxy = *sender;
             memcpy(&req->requestor, &requestor, sizeof(pmix_proc_t));
             req->uid = uid;
+            req->gid = gid;
             req->range = range;
             req->keys = cache;
             cache = NULL;
             pmix_list_append(&prte_data_store.pending, &req->super);
+            if (0 < timeout) {
+                /* the caller said how long it is prepared to wait */
+                tv.tv_sec = timeout;
+                tv.tv_usec = 0;
+                prte_event_evtimer_set(prte_event_base, &req->ev,
+                                       lookup_timeout, req);
+                req->timer_active = true;
+                PMIX_POST_OBJECT(req);
+                prte_event_evtimer_add(&req->ev, &tv);
+            }
             PMIx_Argv_free(keys);
             PMIX_DATA_BUFFER_DESTRUCT(&pbkt);
             PMIX_DESTRUCT(&rq);
@@ -281,8 +381,11 @@ pmix_status_t prte_ds_lookup(pmix_proc_t *sender, int room_number,
             PMIx_Argv_free(cache);
             cache = NULL;
             if (0 == nanswers) {
-                /* nothing was found - indicate that situation */
-                rc = PMIX_ERR_NOT_FOUND;
+                /* nothing was found - indicate that situation.  If the
+                 * data was there and we refused it, say which: the
+                 * retrieval rules reserve PMIX_ERR_NO_PERMISSIONS for
+                 * exactly this case */
+                rc = denied ? PMIX_ERR_NO_PERMISSIONS : PMIX_ERR_NOT_FOUND;
                 PMIx_Argv_free(keys);
                 PMIX_DATA_BUFFER_DESTRUCT(&pbkt);
                 PMIX_DESTRUCT(&rq);

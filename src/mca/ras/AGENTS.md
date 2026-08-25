@@ -55,7 +55,7 @@ see below.
 
 ```
 ras/
-  ras.h                    # module/component vtable + PRTE_RAS_BASE_VERSION_2_0_0
+  ras.h                    # module/component vtable + PRTE_MCA_BASE_VERSION(ras)
   base/
     base.h                 # framework-global struct (prte_ras_base) + all base API prototypes
     ras_base_frame.c       # framework open/close/register; ras_base MCA params; globals
@@ -141,33 +141,204 @@ distinct requester among its targets: one campaign can cover several grows.
 
 ---
 
-## Component selection is not "pick one"
+## An allocation has exactly one owner
 
-`prte_ras_base_select()` (in `ras_base_select.c`) works like the `rmaps`
-selector, not the usual single-winner MCA pattern: it queries every
-component, runs each returned module's `init`, and stores **all** of
-them **priority-sorted** in `prte_ras_base.selected_modules`
-(a `pmix_list_t` of `prte_ras_base_selected_module_t`, each holding
-`pri`, `module`, `component`). The driver then walks that list at
-allocate time. With `ras_base_verbose > 4` the selector prints the final
-prioritized list.
+`prte_ras_base_select()` (in `ras_base_select.c`) queries every component and
+builds a **priority-ordered candidate list**, then takes the first candidate
+whose `init()` succeeds. That one module is stored in
+`prte_ras_base.selected_modules` — still a `pmix_list_t` of
+`prte_ras_base_selected_module_t`, holding exactly one entry, so that every
+consumer (allocate, modify, release, shrink-complete, finalize) iterates
+unchanged. Only the winner is initialized, which is why `ras/slurm` no longer
+stands up its elastic bookkeeping in a DVM it is not allocating for. With
+`ras_base_verbose > 4` the selector prints the candidates and names the winner.
 
-Query priorities (higher wins first):
+Query priorities (higher wins):
 
 ```
 simulator 1000  =  testrm 1000  >  pbs 100  =  gridengine 100  =  flux 100
    >  lsf 75  >  slurm 50  >  bootstrap 20  =  pmix 20  >  hosts 1
 ```
 
-`hosts` is the catch-all default at priority **1** — it is always
-available and is tried last, handling `--host`/`--hostfile`/default
-hostfile and (via the base) the ultimate fall-back to a 1-slot local
-node. The RM components make themselves available only when their
-environment is detected (e.g. `slurm` requires a Slurm job id in the
-environment — see [`common/slurm`](../common/slurm/AGENTS.md)), so on any
-given machine at most one RM answers, then `hosts` closes out the list.
+`hosts` is the catch-all at priority **1**: always available, it handles
+`--host`/`--hostfile`/the default hostfile and (via the base) the ultimate
+fall-back to a 1-slot local node. The RM components make themselves available
+only when their environment is detected (e.g. `slurm` requires a Slurm job id
+— see [`common/slurm`](../common/slurm/AGENTS.md)), so at most one RM answers
+on a given machine. `pmix` answers only when it has actually been pointed at a
+scheduler (a URI, nspace, pid, host, connection order, or the
+system-scheduler switch); it used to answer unconditionally, which was
+harmless only while every module was kept, and would now shadow `hosts` in
+every unmanaged environment — its `allocate()` always returns
+`TAKE_NEXT_OPTION`, so nothing would read a hostfile.
 `simulator`/`testrm` sit at 1000 so that when explicitly configured they
 pre-empt everything.
+
+**This was multi-select until recently, and it never delivered what it was
+for.** The idea was a mixed allocator — a scheduler allocation plus extra
+hosts from a hostfile — but `prte_ras_base_allocate()` breaks at the first
+module that succeeds, so there is no union step and the second allocator never
+contributed a node. (Under a scheduler a hostfile is a *filter*; one naming a
+node outside the allocation is refused outright.) What the extra modules did
+do was serve `prte_ras_base_modify()`: a request the real allocator declined
+fell through to a module with no authority over the allocation. `ras/slurm`
+answers `PMIX_ERR_NOT_SUPPORTED` to anything that is not EXTEND/RELEASE/CANCEL
+and the driver reads that as "ask the next module", so a `PMIX_ALLOC_NEW`
+naming hostnames inside a Slurm allocation was served by `ras/hosts` — answered
+`PMIX_SUCCESS` with an allocation id minted, while Slurm was never asked and
+had granted nothing. The daemon launch on the un-allocated node then failed
+and took the DVM down. `docs/todo.rst` records what supporting mixed
+allocators would actually take.
+
+## Who may add a node
+
+Each module states, in `prte_ras_base_module_t::scheduler_owned`, whether an
+external resource manager owns what it allocated. Slurm, PBS, LSF, Flux,
+gridengine and the PMIx scheduler say yes; hosts, bootstrap, simulator and
+testrm say no. The base copies the selected module's answer into
+`prte_ras_base.scheduler_owned`.
+
+Where it is yes, **PRRTE may select from the allocation but must never add to
+it.** `prte_ras_base_add_hosts()` refuses `--add-host`/`--add-hostfile`
+outright (`ras-base:add-host-managed`), and refuses when no active component
+can serve the directive at all (`ras-base:add-host-unsupported`, which a
+bootstrapped DVM reaches). The refusal is issued **before** the request is
+posted, and that placement is load-bearing: serving it is asynchronous, the
+DVM is marked not-ready and the job parked in the cache, and only the grow's
+`VM_READY` re-entry releases it — so a request nothing answers leaves the job
+waiting on a DVM that never becomes ready again.
+
+Note what already handles the other direction: a node a scheduler has taken
+back is marked `PRTE_NODE_STATE_NOT_INCLUDED` by
+`prte_ras_slurm_exclude_shrunk_nodes()`, and both `setup_virtual_machine`
+branches and the mapper skip that state. Its pool entry deliberately survives
+— the pool index is `PMIX_NODEID` and must never be reused. The only thing
+that ever brought such a node back was `--add-host`, because
+`prte_ras_base_node_insert()` carries `PRTE_NODE_STATE_ADDED` onto an existing
+pool entry; refusing add-host under a scheduler closes that.
+
+**What the refusal took away, and `--activate` gives back.** Refusing
+add-host under a scheduler also closed the *legitimate* case it had been
+serving by accident: a node the scheduler **did** grant, sitting in the pool
+with `node->daemon` NULL because a `--host`/`--hostfile` given at DVM startup
+narrowed which pool entries got daemons, or because a released reservation
+handed it back without one. `prte_ras_base_activate_hosts()` (the
+`--activate` cmd line option, `PRTE_APP_ACTIVATE_HOSTS`) is that operation
+and nothing more: it resolves a `--host`-syntax specification against the
+node pool, marks the resolved entries `PRTE_NODE_STATE_ADDED` and calls
+`prte_ras_base_activate_dvm_grow()`. It inserts no node, changes no slot
+count, and calls no module — so `scheduler_owned` does not gate it, and it
+cannot name anything the allocation does not already contain. A `:N` slot
+extension is **refused** rather than ignored for the same reason: activate
+has no authority to set slot counts.
+
+**The same operation, asked for programmatically.** `PMIX_ALLOC_ACTIVATE`
+is the allocation directive that says exactly this, naming its nodes with
+`PMIX_HOST` and/or `PMIX_HOSTFILE`. `prte_ras_base_modify()` serves it
+**itself**, before the module loop, for the same reason `scheduler_owned`
+does not gate the command line: there is nothing for a module to do, and
+routing it to whichever component owns the allocation would make the answer
+depend on the RM in play — refusing under a scheduler the one size change
+that is always safe under one. Both forms resolve through
+`prte_ras_base_activate_nodes()`, so the syntax, the refusals and the
+treatment of an already-joined node are one implementation and cannot drift
+apart. The two differ only in how the hostfile arrives: the command line
+folds it into the host list as `file=<path>`, the PMIx form carries it as
+its own attribute, which is why the shared entry point takes a host
+specification and a hostfile path as two arguments.
+
+The programmatic form answers in **two phases**, as an extend does, because
+there is no job behind it to make completion observable: the grant is
+returned at once and the daemons are reported by the directed
+`PMIX_DVM_IS_READY` (or `PMIX_ERR_DVM_MOD`) when the grow campaign drains.
+The requester is recorded with `prte_plm_base_add_grow_requester()` rather
+than on a session — an activation creates none — and the campaign adopts it
+when it is recorded. Where no campaign will exist (outside elastic mode, or
+when every named node is already in the DVM) the grant stays the answer and
+`PMIX_SUCCESS` is returned at phase one, so nothing waits on an event no one
+will send.
+
+Two things about it are load-bearing:
+
+- It runs **after** `prte_ras_base_add_hosts()` in `plm_base_receive.c`, and
+  when the same request carries both it deliberately does **not** activate a
+  grow of its own. Add-host's grow is asynchronous — the request has to be
+  served before the nodes exist — and it launches on every node marked
+  `ADDED`, so it sweeps up activate's too. A second grow posted here would
+  race ahead of the insertion.
+- Resolution is separated from commitment. A specification that fails
+  anywhere marks nothing, so a bad token in a later app segment cannot leave
+  pool entries marked `ADDED` for a grow that never runs — which is how a
+  node gets relaunched later by some entirely unrelated request.
+
+`+e` is **refused** here, with its own message rather than the generic
+"invalid relative node syntax" — it is valid `--host` syntax, so a user has
+every reason to try it. For `--host` it means "no application process running
+on this node", which says nothing about DVM membership: most of what it picks
+is already in the DVM, so honoring it would start no daemon and report
+success.
+
+The "every one of them" form is `+all` (the `+` prefix is what already marks
+a token as *not* a hostname in this grammar). It selects every allocated node
+that is not in the DVM, and finding none is success, not an error — the same
+rule that makes naming an already-joined node a no-op.
+
+The other indirect form is `file=<hostfile>`, read by
+`prte_util_add_hostfile_nodes()` — the real parser, so `^host` exclusions,
+aliases and its refusal of relative syntax inside a file all come along. Only
+the **names** are used; a `slots=` in the file is not applied, which is both
+consistent with the `:N` refusal and with what a hostfile handed to a tool
+already does (it selects, it does not resize). Note the tool side matters:
+`create_app()` in `prte_app_parse.c` absolutizes a relative `file=` path
+against the *tool's* cwd, because the HNP is the process that opens it.
+
+---
+
+## An allocation a spawn brings with it
+
+`PMIX_SPAWN_ALLOC` puts an entire allocation request **on** a spawn: the
+value is an array of `pmix_info_t` beginning with the request's directive
+(`PMIX_ALLOC_REQ_DIRECTIVE`) and continuing with exactly the info a
+standalone `PMIx_Allocation_request` would have carried. The host obtains the
+allocation, waits for it, and only then launches — what a launcher does for
+itself when invoked outside an allocation, and what a caller otherwise has to
+write by hand as "request, wait, read the id, spawn with
+`PMIX_SPAWN_TARGET`".
+
+The request itself is nothing new: `prte_ras_base_spawn_alloc()` splits the
+array into its directive and its info and hands it to `prte_ras_base_modify`
+like any other, so it reaches the same modules with the same semantics. Four
+things about the *surroundings* are worth knowing.
+
+- **Who asks.** The requester is the process that asked for the spawn
+  (`PRTE_JOB_LAUNCH_PROXY`), not the job being spawned — that job has no
+  namespace yet, and an allocation must be owned by somebody who exists. It
+  also puts the reservation under the ordinary ownership rules, so the same
+  process can target and release it.
+- **Where the job waits.** The job is held by the *request* — not parked in
+  `prte_cache`, which is drained by whatever DVM-ready event comes next and
+  would launch it while its own allocation was still being obtained. Only
+  once the answer is in does `prte_plm_base_spawn_alloc_granted()` decide:
+  cache it if a grow is now in flight (`prte_ras_base_dvm_is_growing()`), or
+  launch it at once if nothing is coming to make the DVM ready again.
+- **Where the job runs.** A grant that names a session is resolved through
+  the same `resolve_spawn_targets()` a `PMIX_SPAWN_TARGET` goes through, so
+  the job maps onto what it was just given. Without that it would map onto
+  everything *except* those nodes — a reservation is withheld from general
+  use. A grant that names no session (ras/slurm's extend puts its nodes in
+  the general pool) needs no target and gets none.
+- **The two failures, kept apart.** A refused allocation fails the spawn with
+  `PMIX_ERR_JOB_ALLOC_FAILED` and launches nothing; a *malformed* request —
+  no directive, a value that is not an info array — is `PMIX_ERR_BAD_PARAM`,
+  because nothing was asked of any allocator. And a spawn that fails *after*
+  the grant hands the allocation back before its own error is delivered
+  (`prte_ras_base_release_spawn_alloc()`, driven from
+  `prte_plm_base_spawn_response`): a caller told its spawn failed is entitled
+  to conclude it is not holding resources for it, and nothing else would ever
+  release them — the job they were obtained for does not exist and never
+  will. `PRTE_JOB_SPAWN_ALLOC_ID` is what records that debt; it is dropped
+  once the job is running, from which point the allocation is the job's and
+  its disposition is the ordinary one for a reservation.
 
 ---
 
@@ -189,7 +360,7 @@ framework. Its phases:
    it twice. (The sanctioned way to grow an allocation is
    add-host/add-hostfile or an allocation request →
    `prte_ras_base_modify`.)
-2. **Cycle modules.** Walk `selected_modules` in priority order calling
+2. **Ask the allocator.** Walk `selected_modules` — one entry — calling
    `mod->module->allocate(jdata, &nodes)`, honoring the return protocol
    above.
 3. **Empty-list handling.** If no module contributed and
@@ -298,6 +469,10 @@ elastic-DVM or PMIx_Allocation code:
 |---------------|------|
 | `prte_ras_base_modify()` | The `modify` driver (also a state callback). Cycles modules (keyed by `req->key`) to serve a `prte_pmix_server_req_t`; on `PMIX_SUCCESS` calls `prte_ras_base_complete_request`, then invokes the requester's `infocbfunc`. |
 | `prte_ras_base_add_hosts()` | Collect `PRTE_APP_ADD_HOSTFILE`/`PRTE_APP_ADD_HOST` directives across apps into a `PMIX_ALLOC_EXTEND` request and hand it to `prte_ras_base_modify`. Sets `prte_dvm_ready = false` until processed. |
+| `prte_ras_base_activate_hosts()` | Collect `PRTE_APP_ACTIVATE_HOSTS` directives across apps, resolve them against the node pool, mark the resolved entries `PRTE_NODE_STATE_ADDED` and activate a grow. Adds nothing to the allocation, so it is permitted under a scheduler; must run after `prte_ras_base_add_hosts()`. Sets `prte_dvm_ready = false` when it activates a grow of its own. |
+| `prte_ras_base_spawn_alloc()` | Serve the allocation request carried by a spawn (`PMIX_SPAWN_ALLOC`), in the name of the spawn's requester. Sets `*posted` when one is in flight - the request then holds the job, and the outcome arrives at `prte_plm_base_spawn_alloc_granted()`/`_failed()`. |
+| `prte_ras_base_release_spawn_alloc()` | Give back an allocation obtained for a job that then failed to launch, calling `prte_plm_base_spawn_alloc_released()` when it resolves so the spawn's own error can follow. |
+| `prte_ras_base_activate_nodes()` | Resolve one activation — a host specification, a hostfile, or both — against the node pool and mark the resolved entries `PRTE_NODE_STATE_ADDED`, reporting how many entries that changed. Shared by `--activate` and `PMIX_ALLOC_ACTIVATE`. Resolves and marks only: activating the grow is the caller's. |
 | `prte_ras_base_complete_request()` | The heavy reservation router. For `PMIX_ALLOC_NEW`/`EXTEND` it resolves the destination `prte_session_t` (honoring `PMIX_ALLOC_TARGET`/`SHARE`/`INHERITANCE`/`ID`/`REQ_ID`), parses `PMIX_ALLOC_NODE_LIST`, inserts the nodes, and attaches them to the reservation (`add_nodes_to_session`). For `PMIX_ALLOC_RELEASE` it tears down a named reservation or xcasts a `PRTE_DAEMON_SHRINK_CMD`. Marks `PRTE_JOB_EXTEND_DVM` and re-launches daemons for grows. |
 | `prte_ras_base_release_allocation()` | Session-destruct hook: cycles modules whose `release_allocation` matches `session->alloc_module`. |
 | `prte_ras_base_shrink_complete()` | Offers a drained `prte_shrink_campaign_t` to every module's `shrink_complete`. |
@@ -358,7 +533,8 @@ deviation*.)
 
 | Field | Meaning |
 |-------|---------|
-| `selected_modules` | Priority-sorted list of selected components. |
+| `selected_modules` | The selected component. A one-entry list so every consumer can iterate it. |
+| `scheduler_owned` | Does an external RM own our allocation? Copied from the selected module. |
 | `total_slots_alloc` | Sum of `slots` across the pool. |
 | `multiplier` | `ras_base_multiplier` — fabricate N daemons/node to simulate scale (default 1). |
 | `launch_orted_on_hn` | `ras_base_launch_orted_on_hn` — run a daemon on the head node. |
@@ -499,7 +675,7 @@ prototype here compiles and then mismatches the real library.
 | Layer | What it covers |
 |-------|----------------|
 | [`test/unit/ras/test_ras.c`](../../../test/unit/ras/) (`make check`) | `prte_ras_base_node_insert` (dedup, drain, slot accounting, `ADD_SLOTS` clamping, FQDN normalization, HNP dedup, pre-assigned pool slots), the module vtable contract for every static component, `prte_ras_base_select` priority ordering, `prte_ras_base_flag_string`, and `ras/slurm`'s detect-and-report half — query gating on `SLURM_JOBID` at priority 50, then `allocate()` expanding a compressed `SLURM_NODELIST` and refusing a tainted jobid or an over-length nodelist. That last part is driven **through the framework** (find the component, query it, call the module it returns) rather than by naming its symbols, because `ras-slurm` is a plugin and has none in `libprrte`; keep it that way. It skips with a printed reason when the component is not there to be found. |
-| [`contrib/dockerswarm/run-tests.sh`](../../../contrib/dockerswarm/) (`linux`) | The multi-node paths: grow/shrink/re-grow leaving exactly one daemon per node (a duplicated pool entry launches two), `--add-hostfile` growing a live DVM through `add_hosts → ras/pmix defer → ras/hosts` including the `slots=+N` in-place adjust, and **`ras/slurm`'s whole modify surface** against a faked scheduler (below). |
+| [`contrib/dockerswarm/run-tests.sh`](../../../contrib/dockerswarm/) (`linux`) | The multi-node paths: grow/shrink/re-grow leaving exactly one daemon per node (a duplicated pool entry launches two), `--add-hostfile` growing a live DVM through `add_hosts → ras/pmix defer → ras/hosts` including the `slots=+N` in-place adjust, `--activate` bringing an allocated-but-idle node into the DVM (one left out by `prte_max_vm_size`, and two a shrink handed back, named through `file=`) while refusing a host the allocation does not contain and refusing to apply the hostfile's `slots=`, the same operation asked for through `PMIX_ALLOC_ACTIVATE` (`elastic activate`, both the `PMIX_HOST` and the `PMIX_HOSTFILE` form, including its two-phase completion), and **`ras/slurm`'s whole modify surface** against a faked scheduler (below). |
 | Live RM | PBS/LSF/Flux discovery still needs a real scheduler; there is no substitute. |
 
 **`ras/slurm`'s `modify` surface is covered in `contrib/dockerswarm`, not

@@ -72,11 +72,54 @@ static void set_bool_option(prte_job_t *jdata, prte_attribute_key_t key, bool fl
     }
 }
 
+/* Does SPEC - a runtime-option string as it came off a command line - ask
+ * that the exit status of child jobs be reported separately?
+ *
+ * The DVM answers this for itself from the attribute the walk below records,
+ * but a launcher driving a PERSISTENT DVM has to answer it for its own exit
+ * status, in its own process, with no job object anywhere near it.  The
+ * reader lives here beside the writer so that the directive has one spelling
+ * and one set of truth rules; a private copy in the tool would go stale the
+ * first time either changed.
+ *
+ * Anything malformed reads as "no".  This is not where a bad command line is
+ * diagnosed - the DVM does that, with the message and the failure - and
+ * answering twice would only mean saying it twice. */
+bool prte_state_base_report_child_sep(const char *spec)
+{
+    char **options, *ptr;
+    pmix_value_t value;
+    bool flag = false;
+    int n;
+
+    if (NULL == spec) {
+        return false;
+    }
+    options = PMIx_Argv_split(spec, ',');
+    for (n = 0; NULL != options[n]; n++) {
+        ptr = strchr(options[n], '=');
+        if (NULL != ptr) {
+            *ptr = '\0';
+            ++ptr;
+        }
+        if (!PMIX_CHECK_CLI_OPTION(options[n], PRTE_CLI_REPORT_CHILD_SEP)) {
+            continue;
+        }
+        /* the same pair the walk below uses, so a value this says "true" to
+         * is exactly one that sets the attribute there */
+        PMIX_VALUE_LOAD(&value, ptr, PMIX_STRING);
+        flag = PMIX_CHECK_TRUE(&value);
+        PMIX_VALUE_DESTRUCT(&value);
+    }
+    PMIx_Argv_free(options);
+    return flag;
+}
+
 /* this function is called if pmix_server_dyn receives a
  * PMIX_RUNTIME_OPTIONS info struct */
 int prte_state_base_set_runtime_options(prte_job_t *jdata, char *spec)
 {
-    char **options, *ptr;
+    char **options, *ptr, *bkpt;
     int n, k, tm;
     bool flag, *fptr = &flag;
     int32_t i32;
@@ -250,6 +293,7 @@ int prte_state_base_set_runtime_options(prte_job_t *jdata, char *spec)
              * here instead, where it is still the user's command line and
              * not a policy nobody asked for. */
             if (NULL != ptr && !prte_schizo_base_directive_is_valued(options[n]) &&
+                !PMIX_CHECK_CLI_OPTION(options[n], PRTE_CLI_STOP_IN_APP) &&
                 PRTE_SUCCESS != prte_cli_bool_value(ptr, &flag)) {
                 prte_show_help("help-schizo-base.txt", "non-boolean-value", true,
                                PRTE_CLI_RTOS, options[n], ptr);
@@ -355,15 +399,44 @@ int prte_state_base_set_runtime_options(prte_job_t *jdata, char *spec)
                 }
 
             } else if (PMIX_CHECK_CLI_OPTION(options[n], PRTE_CLI_STOP_IN_APP)) {
-                flag = PMIX_CHECK_TRUE(&value);
+                /* this is the one hybrid directive: written bare or with a
+                 * truth value it asserts the boolean "stop wherever the
+                 * application chooses to stop", and written with anything
+                 * else that text is the string ID of the ONE breakpoint the
+                 * application is to stop at.  This is why the strict-boolean
+                 * refusal above steps around this directive.  A breakpoint
+                 * therefore cannot be named with any spelling of a truth
+                 * value - "true" and "false" mean what they always mean. */
+                if (PRTE_SUCCESS == prte_cli_bool_value(ptr, &flag)) {
+                    bkpt = NULL;
+                } else {
+                    flag = true;
+                    bkpt = ptr;
+                }
                 if (flag) {
                     prte_set_attribute(&jdata->attributes, PRTE_JOB_STOP_IN_APP,
                                        PRTE_ATTR_GLOBAL, NULL, PMIX_BOOL);
                     /* also must add to job-level cache */
                     PMIX_INFO_LOAD(&info, PMIX_DEBUG_STOP_IN_APP, NULL, PMIX_BOOL);
                     pmix_server_cache_job_info(jdata, &info);
+                    if (NULL == bkpt) {
+                        /* no particular place was named, so any prior
+                         * request for one no longer applies */
+                        prte_remove_attribute(&jdata->attributes, PRTE_JOB_BREAKPOINT);
+                    } else {
+                        prte_set_attribute(&jdata->attributes, PRTE_JOB_BREAKPOINT,
+                                           PRTE_ATTR_GLOBAL, bkpt, PMIX_STRING);
+                        /* the daemons turn this into an envar for the app to
+                         * read, but cache it as well so anything holding a
+                         * PMIx handle on the job - a debugger tool, or the
+                         * application itself - can simply ask for it */
+                        PMIX_INFO_LOAD(&info, PMIX_BREAKPOINT, bkpt, PMIX_STRING);
+                        pmix_server_cache_job_info(jdata, &info);
+                        PMIX_INFO_DESTRUCT(&info);
+                    }
                 } else {
                     prte_remove_attribute(&jdata->attributes, PRTE_JOB_STOP_IN_APP);
+                    prte_remove_attribute(&jdata->attributes, PRTE_JOB_BREAKPOINT);
                 }
 
             } else if (PMIX_CHECK_CLI_OPTION(options[n], PRTE_CLI_TIMEOUT)) {
