@@ -22,7 +22,7 @@ test_rml_routing_LDADD = $(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la
 test_relm_SOURCES = \
     test_relm.c
 
-test_relm_LDADD = $(top_builddir)/src/libprrte.la
+test_relm_LDADD = $(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la
 
 TESTS = test_rml test_rml_routing test_relm
 
