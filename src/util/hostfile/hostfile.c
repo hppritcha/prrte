@@ -44,6 +44,7 @@
 
 #include "src/mca/errmgr/errmgr.h"
 #include "src/mca/ras/base/base.h"
+#include "src/mca/rmaps/base/base.h"
 #include "src/runtime/prte_globals.h"
 #include "src/util/name_fns.h"
 #include "src/util/proc_info.h"
@@ -103,6 +104,37 @@ static char *hostfile_parse_string(void)
     return strdup(prte_util_hostfile_value.sval);
 }
 
+/*
+ * Split a host entry into its optional username and the node name.
+ *
+ * The lexer's string rule accepts '@' anywhere in a token, so a mistyped
+ * entry such as "a@b@c" arrives here as a single token that is neither a
+ * hostname nor a "user@hostname".  Refuse it the way every other parse
+ * failure in this file is refused - by naming the file, the line, and the
+ * entry - rather than printing a bare warning that says none of the three.
+ */
+static int hostfile_parse_username(const char *value, char **username, char **node_name)
+{
+    char **argv;
+    int cnt;
+
+    argv = PMIx_Argv_split(value, '@');
+    cnt = PMIx_Argv_count(argv);
+    if (1 == cnt) {
+        *node_name = strdup(argv[0]);
+    } else if (2 == cnt) {
+        *username = strdup(argv[0]);
+        *node_name = strdup(argv[1]);
+    } else {
+        prte_show_help("help-hostfile.txt", "user-host", true, cur_hostfile_name,
+                       prte_util_hostfile_line, value);
+        PMIx_Argv_free(argv);
+        return PRTE_ERR_SILENT;
+    }
+    PMIx_Argv_free(argv);
+    return PRTE_SUCCESS;
+}
+
 static int hostfile_parse_line(int token, pmix_list_t *updates,
                                pmix_list_t *exclude, bool keep_all)
 {
@@ -110,10 +142,8 @@ static int hostfile_parse_line(int token, pmix_list_t *updates,
     prte_node_t *node;
     bool got_max = false;
     char *value;
-    char **argv;
     char *node_name = NULL;
     char *username = NULL;
-    int cnt;
     char buff[64];
 
     if (PRTE_HOSTFILE_STRING == token || PRTE_HOSTFILE_HOSTNAME == token ||
@@ -126,20 +156,10 @@ static int hostfile_parse_line(int token, pmix_list_t *updates,
         } else {
             value = prte_util_hostfile_value.sval;
         }
-        argv = PMIx_Argv_split(value, '@');
-
-        cnt = PMIx_Argv_count(argv);
-        if (1 == cnt) {
-            node_name = strdup(argv[0]);
-        } else if (2 == cnt) {
-            username = strdup(argv[0]);
-            node_name = strdup(argv[1]);
-        } else {
-            pmix_output(0, "WARNING: Unhandled user@host-combination - %s\n", value); /* XXX */
-            PMIx_Argv_free(argv);
-            return PRTE_ERROR;
+        rc = hostfile_parse_username(value, &username, &node_name);
+        if (PRTE_SUCCESS != rc) {
+            return rc;
         }
-        PMIx_Argv_free(argv);
 
         /* if the first letter of the name is '^', then this is a node
          * to be excluded. Remove the ^ character so the nodename is
@@ -243,8 +263,11 @@ static int hostfile_parse_line(int token, pmix_list_t *updates,
             token = prte_util_hostfile_lex();
         }
         if (prte_util_hostfile_done) {
-            /* bad syntax somewhere */
-            return PRTE_ERROR;
+            /* the file ended before the '=' that must follow a rank, so we
+             * never got a node name - say so rather than returning an error
+             * the caller can only report as a line number in our own source */
+            hostfile_parse_error(token);
+            return PRTE_ERR_SILENT;
         }
         /* next position should be the node name */
         token = prte_util_hostfile_lex();
@@ -255,20 +278,10 @@ static int hostfile_parse_line(int token, pmix_list_t *updates,
             value = prte_util_hostfile_value.sval;
         }
 
-        argv = PMIx_Argv_split(value, '@');
-
-        cnt = PMIx_Argv_count(argv);
-        if (1 == cnt) {
-            node_name = strdup(argv[0]);
-        } else if (2 == cnt) {
-            username = strdup(argv[0]);
-            node_name = strdup(argv[1]);
-        } else {
-            pmix_output(0, "WARNING: Unhandled user@host-combination - %s\n", value); /* XXX */
-            PMIx_Argv_free(argv);
-            return PRTE_ERROR;
+        rc = hostfile_parse_username(value, &username, &node_name);
+        if (PRTE_SUCCESS != rc) {
+            return rc;
         }
-        PMIx_Argv_free(argv);
 
         /* Do we need to make a new node object? */
         if (NULL == (node = prte_node_match(updates, node_name))) {
@@ -309,7 +322,7 @@ static int hostfile_parse_line(int token, pmix_list_t *updates,
 
     } else {
         hostfile_parse_error(token);
-        return PRTE_ERROR;
+        return PRTE_ERR_SILENT;
     }
     free(username);
 
@@ -336,7 +349,7 @@ static int hostfile_parse_line(int token, pmix_list_t *updates,
             rc = hostfile_parse_int();
             if (rc < 0) {
                 prte_show_help("help-hostfile.txt", "port", true, cur_hostfile_name, rc);
-                return PRTE_ERROR;
+                return PRTE_ERR_SILENT;
             }
             prte_set_attribute(&node->attributes, PRTE_NODE_PORT, PRTE_ATTR_LOCAL, &rc, PMIX_INT);
             break;
@@ -349,7 +362,7 @@ static int hostfile_parse_line(int token, pmix_list_t *updates,
                 prte_show_help("help-hostfile.txt", "slots", true, cur_hostfile_name, rc);
                 pmix_list_remove_item(updates, &node->super);
                 PMIX_RELEASE(node);
-                return PRTE_ERROR;
+                return PRTE_ERR_SILENT;
             }
             if (PRTE_FLAG_TEST(node, PRTE_NODE_FLAG_SLOTS_GIVEN)) {
                 /* multiple definitions were given for the
@@ -359,7 +372,7 @@ static int hostfile_parse_line(int token, pmix_list_t *updates,
                                node->name);
                 pmix_list_remove_item(updates, &node->super);
                 PMIX_RELEASE(node);
-                return PRTE_ERROR;
+                return PRTE_ERR_SILENT;
             }
             node->slots = rc;
             PRTE_FLAG_SET(node, PRTE_NODE_FLAG_SLOTS_GIVEN);
@@ -377,7 +390,7 @@ static int hostfile_parse_line(int token, pmix_list_t *updates,
                                ((size_t) rc));
                 pmix_list_remove_item(updates, &node->super);
                 PMIX_RELEASE(node);
-                return PRTE_ERROR;
+                return PRTE_ERR_SILENT;
             }
             /* Only take this update if it puts us >= node_slots */
             if (rc >= node->slots) {
@@ -388,10 +401,9 @@ static int hostfile_parse_line(int token, pmix_list_t *updates,
             } else {
                 prte_show_help("help-hostfile.txt", "max_slots_lt", true, cur_hostfile_name,
                                node->slots, rc);
-                PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
                 pmix_list_remove_item(updates, &node->super);
                 PMIX_RELEASE(node);
-                return PRTE_ERROR;
+                return PRTE_ERR_SILENT;
             }
             break;
 
@@ -404,7 +416,7 @@ static int hostfile_parse_line(int token, pmix_list_t *updates,
             hostfile_parse_error(token);
             pmix_list_remove_item(updates, &node->super);
             PMIX_RELEASE(node);
-            return PRTE_ERROR;
+            return PRTE_ERR_SILENT;
         }
     }
 
@@ -426,6 +438,7 @@ static int hostfile_parse(const char *hostfile, pmix_list_t *updates, pmix_list_
 {
     int token;
     int rc = PRTE_SUCCESS;
+    struct stat sbuf;
 
     cur_hostfile_name = hostfile;
 
@@ -434,6 +447,22 @@ static int hostfile_parse(const char *hostfile, pmix_list_t *updates, pmix_list_
      * every hostfile after the first reported its parse errors at a line
      * number carried over from the ones before it */
     prte_util_hostfile_line = 1;
+
+    /* Refuse anything that is not a regular file BEFORE it reaches the lexer.
+     * fopen() opens a directory quite happily, and every read from the result
+     * then fails with EISDIR - which the lexer does not distinguish from "no
+     * input available yet", so it spins and the tool never gets an answer at
+     * all.  A user reaches this by naming a directory ("--hostfile /tmp", or
+     * a path variable that expanded to one), which deserves the same message
+     * a missing file gets, not a hang.  A stat that fails is left to fopen
+     * below, which is where "no such file" - and the default-hostfile
+     * exemption for it - is already handled. */
+    if (0 == stat(hostfile, &sbuf) && !S_ISREG(sbuf.st_mode)) {
+        prte_show_help("help-hostfile.txt", "not-a-file", true, hostfile);
+        rc = PRTE_ERR_SILENT;
+        goto unlock;
+    }
+
     prte_util_hostfile_in = fopen(hostfile, "r");
     if (NULL == prte_util_hostfile_in) {
         if (NULL == prte_default_hostfile || 0 != strcmp(prte_default_hostfile, hostfile)) {
@@ -489,7 +518,7 @@ static int hostfile_parse(const char *hostfile, pmix_list_t *updates, pmix_list_
 
         default:
             hostfile_parse_error(token);
-            rc = PRTE_ERROR;
+            rc = PRTE_ERR_SILENT;
             goto unlock;
         }
     }
@@ -776,10 +805,33 @@ int prte_util_filter_hostfile_nodes(pmix_list_t *nodes, char *hostfile, bool rem
                     /* if the slot count here is less than the
                      * total slots avail on this node, set it
                      * to the specified count - this allows people
-                     * to subdivide an allocation
+                     * to subdivide an allocation.
+                     *
+                     * The nodes on this list are the pool's own objects, so
+                     * the smaller count has to be handed back when the map is
+                     * done: the "slots=" says how many slots THIS job may
+                     * have on the node, not how big the node is, exactly as a
+                     * "-host node:N" does. Left unrecorded, one job's hostfile
+                     * shrank the node for every job the DVM ran afterwards -
+                     * jobs that never named the hostfile - and the allocation
+                     * could only ever get smaller, with nothing short of
+                     * restarting the DVM to put it back.
+                     *
+                     * Only do this when we are selecting the nodes a job will
+                     * map onto ("remove"), because that is the one caller
+                     * running inside prte_rmaps_base_map_job(), which restores
+                     * what it recorded before it returns. The record list is a
+                     * framework global, not a per-job one, and a DVM maps one
+                     * job while another is still forming its daemons - so an
+                     * entry made anywhere else is one some unrelated job's map
+                     * would put back. The other caller, the VM setup, is only
+                     * marking which nodes are to host a daemon; it never maps
+                     * and reads no slot count, so it has nothing to resize for.
                      */
-                    if (PRTE_FLAG_TEST(node_from_file, PRTE_NODE_FLAG_SLOTS_GIVEN)
+                    if (remove
+                        && PRTE_FLAG_TEST(node_from_file, PRTE_NODE_FLAG_SLOTS_GIVEN)
                         && node_from_file->slots < node_from_list->slots) {
+                        prte_rmaps_base_record_resize(node_from_list, node_from_list->slots);
                         node_from_list->slots = node_from_file->slots;
                     }
                     if (remove) {

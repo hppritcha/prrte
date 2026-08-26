@@ -44,6 +44,7 @@
 #include "src/hwloc/hwloc-internal.h"
 #include "src/pmix/pmix-internal.h"
 #include "src/prted/pmix/pmix_server.h"
+#include "src/prted/pmix/pmix_server_internal.h"
 
 #include "src/mca/errmgr/errmgr.h"
 #include "src/mca/ess/ess.h"
@@ -990,6 +991,21 @@ void prte_plm_base_send_launch_msg(int fd, short args, void *cbdata)
         return;
     }
 
+    /* Send each daemon the part of the message addressed to it alone - the
+     * bindings of the procs it will fork.  Ahead of the broadcast, but only
+     * for tidiness: the two are independent messages on independent paths,
+     * the receiving daemon waits for whichever arrives second, and nothing
+     * here depends on which that is. */
+    if (prte_odls_globals.scatter_cpusets) {
+        rc = prte_odls_base_send_cpuset_slices(jdata);
+        if (PRTE_SUCCESS != rc) {
+            PRTE_ERROR_LOG(rc);
+            PRTE_ACTIVATE_JOB_STATE(caddy->jdata, PRTE_JOB_STATE_NEVER_LAUNCHED);
+            PMIX_RELEASE(caddy);
+            return;
+        }
+    }
+
     /* Goes to all daemons, on the launch message's own tag rather than the
      * general daemon-command tag. This is the one large broadcast PRRTE makes
      * on a regular basis, and naming it is what lets grpcomm move it by what
@@ -1216,10 +1232,47 @@ int prte_plm_base_spawn_response(int32_t status, prte_job_t *jdata)
         return PRTE_SUCCESS;
     }
 
+    /* A job that obtained its own allocation (PMIX_SPAWN_ALLOC) and then
+     * failed to launch has to give that allocation back before its requester
+     * is told: a caller told its spawn failed is entitled to conclude it is
+     * not holding resources for it, and nothing else will ever release them -
+     * the job they were obtained for does not exist and never will.
+     *
+     * The answer therefore waits for the release, which is why the status is
+     * parked on the job and delivered by the re-entry from
+     * prte_plm_base_spawn_alloc_released().  Removing the id first is what
+     * makes that re-entry pass straight through here rather than release
+     * again.  A release we cannot even post is not worth losing the answer
+     * over: fall through and tell the requester what happened. */
+    if (PMIX_SUCCESS != status) {
+        char *sa_id = NULL;
+
+        if (prte_get_attribute(&jdata->attributes, PRTE_JOB_SPAWN_ALLOC_ID,
+                               (void **) &sa_id, PMIX_STRING) &&
+            NULL != sa_id) {
+            prte_remove_attribute(&jdata->attributes, PRTE_JOB_SPAWN_ALLOC_ID);
+            prte_set_attribute(&jdata->attributes, PRTE_JOB_SPAWN_ALLOC_STATUS,
+                               PRTE_ATTR_LOCAL, &status, PMIX_INT32);
+            rc = prte_ras_base_release_spawn_alloc(jdata, sa_id);
+            free(sa_id);
+            if (PRTE_SUCCESS == rc) {
+                return PRTE_SUCCESS;
+            }
+            PRTE_ERROR_LOG(rc);
+            prte_remove_attribute(&jdata->attributes, PRTE_JOB_SPAWN_ALLOC_STATUS);
+        }
+    }
+
     /* a status is all the requester is going to get out of this response,
      * so tell it what actually happened while it is still listening */
     if (PMIX_SUCCESS != status) {
         report_launch_failure(jdata);
+    } else {
+        /* the PMIx definition says the processes created by PMIx_Spawn are
+         * connected to the parent process upon successful launch - which is
+         * what makes a parent and its child hear about each other's failures.
+         * Whether this launch has such a parent at all is decided there. */
+        prte_pmix_server_connection_spawned(jdata);
     }
 
     /* If the requestor was a tool, use PMIx to notify them of launch
@@ -1431,6 +1484,12 @@ void prte_plm_base_post_launch(int fd, short args, void *cbdata)
     }
 
 next:
+    /* The job is running, so an allocation obtained for it is now the job's
+     * to hold: drop the note that says we still owe it a release.  From here
+     * its disposition is the ordinary one for a reservation - the inheritance
+     * rules applied when the owning namespace ends. */
+    prte_remove_attribute(&jdata->attributes, PRTE_JOB_SPAWN_ALLOC_ID);
+
     /* notify the spawn requestor */
     rc = prte_plm_base_spawn_response(PRTE_SUCCESS, jdata);
     if (PRTE_SUCCESS != rc) {
@@ -1936,6 +1995,30 @@ void prte_plm_base_daemon_callback(int status, pmix_proc_t *sender, pmix_data_bu
         jdatorted->num_reported++;
         jdatorted->num_daemons_reported++;
 
+        /* This daemon may have missed the order to terminate.  The exit
+         * command is xcast exactly once, and prte_plm_base_prted_exit()
+         * latches so it is never re-issued; a daemon that had been launched
+         * but had not yet reported in holds no contact info here, so the send
+         * to it failed and errmgr/dvm deliberately swallowed that failure -
+         * correctly, since the daemon was not dead, only not yet listening.
+         * Nothing, though, remembered that it still owes an exit.
+         *
+         * It has just told us where it is, so tell it now.  Otherwise it sits
+         * in the routing tree as a live child that will never leave, and the
+         * HNP terminates only once its child count reaches zero: prterun
+         * hangs forever and the daemon is left orphaned on its node.  An
+         * elastic grow overlapping the end of the last job is the ordinary
+         * way in, because PMIX_ALLOC_EXTEND answers its caller as soon as the
+         * scheduler does - tens of milliseconds before the daemon reports -
+         * so a client that treats that answer as the end and exits lands here
+         * every time. */
+        if (prte_prteds_term_ordered) {
+            pmix_output_verbose(5, prte_plm_base_framework.framework_output,
+                                "%s plm:base:prted_report_launch daemon %s reported after "
+                                "termination was ordered - re-issuing its exit command",
+                                PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(&dname));
+            prte_plm_base_prted_exit_late(&dname);
+        }
 
     CLEANUP:
         pmix_output_verbose(5, prte_plm_base_framework.framework_output,
@@ -2387,7 +2470,106 @@ static int campaign_add_requester(prte_grow_campaign_t *camp, prte_session_t *se
     return PRTE_SUCCESS;
 }
 
-int prte_plm_base_setup_virtual_machine(prte_job_t *jdata)
+/*
+ * Requesters waiting on the NEXT grow campaign.
+ *
+ * A campaign normally finds its requesters through the nodes it is launching
+ * on: a grow that was granted resources put those nodes in a session, and the
+ * session records who asked for them.  An ACTIVATION has no such session -
+ * it names nodes the allocation already held, which sit in the general pool
+ * exactly as they did before - so the requester has to be carried here
+ * instead, from the point the request was granted to the point a campaign
+ * exists to answer it.
+ *
+ * The list is short-lived by construction: activating a grow posts
+ * LAUNCH_DAEMONS, and setup_virtual_machine - which runs on the very next
+ * turn of the event loop - either hands the entries to the campaign it
+ * records or answers them itself because there is nothing to launch.
+ */
+static prte_grow_requester_t *pending_requesters = NULL;
+static int npending_requesters = 0;
+
+int prte_plm_base_add_grow_requester(const pmix_proc_t *requester,
+                                     const char *alloc_id,
+                                     const char *req_id)
+{
+    prte_grow_requester_t *tmp;
+
+    tmp = (prte_grow_requester_t *) realloc(pending_requesters,
+                                            (npending_requesters + 1) * sizeof(*tmp));
+    if (NULL == tmp) {
+        return PRTE_ERR_OUT_OF_RESOURCE;
+    }
+    pending_requesters = tmp;
+    tmp = &pending_requesters[npending_requesters];
+    PMIX_XFER_PROCID(&tmp->requester, requester);
+    tmp->alloc_id = (NULL != alloc_id) ? strdup(alloc_id) : NULL;
+    tmp->req_id = (NULL != req_id) ? strdup(req_id) : NULL;
+    npending_requesters++;
+
+    return PRTE_SUCCESS;
+}
+
+/* Give the pending requesters to this campaign, which then owns answering
+ * them - and owns their strings, so nothing is freed here. */
+static void adopt_pending_requesters(prte_grow_campaign_t *camp)
+{
+    prte_grow_requester_t *tmp;
+    int r;
+
+    if (0 == npending_requesters) {
+        return;
+    }
+    tmp = (prte_grow_requester_t *) realloc(camp->requesters,
+                                            (camp->nrequesters + npending_requesters)
+                                                * sizeof(*tmp));
+    if (NULL == tmp) {
+        /* keep what the campaign had rather than losing the launch; the
+         * pending requesters are answered here instead of never */
+        PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+        for (r = 0; r < npending_requesters; r++) {
+            prte_plm_base_dvm_mod_notify(&pending_requesters[r].requester,
+                                         pending_requesters[r].alloc_id,
+                                         pending_requesters[r].req_id,
+                                         false, PMIX_ERR_NOMEM);
+            free(pending_requesters[r].alloc_id);
+            free(pending_requesters[r].req_id);
+        }
+        goto done;
+    }
+    camp->requesters = tmp;
+    memcpy(&camp->requesters[camp->nrequesters], pending_requesters,
+           npending_requesters * sizeof(*pending_requesters));
+    camp->nrequesters += npending_requesters;
+
+done:
+    free(pending_requesters);
+    pending_requesters = NULL;
+    npending_requesters = 0;
+}
+
+/* Answer every pending requester now.  Reached when the grow they were
+ * recorded for launches no daemon - nothing will report, so no campaign is
+ * recorded and grow_drain() would never run - and, defensively, wherever a
+ * launch ends without recording one. */
+static void notify_pending_requesters(bool success, pmix_status_t cause)
+{
+    int r;
+
+    for (r = 0; r < npending_requesters; r++) {
+        prte_plm_base_dvm_mod_notify(&pending_requesters[r].requester,
+                                     pending_requesters[r].alloc_id,
+                                     pending_requesters[r].req_id,
+                                     success, cause);
+        free(pending_requesters[r].alloc_id);
+        free(pending_requesters[r].req_id);
+    }
+    free(pending_requesters);
+    pending_requesters = NULL;
+    npending_requesters = 0;
+}
+
+static int setup_virtual_machine(prte_job_t *jdata)
 {
     prte_node_t *node, *nptr;
     prte_proc_t *proc, *pptr;
@@ -3094,12 +3276,44 @@ process:
                 }
             }
         }
+        /* an activation records its requester here rather than on a session,
+         * because it created none - see pending_requesters */
+        adopt_pending_requesters(gcamp);
         pmix_list_append(&prte_grow_campaigns, &gcamp->super);
         /* raise the fence by exactly what this campaign will drain */
         prte_dvm_launch_fence += gcamp->ntargets;
     }
 
     return PRTE_SUCCESS;
+}
+
+void prte_plm_base_flush_grow_requesters(void)
+{
+    /* The DVM is going away with a request still pending - it was granted,
+     * but the launch it was waiting on will not now happen.  Say so: a
+     * requester of a size change is answered exactly once, and silence is
+     * the one answer the contract does not have. */
+    notify_pending_requesters(false, PMIX_ERR_UNREACH);
+}
+
+int prte_plm_base_setup_virtual_machine(prte_job_t *jdata)
+{
+    int rc;
+
+    rc = setup_virtual_machine(jdata);
+
+    /* Answer any requester the pass did not hand to a campaign.  Success
+     * means the DVM already reflects what they asked for - either their nodes
+     * needed no daemon, or this launch is one no campaign tracks (a DVM
+     * outside elastic mode raises no fence).  A failure means the launch was
+     * never computed at all, and saying so here is what keeps them from being
+     * answered by some later grow's campaign instead.  Where a campaign did
+     * adopt them this is a no-op: the campaign owns the answer, and delivers
+     * it when its daemons report. */
+    notify_pending_requesters(PRTE_SUCCESS == rc,
+                              (PRTE_SUCCESS == rc) ? PMIX_SUCCESS
+                                                   : prte_pmix_convert_rc(rc));
+    return rc;
 }
 
 void prte_plm_base_dvm_mod_notify(const pmix_proc_t *requester,
@@ -3118,17 +3332,20 @@ void prte_plm_base_dvm_mod_notify(const pmix_proc_t *requester,
 
     /* Assemble a directed (custom-range) notification to the requester only,
      * mirroring the PMIX_ALLOC_TIMEOUT_WARNING delivery: custom range plus the
-     * allocation id, the requester's own request id when one was supplied, and
-     * — on failure — the underlying cause so the requester can distinguish
-     * what went wrong rather than only that something did.  The event also
-     * carries "prte.notify.donotloop" so our own notify_event server upcall
+     * allocation id and the requester's own request id where the operation had
+     * them, and — on failure — the underlying cause so the requester can
+     * distinguish what went wrong rather than only that something did.  The
+     * event also carries "prte.notify.donotloop" so our own notify_event server upcall
      * short-circuits instead of thread-shifting and re-xcasting it: the
      * requester is a tool local to this HNP, so PMIx delivers the event
      * locally and no broadcast is needed.  Without the marker the upcall
      * would defer its work onto this progress thread while the blocking
      * PMIx_Notify_event below is parked here waiting for it -- a self-deadlock
      * (see the AGENTS.md rule on locally-originated event notifications). */
-    nrinfo = 3;  /* custom range + alloc id + donotloop marker */
+    nrinfo = 2;  /* custom range + donotloop marker */
+    if (NULL != alloc_id) {
+        nrinfo++;
+    }
     if (NULL != req_id) {
         nrinfo++;
     }
@@ -3143,7 +3360,11 @@ void prte_plm_base_dvm_mod_notify(const pmix_proc_t *requester,
     parray.array = &ptarg;
     /* PMIX_INFO_LOAD deep-copies the data, so the stack copies are fine */
     PMIX_INFO_LOAD(&rinfo[idx++], PMIX_EVENT_CUSTOM_RANGE, &parray, PMIX_DATA_ARRAY);
-    PMIX_INFO_LOAD(&rinfo[idx++], PMIX_ALLOC_ID, (void *) alloc_id, PMIX_STRING);
+    if (NULL != alloc_id) {
+        /* omitted rather than sent empty when the operation named no
+         * allocation - an activation asks for none */
+        PMIX_INFO_LOAD(&rinfo[idx++], PMIX_ALLOC_ID, (void *) alloc_id, PMIX_STRING);
+    }
     /* keep delivery local: do not loop back through our own server upcall */
     PMIX_INFO_LOAD(&rinfo[idx++], "prte.notify.donotloop", NULL, PMIX_BOOL);
     if (NULL != req_id) {

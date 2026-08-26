@@ -258,6 +258,8 @@ const char *prte_attr_key_to_str(prte_attribute_key_t key)
             return "APP-DASH-HOST";
         case PRTE_APP_ADD_HOST:
             return "APP-ADD-HOST";
+        case PRTE_APP_ACTIVATE_HOSTS:
+            return "APP-ACTIVATE-HOSTS";
         case PRTE_APP_USER_CWD:
             return "APP-USER-CWD";
         case PRTE_APP_SSNDIR_CWD:
@@ -306,8 +308,14 @@ const char *prte_attr_key_to_str(prte_attribute_key_t key)
             return "PRTE_APP_BINDTO";
         case PRTE_APP_MAP_FILE:
             return "PRTE_APP_MAP_FILE";
-        case PRTE_APP_DIST_DEVICE:
-            return "PRTE_APP_DIST_DEVICE";
+        case PRTE_APP_MAP_DEVICE:
+            return "PRTE_APP_MAP_DEVICE";
+        case PRTE_APP_MAP_INTERLEAVE:
+            return "PRTE_APP_MAP_INTERLEAVE";
+        case PRTE_APP_MAP_SHARED:
+            return "PRTE_APP_MAP_SHARED";
+        case PRTE_APP_MAP_NDEV:
+            return "PRTE_APP_MAP_NDEV";
         case PRTE_APP_HWT_CPUS:
             return "PRTE_APP_HWT_CPUS";
         case PRTE_APP_CORE_CPUS:
@@ -486,8 +494,14 @@ const char *prte_attr_key_to_str(prte_attribute_key_t key)
             return "JOB_INHERIT";
         case PRTE_JOB_PES_PER_PROC:
             return "JOB_PES_PER_PROC";
-        case PRTE_JOB_DIST_DEVICE:
-            return "JOB_DIST_DEVICE";
+        case PRTE_JOB_MAP_DEVICE:
+            return "JOB_MAP_DEVICE";
+        case PRTE_JOB_MAP_INTERLEAVE:
+            return "JOB_MAP_INTERLEAVE";
+        case PRTE_JOB_MAP_SHARED:
+            return "JOB_MAP_SHARED";
+        case PRTE_JOB_MAP_NDEV:
+            return "JOB_MAP_NDEV";
         case PRTE_JOB_HWT_CPUS:
             return "JOB_HWT_CPUS";
         case PRTE_JOB_CORE_CPUS:
@@ -510,6 +524,14 @@ const char *prte_attr_key_to_str(prte_attribute_key_t key)
             return "STOP-IN-INIT";
         case PRTE_JOB_STOP_IN_APP:
             return "STOP-IN-APP";
+        case PRTE_JOB_BREAKPOINT:
+            return "BREAKPOINT";
+        case PRTE_JOB_SPAWN_ALLOC:
+            return "SPAWN-ALLOCATION-REQUEST";
+        case PRTE_JOB_SPAWN_ALLOC_ID:
+            return "SPAWN-ALLOCATION-ID";
+        case PRTE_JOB_SPAWN_ALLOC_STATUS:
+            return "SPAWN-ALLOCATION-HELD-STATUS";
         case PRTE_JOB_ENVARS_HARVESTED:
             return "ENVARS-HARVESTED";
         case PRTE_JOB_OUTPUT_NOCOPY:
@@ -524,6 +546,8 @@ const char *prte_attr_key_to_str(prte_attribute_key_t key)
             return "DO-NOT-AGGREGATE-HELP";
         case PRTE_JOB_REPORT_CHILD_SEP:
             return "REPORT-CHILD-JOBS-SEPARATELY";
+        case PRTE_JOB_NO_IOF_INHERIT:
+            return "JOB-DOES-NOT-INHERIT-OUTPUT-FORWARDING";
         case PRTE_JOB_COLOCATE_PROCS:
             return "COLOCATE PROCS";
         case PRTE_JOB_COLOCATE_NPERPROC:
@@ -604,6 +628,8 @@ const char *prte_attr_key_to_str(prte_attribute_key_t key)
             return "PROC-NODENAME";
         case PRTE_PROC_CGROUP:
             return "PROC-CGROUP";
+        case PRTE_PROC_DEVICE_ID:
+            return "PROC_DEVICE_ID";
         case PRTE_PROC_NBEATS:
             return "PROC-NBEATS";
 

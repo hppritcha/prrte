@@ -28,6 +28,8 @@
 
 #include "prte_config.h"
 
+#include <assert.h>
+
 #include "src/class/pmix_list.h"
 #include "src/util/pmix_string_copy.h"
 
@@ -60,6 +62,9 @@ typedef struct {
     pmix_list_item_t super;
     prte_oob_tcp_hdr_t hdr;
     bool hdr_recvd;
+    /* the nspace trails the fixed part of the header and is read separately,
+     * so "we have the header" is two steps, not one */
+    bool nspace_recvd;
     char *data;
     char *rdptr;
     size_t rdbytes;
@@ -103,13 +108,18 @@ PMIX_CLASS_DECLARATION(prte_oob_tcp_recv_t);
 #define MCA_OOB_TCP_QUEUE_SEND(m, p)                                                           \
     do {                                                                                       \
         prte_oob_tcp_send_t *_s;                                                               \
-        pmix_output_verbose(5, prte_oob_base.output,                       \
+        pmix_output_verbose(5, prte_oob_base.output,                                           \
                             "%s:[%s:%d] queue send to %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), \
                             __FILE__, __LINE__, PRTE_NAME_PRINT(&((m)->dst)));                 \
         _s = PMIX_NEW(prte_oob_tcp_send_t);                                                    \
-        /* setup the header */                                                                 \
-        PMIX_XFER_PROCID(&_s->hdr.origin, &(m)->origin);                                       \
-        PMIX_XFER_PROCID(&_s->hdr.dst, &(m)->dst);                                             \
+        /* Both ends are this daemon's own namespace, so none goes on the    \
+         * wire - see oob_tcp_hdr.h.  Asserted rather than derived: it is     \
+         * what the receiver reconstructs the two procids from. */            \
+        assert(PMIX_CHECK_NSPACE((m)->origin.nspace, PRTE_PROC_MY_NAME->nspace)                \
+               && PMIX_CHECK_NSPACE((m)->dst.nspace, PRTE_PROC_MY_NAME->nspace));              \
+        _s->hdr.origin = (m)->origin.rank;                                                     \
+        _s->hdr.dst = (m)->dst.rank;                                                           \
+        _s->hdr.nslen = 0;                                                                     \
         _s->hdr.type = MCA_OOB_TCP_USER;                                                       \
         _s->hdr.tag = (m)->tag;                                                                \
         _s->hdr.seq_num = (m)->seq_num;                                                        \
@@ -117,12 +127,12 @@ PMIX_CLASS_DECLARATION(prte_oob_tcp_recv_t);
         /* point to the actual message */                                                      \
         _s->msg = (m);                                                                         \
         /* set the total number of bytes to be sent */                                         \
-        _s->hdr.nbytes = (m)->dbuf->bytes_used;                                                 \
+        _s->hdr.nbytes = (m)->dbuf->bytes_used;                                                \
         /* prep header for xmission */                                                         \
         MCA_OOB_TCP_HDR_HTON(&_s->hdr);                                                        \
         /* start the send with the header */                                                   \
         _s->sdptr = (char *) &_s->hdr;                                                         \
-        _s->sdbytes = sizeof(prte_oob_tcp_hdr_t);                                              \
+        _s->sdbytes = PRTE_OOB_TCP_HDR_LEN(&_s->hdr);                                          \
         /* add to the msg queue for this peer */                                               \
         MCA_OOB_TCP_QUEUE_MSG((p), _s, true);                                                  \
     } while (0)
@@ -136,13 +146,16 @@ PMIX_CLASS_DECLARATION(prte_oob_tcp_recv_t);
 #define MCA_OOB_TCP_QUEUE_PENDING(m, p)                                                           \
     do {                                                                                          \
         prte_oob_tcp_send_t *_s;                                                                  \
-        pmix_output_verbose(5, prte_oob_base.output,                          \
+        pmix_output_verbose(5, prte_oob_base.output,                                              \
                             "%s:[%s:%d] queue pending to %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), \
                             __FILE__, __LINE__, PRTE_NAME_PRINT(&((m)->dst)));                    \
         _s = PMIX_NEW(prte_oob_tcp_send_t);                                                       \
-        /* setup the header */                                                                    \
-        PMIX_XFER_PROCID(&_s->hdr.origin, &(m)->origin);                                          \
-        PMIX_XFER_PROCID(&_s->hdr.dst, &(m)->dst);                                                \
+        /* both ends are our own namespace - see MCA_OOB_TCP_QUEUE_SEND */                        \
+        assert(PMIX_CHECK_NSPACE((m)->origin.nspace, PRTE_PROC_MY_NAME->nspace)                   \
+               && PMIX_CHECK_NSPACE((m)->dst.nspace, PRTE_PROC_MY_NAME->nspace));                 \
+        _s->hdr.origin = (m)->origin.rank;                                                        \
+        _s->hdr.dst = (m)->dst.rank;                                                              \
+        _s->hdr.nslen = 0;                                                                        \
         _s->hdr.type = MCA_OOB_TCP_USER;                                                          \
         _s->hdr.tag = (m)->tag;                                                                   \
         _s->hdr.seq_num = (m)->seq_num;                                                           \
@@ -150,12 +163,12 @@ PMIX_CLASS_DECLARATION(prte_oob_tcp_recv_t);
         /* point to the actual message */                                                         \
         _s->msg = (m);                                                                            \
         /* set the total number of bytes to be sent */                                            \
-        _s->hdr.nbytes = (m)->dbuf->bytes_used;                                                    \
+        _s->hdr.nbytes = (m)->dbuf->bytes_used;                                                   \
         /* prep header for xmission */                                                            \
         MCA_OOB_TCP_HDR_HTON(&_s->hdr);                                                           \
         /* start the send with the header */                                                      \
         _s->sdptr = (char *) &_s->hdr;                                                            \
-        _s->sdbytes = sizeof(prte_oob_tcp_hdr_t);                                                 \
+        _s->sdbytes = PRTE_OOB_TCP_HDR_LEN(&_s->hdr);                                             \
         /* add to the msg queue for this peer */                                                  \
         MCA_OOB_TCP_QUEUE_MSG((p), _s, false);                                                    \
     } while (0)

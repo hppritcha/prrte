@@ -28,7 +28,11 @@
 
 #include "prte_config.h"
 
+#include <limits.h>
 #include <string.h>
+#ifdef HAVE_STRINGS_H
+#    include <strings.h>
+#endif
 
 #include "constants.h"
 #include "types.h"
@@ -42,6 +46,7 @@
 #include "src/mca/errmgr/errmgr.h"
 #include "src/mca/iof/base/base.h"
 #include "src/mca/odls/odls_types.h"
+#include "src/mca/plm/base/base.h"
 #include "src/mca/plm/base/plm_private.h"
 #include "src/mca/rmaps/base/base.h"
 #include "src/mca/state/state.h"
@@ -711,6 +716,106 @@ void prte_ras_base_flush_deferred_releases(pmix_status_t status)
     }
 }
 
+#if defined(PMIX_ALLOC_ACTIVATE)
+/*
+ * PMIX_ALLOC_ACTIVATE - the programmatic form of the "--activate" command
+ * line option: start daemons on nodes the requester already holds.
+ *
+ * This is served here, at the driver, rather than by a ras module, because
+ * there is nothing for a module to do.  The directive adds nothing to the
+ * allocation, changes no slot count and asks no scheduler for anything - it
+ * can only name nodes the node pool already contains - so it is neither
+ * gated on prte_ras_base.scheduler_owned nor routed to whichever component
+ * owns the allocation.  Sending it around the module loop would make the
+ * answer depend on which RM is in play, and refuse under a scheduler exactly
+ * the request that is always safe under one.
+ *
+ * The nodes are named with PMIX_HOST and/or PMIX_HOSTFILE and resolved by
+ * the same code that resolves an "--activate" specification, so the two
+ * cannot drift apart: the syntax, the refusals, and the treatment of a node
+ * that is already in the DVM are one implementation.
+ */
+static void ras_base_activate_request(prte_pmix_server_req_t *req)
+{
+    const char *hosts = NULL, *hostfile = NULL, *req_id = NULL;
+    int rc, nactivated = 0;
+    size_t n;
+
+    for (n = 0; n < req->ninfo; n++) {
+        if (PMIx_Check_key(req->info[n].key, PMIX_HOST)) {
+            /* the value arrived over the wire, so it may be anything */
+            if (PMIX_STRING != req->info[n].value.type) {
+                req->pstatus = PMIX_ERR_BAD_PARAM;
+                return;
+            }
+            hosts = req->info[n].value.data.string;
+
+        } else if (PMIx_Check_key(req->info[n].key, PMIX_HOSTFILE)) {
+            if (PMIX_STRING != req->info[n].value.type) {
+                req->pstatus = PMIX_ERR_BAD_PARAM;
+                return;
+            }
+            hostfile = req->info[n].value.data.string;
+
+        } else if (PMIx_Check_key(req->info[n].key, PMIX_ALLOC_REQ_ID)) {
+            if (PMIX_STRING == req->info[n].value.type) {
+                /* echoed back in the completion event so a requester with
+                 * several requests in flight can tell them apart */
+                req_id = req->info[n].value.data.string;
+            }
+        }
+    }
+
+    if ((NULL == hosts || '\0' == *hosts) &&
+        (NULL == hostfile || '\0' == *hostfile)) {
+        prte_show_help("help-ras-base.txt", "ras-base:activate-nothing-named", true);
+        req->pstatus = PMIX_ERR_BAD_PARAM;
+        return;
+    }
+
+    rc = prte_ras_base_activate_nodes(hosts, hostfile, &nactivated);
+    if (PRTE_SUCCESS != rc) {
+        /* the resolver reports what it refused, and why, through show_help;
+         * a refusal is always the specification's fault (a host this DVM
+         * does not hold, a slot count activate may not grant, a hostfile it
+         * cannot read), so it comes back as a bad parameter */
+        req->pstatus = (PRTE_ERR_SILENT == rc) ? PMIX_ERR_BAD_PARAM
+                                               : prte_pmix_convert_rc(rc);
+        return;
+    }
+
+    req->pstatus = PMIX_SUCCESS;
+    if (0 == nactivated) {
+        /* every named node is already in the DVM, or already on its way in.
+         * The request is met and nothing will be launched, so answer now -
+         * promising a completion event here would leave the requester
+         * waiting on a grow that never runs. */
+        PMIX_OUTPUT_VERBOSE((5, prte_ras_base_framework.framework_output,
+                             "%s ras:base:activate request had nothing to activate",
+                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+        return;
+    }
+
+    /* hold the DVM not-ready until the new daemons are up, so a job submitted
+     * behind this request waits for them - the VM_READY re-entry at the end
+     * of the grow marks it ready again and releases the cached jobs */
+    prte_dvm_ready = false;
+
+#if PRTE_HAVE_DVM_MOD_EVENTS
+    if (prte_elastic_mode &&
+        PRTE_SUCCESS == prte_plm_base_add_grow_requester(&req->tproc, NULL, req_id)) {
+        /* An activated node is not usable until its daemon is up, so the
+         * campaign's PMIX_DVM_IS_READY is the answer - as it is for an
+         * extend.  Only where that event can arrive: outside elastic mode no
+         * campaign is recorded, and there the grant stays the answer. */
+        req->pstatus = PMIX_OPERATION_IN_PROGRESS;
+    }
+#endif
+
+    prte_ras_base_activate_dvm_grow();
+}
+#endif /* defined(PMIX_ALLOC_ACTIVATE) */
+
 void prte_ras_base_modify(int fd, short args, void *cbdata)
 {
     prte_pmix_server_req_t *req = (prte_pmix_server_req_t*)cbdata;
@@ -747,6 +852,15 @@ void prte_ras_base_modify(int fd, short args, void *cbdata)
 
     // set the default response
     req->pstatus = PMIX_ERR_NOT_SUPPORTED;
+
+#if defined(PMIX_ALLOC_ACTIVATE)
+    if (PMIX_ALLOC_ACTIVATE == req->allocdir) {
+        /* served here rather than by a module - see the note on
+         * ras_base_activate_request */
+        ras_base_activate_request(req);
+        goto respond;
+    }
+#endif
 
     // cycle across the modules and give each a chance to execute request
     PMIX_LIST_FOREACH(mod, &prte_ras_base.selected_modules, prte_ras_base_selected_module_t) {
@@ -811,6 +925,54 @@ void prte_ras_base_shrink_complete(prte_shrink_campaign_t *campaign)
     }
 }
 
+/* Report the application procs killed by the release of this node.  Nothing
+ * else does: the target daemon's proc-state updates race the routing teardown
+ * its departure starts, and its later comm failure is ignored (errmgr_dvm.c).
+ * An unaccounted proc holds its job below PRTE_JOB_STATE_TERMINATED forever.
+ *
+ * KILLED_BY_RELEASE, not TERMINATED: the release is planned, the kill is not.
+ * Reported as a normal termination it left prun exiting 0 for a job that lost
+ * ranks mid-fence.  errmgr/dvm decides what it costs.  Accounting is
+ * unchanged - proc_errors force-marks WAITPID_FIRED and IOF_COMPLETE for a
+ * remote proc, driving the same TERMINATED activation raised here before.
+ *
+ * A node lists procs that exited earlier until their whole job terminates, so
+ * without the RECORDED test the release of an idle node would abort a healthy
+ * job.  Runs before prte_plm_base_reset_dvm_node(), which can drop the map's
+ * last reference to the node. */
+static void release_node_procs(prte_node_t *node)
+{
+    prte_proc_t *proc;
+    int i;
+
+    if (NULL == node || NULL == node->procs) {
+        return;
+    }
+
+    for (i = 0; i < node->procs->size; i++) {
+        proc = (prte_proc_t *) pmix_pointer_array_get_item(node->procs, i);
+        if (NULL == proc) {
+            continue;
+        }
+        /* defensive: only application procs are recorded on a node, but the
+         * daemon job is not ours to account for -- the per-target block owns
+         * the target daemon's teardown */
+        if (PMIX_CHECK_NSPACE(proc->name.nspace, PRTE_PROC_MY_NAME->nspace)) {
+            continue;
+        }
+        /* already accounted for: it reported its own termination before the
+         * release reached it, so the release did not kill it */
+        if (PRTE_FLAG_TEST(proc, PRTE_PROC_FLAG_RECORDED)) {
+            continue;
+        }
+        PMIX_OUTPUT_VERBOSE((2, prte_ras_base_framework.framework_output,
+                             "%s ras:base:shrink killing live proc %s with node %s",
+                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                             PRTE_NAME_PRINT(&proc->name), node->name));
+        PRTE_ACTIVATE_PROC_STATE(&proc->name, PRTE_PROC_STATE_KILLED_BY_RELEASE);
+    }
+}
+
 /* Thread-shift target: collectively complete a DVM shrink campaign.  Runs once
  * per campaign on the DVM master, on a fresh event (posted from the grpcomm
  * xcast-completion callback below) so it never executes nested inside the xcast
@@ -845,7 +1007,7 @@ static void shrink_campaign_complete(int sd, short args, void *cbdata)
         for (t = 0; t < camp->ntargets; t++) {
             fr[t] = camp->targets[t];
         }
-        prte_rml_repair_routing_tree(&failed, false);
+        prte_rml_repair_routing_tree(&failed, false, /* epoch = */ 0);
         free(failed.array);
         failed.array = NULL;
     }
@@ -862,6 +1024,7 @@ static void shrink_campaign_complete(int sd, short args, void *cbdata)
                 continue;
             }
             node = dproc->node;
+            release_node_procs(node);
             if (PRTE_FLAG_TEST(dproc, PRTE_PROC_FLAG_ALIVE)) {
                 PRTE_FLAG_UNSET(dproc, PRTE_PROC_FLAG_ALIVE);
                 dproc->state = PRTE_PROC_STATE_TERMINATED;
@@ -1014,6 +1177,11 @@ static void add_nodes_to_session(char **names, prte_session_t *dest)
     }
 }
 
+static int ras_base_start_dvm_shrink(prte_pmix_server_req_t *req,
+                                     pmix_rank_t *ranks, int32_t nranks,
+                                     prte_shrink_campaign_t **campaign,
+                                     bool report_xcast_failure);
+
 void prte_ras_base_teardown_reservation(prte_session_t *session,
                                         bool return_to_scheduler)
 {
@@ -1021,9 +1189,7 @@ void prte_ras_base_teardown_reservation(prte_session_t *session,
     int k;
     pmix_rank_t *ranks = NULL;
     int32_t m = 0;
-    pmix_data_buffer_t msg;
-    prte_daemon_cmd_flag_t cmd = PRTE_DAEMON_SHRINK_CMD;
-    pmix_status_t rc;
+    int ret;
 
     if (NULL == session || session == prte_default_session) {
         return;
@@ -1090,22 +1256,21 @@ void prte_ras_base_teardown_reservation(prte_session_t *session,
     }
 
     if (return_to_scheduler && NULL != ranks && 0 < m) {
-        PMIX_DATA_BUFFER_CONSTRUCT(&msg);
-        rc = PMIx_Data_pack(NULL, &msg, &cmd, 1, PMIX_UINT8);
-        if (PMIX_SUCCESS == rc) {
-            rc = PMIx_Data_pack(NULL, &msg, &m, 1, PMIX_INT32);
+        /* Shrink them out through the ordinary machinery rather than by hand.
+         * This used to pack and broadcast the shrink command itself, which
+         * told the daemons to go but left the master still believing they
+         * were there: node->daemon still pointing at a departed proc, the
+         * node still in the daemon job's map, the daemon count unreduced.
+         * A later grow onto that same node then "reused" the dead daemon and
+         * sent its launch message to nobody ("node has gone down"), so a node
+         * that had once been released could never be allocated again.  The
+         * campaign's completion is what does that bookkeeping - one routing
+         * repair and one node reset for the whole set - and it costs nothing
+         * to go through it. */
+        ret = ras_base_start_dvm_shrink(NULL, ranks, m, NULL, false);
+        if (PRTE_SUCCESS != ret) {
+            PRTE_ERROR_LOG(ret);
         }
-        if (PMIX_SUCCESS == rc) {
-            rc = PMIx_Data_pack(NULL, &msg, ranks, m, PMIX_PROC_RANK);
-        }
-        if (PMIX_SUCCESS == rc) {
-            if (PRTE_SUCCESS != (rc = prte_grpcomm_xcast(PRTE_RML_TAG_DAEMON, &msg))) {
-                PRTE_ERROR_LOG(rc);
-            }
-        } else {
-            PMIX_ERROR_LOG(rc);
-        }
-        PMIX_DATA_BUFFER_DESTRUCT(&msg);
     }
     if (NULL != ranks) {
         free(ranks);
@@ -1627,17 +1792,23 @@ static int ras_base_create_shrink_campaign(prte_pmix_server_req_t *req,
     memcpy(camp->targets, ranks, nranks * sizeof(pmix_rank_t));
     camp->ntargets = nranks;
     camp->pending = nranks;
-    /* record the requester so the phase-two completion event can be
-     * directed at the process that issued this PMIX_ALLOC_RELEASE */
-    PMIX_XFER_PROCID(&camp->requester, &req->tproc);
-    for (size_t n = 0; n < req->ninfo; n++) {
-        if (PMIx_Check_key(req->info[n].key, PMIX_ALLOC_ID)) {
-            camp->alloc_id = strdup(req->info[n].value.data.string);
-        } else if (PMIx_Check_key(req->info[n].key, PMIX_ALLOC_REQ_ID)) {
-            camp->req_id = strdup(req->info[n].value.data.string);
+    /* Record the requester so the phase-two completion event can be directed
+     * at the process that issued this PMIX_ALLOC_RELEASE.  There need not be
+     * one: a reservation torn down on its own account - by its timeout, by
+     * its owner departing, by the inheritance rules at job end - is nobody's
+     * request, and the campaign then exists purely for the bookkeeping its
+     * completion does. */
+    if (NULL != req) {
+        PMIX_XFER_PROCID(&camp->requester, &req->tproc);
+        for (size_t n = 0; n < req->ninfo; n++) {
+            if (PMIx_Check_key(req->info[n].key, PMIX_ALLOC_ID)) {
+                camp->alloc_id = strdup(req->info[n].value.data.string);
+            } else if (PMIx_Check_key(req->info[n].key, PMIX_ALLOC_REQ_ID)) {
+                camp->req_id = strdup(req->info[n].value.data.string);
+            }
         }
+        camp->have_requester = true;
     }
-    camp->have_requester = true;
     pmix_list_append(&prte_shrink_campaigns, &camp->super);
     prte_dvm_launch_fence += nranks;
 
@@ -1862,9 +2033,42 @@ void prte_ras_base_complete_request(prte_pmix_server_req_t *req)
     }
 }
 
+/*
+ * May an add-host/add-hostfile directive be honored here?
+ *
+ * Two different noes.  Under an allocation owned by an external resource
+ * manager it is not PRRTE's to grant: only the scheduler can say which nodes
+ * this DVM holds, and launching a daemon on one it did not grant does not
+ * fail locally - the launch fails and takes the whole DVM with it.  That was
+ * the behavior before this check existed.
+ *
+ * Otherwise the request is routed by name to the component that serves it, so
+ * refuse if that component is not the active allocator.  A bootstrapped DVM
+ * is the case that reaches this: its membership comes from a configuration
+ * file every daemon reads, and ras/bootstrap outranks ras/hosts.
+ */
+static int ras_base_add_hosts_allowed(void)
+{
+    prte_ras_base_selected_module_t *mod;
+
+    if (prte_ras_base.scheduler_owned) {
+        prte_show_help("help-ras-base.txt", "ras-base:add-host-managed", true);
+        return PRTE_ERR_NOT_SUPPORTED;
+    }
+
+    PMIX_LIST_FOREACH(mod, &prte_ras_base.selected_modules, prte_ras_base_selected_module_t) {
+        if (0 == strcasecmp("hosts", mod->component->pmix_mca_component_name)) {
+            return PRTE_SUCCESS;
+        }
+    }
+
+    prte_show_help("help-ras-base.txt", "ras-base:add-host-unsupported", true);
+    return PRTE_ERR_NOT_SUPPORTED;
+}
+
 int prte_ras_base_add_hosts(prte_job_t *jdata)
 {
-    int i;
+    int i, rc;
     prte_app_context_t *app;
     char *hosts, **hostfiles, **addhosts, *tmp;
     prte_pmix_server_req_t *req;
@@ -1899,11 +2103,30 @@ int prte_ras_base_add_hosts(prte_job_t *jdata)
         return PRTE_SUCCESS;
     }
 
+    /* Can this be served at all?  Refuse here, synchronously, rather than
+     * posting a request nothing will answer: a few lines below this marks the
+     * DVM not-ready and the caller parks the job in the cache, and only the
+     * grow's VM_READY re-entry releases it.  A request no module serves would
+     * leave the job waiting on a DVM that never becomes ready again. */
+    rc = ras_base_add_hosts_allowed();
+    if (PRTE_SUCCESS != rc) {
+        PMIx_Argv_free(hostfiles);
+        PMIx_Argv_free(addhosts);
+        return rc;
+    }
+
     // create an allocation request tracker
     req = PMIX_NEW(prte_pmix_server_req_t);
     req->key = strdup("hosts");
     req->operation = strdup("ADDHOSTS");
     req->allocdir = PMIX_ALLOC_EXTEND;
+    /* the request OWNS whatever job object it carries - its destructor
+     * releases it - and this one is not ours to give away: the job is
+     * still on its way to launch, and the parent's child list is holding
+     * the only other reference to it.  Every other producer of a request
+     * hands over a job it just created (PRTE_SPN_REQ); we are borrowing a
+     * live one, so take a reference of our own for the request to drop. */
+    PMIX_RETAIN(jdata);
     req->jdata = jdata;
     if (NULL != hostfiles) {
         req->ninfo++;
@@ -1939,6 +2162,709 @@ int prte_ras_base_add_hosts(prte_job_t *jdata)
     // mark that the DVM is not ready so the launch does not continue
     // until we have processed the nodes
     prte_dvm_ready = false;
+
+    return PRTE_SUCCESS;
+}
+
+/*
+ * PMIX_SPAWN_ALLOC - a spawn that carries the allocation it needs.
+ *
+ * The request is served exactly as a standalone PMIx_Allocation_request
+ * would be: the same directive, the same info, the same modules, the same
+ * answer.  What differs is only what is done with that answer, and that is
+ * plm's business - so the two callbacks below decide nothing themselves,
+ * they hand the outcome to prte_plm_base_spawn_alloc_granted/_failed.
+ *
+ * The requester is the process that asked for the spawn, not the job being
+ * spawned: the job has no namespace yet (the HNP assigns it at launch), and
+ * an allocation has to be owned by somebody who exists.  That also puts the
+ * reservation under the ordinary ownership rules - the spawn requester can
+ * release it, target it, and is the one it outlives.
+ */
+static void spawn_alloc_complete(pmix_status_t status, pmix_info_t *info, size_t ninfo,
+                                 void *cbdata, pmix_release_cbfunc_t rel, void *relcbdata)
+{
+    prte_job_t *jdata = (prte_job_t *) cbdata;
+    char *alloc_id = NULL;
+    size_t n;
+
+    /* the id of what we were given, where the answer carries one - it is
+     * what points the job at those resources, and what has to be handed back
+     * if the job then fails to launch */
+    for (n = 0; n < ninfo; n++) {
+        if (PMIx_Check_key(info[n].key, PMIX_ALLOC_ID) &&
+            PMIX_STRING == info[n].value.type) {
+            alloc_id = info[n].value.data.string;
+            break;
+        }
+    }
+
+    /* PMIX_OPERATION_IN_PROGRESS is a grant, not a maybe: it is what a
+     * resource manager answers when the resources are promised and their
+     * daemons are still coming (ras/slurm's extend), and the DVM-ready event
+     * that ends it is the same one the job is already waiting on. */
+    if (PMIX_SUCCESS == status || PMIX_OPERATION_SUCCEEDED == status ||
+        PMIX_OPERATION_IN_PROGRESS == status) {
+        prte_plm_base_spawn_alloc_granted(jdata, alloc_id);
+    } else {
+        prte_plm_base_spawn_alloc_failed(jdata, status);
+    }
+
+    if (NULL != rel) {
+        rel(relcbdata);
+    }
+}
+
+int prte_ras_base_spawn_alloc(prte_job_t *jdata, bool *posted)
+{
+    pmix_data_array_t *darray = NULL;
+    pmix_info_t *src, *info = NULL;
+    size_t n, ninfo = 0, idx = 0, nalloc;
+    pmix_alloc_directive_t directive = 0;
+    bool have_directive = false;
+    prte_pmix_server_req_t *req;
+    pmix_proc_t *proxy = NULL;
+
+    *posted = false;
+    if (!prte_get_attribute(&jdata->attributes, PRTE_JOB_SPAWN_ALLOC,
+                            (void **) &darray, PMIX_DATA_ARRAY) ||
+        NULL == darray) {
+        /* this spawn asks for no allocation - the ordinary case */
+        return PRTE_SUCCESS;
+    }
+    /* consumed: the launch is re-driven once the DVM is ready again, and a
+     * second pass must not ask for a second allocation */
+    prte_remove_attribute(&jdata->attributes, PRTE_JOB_SPAWN_ALLOC);
+
+    if (PMIX_INFO != darray->type || 0 == darray->size || NULL == darray->array) {
+        PMIX_DATA_ARRAY_FREE(darray);
+        return PRTE_ERR_BAD_PARAM;
+    }
+    src = (pmix_info_t *) darray->array;
+    nalloc = darray->size;
+
+    /* Split the request into its directive and its info array - the shape a
+     * request has everywhere else in the code, and the shape the modules
+     * expect.  Everything that is not the directive is the request.  The
+     * array is sized for the whole thing and filled short by exactly the
+     * directive; the tail stays as PMIX_INFO_CREATE left it, which destructs
+     * to nothing, so the request may carry the filled count. */
+    PMIX_INFO_CREATE(info, nalloc);
+    if (NULL == info) {
+        PMIX_DATA_ARRAY_FREE(darray);
+        return PRTE_ERR_OUT_OF_RESOURCE;
+    }
+    for (n = 0; n < nalloc; n++) {
+        if (PMIx_Check_key(src[n].key, PMIX_ALLOC_REQ_DIRECTIVE)) {
+            if (PMIX_ALLOC_DIRECTIVE != src[n].value.type) {
+                PMIX_INFO_FREE(info, nalloc);
+                PMIX_DATA_ARRAY_FREE(darray);
+                return PRTE_ERR_BAD_PARAM;
+            }
+            directive = src[n].value.data.uint8;
+            have_directive = true;
+            continue;
+        }
+        PMIX_INFO_XFER(&info[idx++], &src[n]);
+    }
+    ninfo = idx;
+    PMIX_DATA_ARRAY_FREE(darray);
+
+    if (!have_directive) {
+        /* the one element that cannot be defaulted: a request whose directive
+         * we had to guess would ask for something nobody asked for */
+        prte_show_help("help-ras-base.txt", "ras-base:spawn-alloc-nodirective", true);
+        PMIX_INFO_FREE(info, nalloc);
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    req = PMIX_NEW(prte_pmix_server_req_t);
+    if (NULL == req) {
+        PMIX_INFO_FREE(info, nalloc);
+        return PRTE_ERR_OUT_OF_RESOURCE;
+    }
+    pmix_asprintf(&req->operation, "SPAWN-ALLOC: %s",
+                  PMIx_Alloc_directive_string(directive));
+    req->allocdir = directive;
+    req->info = info;
+    req->ninfo = ninfo;
+    req->copy = true;
+    /* ask in the name of whoever asked for the spawn */
+    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_LAUNCH_PROXY,
+                           (void **) &proxy, PMIX_PROC) &&
+        NULL != proxy) {
+        PMIX_XFER_PROCID(&req->tproc, proxy);
+        PMIX_PROC_RELEASE(proxy);
+    } else {
+        PMIX_XFER_PROCID(&req->tproc, &jdata->originator);
+    }
+    /* The request OWNS the job object it carries - and this one is not ours
+     * to give away, so take a reference of our own for it to drop (the same
+     * borrowing prte_ras_base_add_hosts does).  That reference is what keeps
+     * the job alive across the request, so the callbacks may use it freely
+     * until they hand the request back. */
+    PMIX_RETAIN(jdata);
+    req->jdata = jdata;
+    req->cbdata = jdata;
+    req->infocbfunc = spawn_alloc_complete;
+    req->local_index = pmix_pointer_array_add(&prte_pmix_server_globals.local_reqs, req);
+
+    /* Note what is NOT done here: the job is not parked in the cache and the
+     * DVM is not marked un-ready.  The request itself is what holds the job
+     * while the allocation is obtained - the cache is drained by the next
+     * DVM-ready event whatever it was raised for, which would launch this job
+     * before it had the resources it asked for.  Where to wait, and for what,
+     * is decided once the answer is in (prte_plm_base_spawn_alloc_granted). */
+    prte_event_set(prte_event_base, &req->ev, -1, PRTE_EV_WRITE, prte_ras_base_modify, req);
+    PMIX_POST_OBJECT(req);
+    prte_event_active(&req->ev, PRTE_EV_WRITE, 1);
+
+    *posted = true;
+    return PRTE_SUCCESS;
+}
+
+/*
+ * Hand back an allocation obtained for a spawn that then failed to launch.
+ *
+ * The requester is told the spawn's own error - but only once the resources
+ * are on their way back, since a caller that is told its spawn failed is
+ * entitled to assume it is no longer holding anything for it.  The release
+ * is an ordinary PMIX_ALLOC_RELEASE, so it goes wherever a release goes: to
+ * the module that owns the allocation, and through the same deferral if a
+ * grow is in flight.  cb is invoked when it resolves, either way - there is
+ * no outcome in which the spawn's own error is not delivered.
+ */
+static void spawn_alloc_release_complete(pmix_status_t status, pmix_info_t *info,
+                                         size_t ninfo, void *cbdata,
+                                         pmix_release_cbfunc_t rel, void *relcbdata)
+{
+    prte_job_t *jdata = (prte_job_t *) cbdata;
+    PRTE_HIDE_UNUSED_PARAMS(info, ninfo);
+
+    if (PMIX_SUCCESS != status && PMIX_OPERATION_SUCCEEDED != status) {
+        /* nothing more can be done about it here - the resources stay held,
+         * and the requester still has to be told what became of its spawn */
+        PMIX_OUTPUT_VERBOSE((2, prte_ras_base_framework.framework_output,
+                             "%s ras:base:spawn_alloc release refused: %s",
+                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                             PMIx_Error_string(status)));
+    }
+
+    prte_plm_base_spawn_alloc_released(jdata);
+
+    if (NULL != rel) {
+        rel(relcbdata);
+    }
+}
+
+int prte_ras_base_release_spawn_alloc(prte_job_t *jdata, const char *alloc_id)
+{
+    prte_pmix_server_req_t *req;
+    pmix_proc_t *proxy = NULL;
+
+    if (NULL == alloc_id) {
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    PMIX_OUTPUT_VERBOSE((2, prte_ras_base_framework.framework_output,
+                         "%s ras:base:spawn_alloc releasing %s - the job it was "
+                         "obtained for did not launch",
+                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), alloc_id));
+
+    req = PMIX_NEW(prte_pmix_server_req_t);
+    if (NULL == req) {
+        return PRTE_ERR_OUT_OF_RESOURCE;
+    }
+    req->operation = strdup("SPAWN-ALLOC-RELEASE");
+    req->allocdir = PMIX_ALLOC_RELEASE;
+    req->ninfo = 1;
+    PMIX_INFO_CREATE(req->info, req->ninfo);
+    if (NULL == req->info) {
+        PMIX_RELEASE(req);
+        return PRTE_ERR_OUT_OF_RESOURCE;
+    }
+    req->copy = true;
+    PMIX_INFO_LOAD(&req->info[0], PMIX_ALLOC_ID, (void *) alloc_id, PMIX_STRING);
+    /* release in the same name it was obtained in, or the ownership check
+     * refuses us our own allocation */
+    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_LAUNCH_PROXY,
+                           (void **) &proxy, PMIX_PROC) &&
+        NULL != proxy) {
+        PMIX_XFER_PROCID(&req->tproc, proxy);
+        PMIX_PROC_RELEASE(proxy);
+    } else {
+        PMIX_XFER_PROCID(&req->tproc, &jdata->originator);
+    }
+    PMIX_RETAIN(jdata);
+    req->jdata = jdata;
+    req->cbdata = jdata;
+    req->infocbfunc = spawn_alloc_release_complete;
+    req->local_index = pmix_pointer_array_add(&prte_pmix_server_globals.local_reqs, req);
+
+    prte_event_set(prte_event_base, &req->ev, -1, PRTE_EV_WRITE, prte_ras_base_modify, req);
+    PMIX_POST_OBJECT(req);
+    prte_event_active(&req->ev, PRTE_EV_WRITE, 1);
+
+    return PRTE_SUCCESS;
+}
+
+/*
+ * --activate: bring nodes the allocation already contains into the DVM.
+ *
+ * The node pool holds every node the allocation contains, but only those the
+ * DVM was started across carry a daemon: a --host/--hostfile given to "prte"
+ * narrows which pool entries get one, and a released reservation hands its
+ * nodes back to the pool without one.  Such a node is up, allocated, and
+ * unreachable - nothing in the DVM can use it, and until now nothing could
+ * ask for it back.
+ *
+ * This is deliberately weaker than --add-host, and that is what makes it
+ * safe where add-host is not.  It adds nothing to the allocation, changes no
+ * slot count, and asks no scheduler for anything: it can only name nodes the
+ * allocation already contains, so it is permitted even when a resource
+ * manager owns the allocation.  All it does is mark the chosen pool entries
+ * PRTE_NODE_STATE_ADDED - which is precisely what every other producer of a
+ * grow does - and let the ordinary DVM extension launch daemons on them.
+ */
+
+/* Is this pool entry already part of the DVM?  Pool entry 0 is the HNP's own
+ * node, which is in the DVM by definition - and which the grow loop in
+ * prte_plm_base_setup_virtual_machine() starts past, so it could not be a
+ * target even if it somehow carried no daemon. */
+static bool ras_base_in_dvm(prte_node_t *node)
+{
+    return (NULL != node->daemon || 0 == node->index);
+}
+
+/* May a daemon be started on this pool entry?  A node already in the DVM is
+ * not activatable but is not an error either - see below. */
+static bool ras_base_activatable(prte_node_t *node)
+{
+    if (ras_base_in_dvm(node)) {
+        return false;
+    }
+    /* ADDED means some other pending grow has already claimed it; UP is the
+     * ordinary idle case.  Every other state says the node is not to be used
+     * (DOWN, REBOOT, DO_NOT_USE) or has been taken back by the scheduler
+     * (NOT_INCLUDED), and a daemon launched on one of those fails - taking
+     * the DVM with it, since a daemon that cannot start is fatal. */
+    return (PRTE_NODE_STATE_UP == node->state || PRTE_NODE_STATE_ADDED == node->state);
+}
+
+/* Read a non-negative decimal index, refusing anything that is not wholly
+ * digits.  parse_dash_host() takes strtol's answer unchecked, so "+nabc"
+ * quietly means "+n0" there; here that would silently activate a node
+ * nobody named and report success. */
+static bool ras_base_read_count(const char *str, int *val)
+{
+    char *endp = NULL;
+    long v;
+
+    if (NULL == str || '\0' == *str) {
+        return false;
+    }
+    v = strtol(str, &endp, 10);
+    if (NULL == endp || '\0' != *endp || 0 > v || INT_MAX < v) {
+        return false;
+    }
+    *val = (int) v;
+    return true;
+}
+
+/* Is this node already in the selection? */
+static bool ras_base_activate_selected(pmix_pointer_array_t *sel, prte_node_t *node)
+{
+    int i;
+    prte_node_t *nptr;
+
+    for (i = 0; i < sel->size; i++) {
+        nptr = (prte_node_t *) pmix_pointer_array_get_item(sel, i);
+        if (nptr == node) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int ras_base_activate_select(pmix_pointer_array_t *sel, prte_node_t *node,
+                                    const char *token)
+{
+    if (ras_base_in_dvm(node)) {
+        /* already in the DVM.  Not an error: --activate states what the DVM's
+         * membership is to include, and for this node it already does.  A
+         * relative token ("+e:2") never lands here - it selects only from
+         * daemon-less entries - so this is the user naming a node twice, or
+         * naming one they were not sure about. */
+        return PRTE_SUCCESS;
+    }
+    if (!ras_base_activatable(node)) {
+        prte_show_help("help-ras-base.txt", "ras-base:activate-unavailable", true,
+                       node->name, prte_node_state_to_str(node->state), token);
+        return PRTE_ERR_SILENT;
+    }
+    if (!ras_base_activate_selected(sel, node)) {
+        pmix_pointer_array_add(sel, node);
+    }
+    return PRTE_SUCCESS;
+}
+
+/*
+ * Resolve a "file=" token: read the hostfile, then look every name it holds
+ * up in the node pool.  The parsed nodes are throwaway objects describing
+ * what the file said; what goes into the selection is the pool's own entry
+ * for each, which is the only thing a grow can act on.
+ */
+static int ras_base_activate_hostfile(const char *hostfile, pmix_pointer_array_t *sel)
+{
+    pmix_list_t nodes;
+    prte_node_t *nd, *node;
+    int rc;
+
+    if ('\0' == *hostfile) {
+        prte_show_help("help-ras-base.txt", "ras-base:activate-nofile", true);
+        return PRTE_ERR_SILENT;
+    }
+
+    PMIX_CONSTRUCT(&nodes, pmix_list_t);
+    /* the parser reports its own failures - a file it cannot open, a bad
+     * line, relative syntax inside a file - through show_help */
+    rc = prte_util_add_hostfile_nodes(&nodes, (char *) hostfile);
+    if (PRTE_SUCCESS != rc) {
+        PMIX_LIST_DESTRUCT(&nodes);
+        return (PRTE_ERR_SILENT == rc) ? rc : PRTE_ERR_SILENT;
+    }
+
+    PMIX_LIST_FOREACH(nd, &nodes, prte_node_t) {
+        node = prte_node_match(NULL, nd->name);
+        if (NULL == node) {
+            prte_show_help("help-ras-base.txt", "ras-base:activate-unknown-in-file", true,
+                           nd->name, hostfile);
+            PMIX_LIST_DESTRUCT(&nodes);
+            return PRTE_ERR_SILENT;
+        }
+        rc = ras_base_activate_select(sel, node, nd->name);
+        if (PRTE_SUCCESS != rc) {
+            PMIX_LIST_DESTRUCT(&nodes);
+            return rc;
+        }
+    }
+    PMIX_LIST_DESTRUCT(&nodes);
+
+    return PRTE_SUCCESS;
+}
+
+/*
+ * Resolve one --activate specification against the node pool, appending the
+ * nodes it names to sel.  Nothing is modified here: a specification is either
+ * wholly acceptable or wholly refused, so that a bad token in a later app
+ * segment cannot leave nodes marked for a grow that never happens.
+ *
+ * The syntax is --host's, minus what activate cannot honor:
+ *   node01,node02   - name the nodes directly
+ *   +all            - every allocated node that is not in the DVM
+ *   +n<K>           - the K'th node of the allocation
+ *   file=<path>     - a hostfile, read exactly as --hostfile reads one
+ * A ":<slots>" modifier is refused rather than ignored (see below), and so
+ * is "+e" - see there for why it cannot mean anything useful here.
+ */
+static int ras_base_activate_spec(const char *spec, pmix_pointer_array_t *sel)
+{
+    char **tokens;
+    int rc = PRTE_SUCCESS;
+    int k, n, nodeidx;
+    prte_node_t *node;
+
+    tokens = PMIx_Argv_split(spec, ',');
+    if (NULL == tokens) {
+        return PRTE_SUCCESS;
+    }
+
+    for (k = 0; NULL != tokens[k]; k++) {
+        if (0 == strncmp(tokens[k], "file=", 5)) {
+            /* a hostfile, in exactly the format --hostfile reads - which is
+             * also what makes it useful here: the file that described the
+             * allocation to begin with can be handed straight back.  Only
+             * the node NAMES are taken from it.  A "slots=" in the file is
+             * not applied, for the same reason the ":N" form below is
+             * refused, and this is how a hostfile given to a tool already
+             * behaves: it selects, it does not resize.
+             *
+             * The parser is the real one, so ^exclusion, aliases and its
+             * refusal of relative syntax inside a file all come along. */
+            rc = ras_base_activate_hostfile(&tokens[k][5], sel);
+            if (PRTE_SUCCESS != rc) {
+                goto done;
+            }
+
+        } else if ('+' != tokens[k][0]) {
+            /* an explicit node name.  A ":N" slot modifier is refused, not
+             * quietly dropped: activate has no authority to change what the
+             * allocation grants, and a request that appears to have been
+             * honored but silently was not is worse than a refusal.  Use
+             * --add-host where PRRTE owns the allocation and the slot count
+             * really is PRRTE's to change. */
+            if (NULL != strchr(tokens[k], ':')) {
+                prte_show_help("help-ras-base.txt", "ras-base:activate-slots", true, tokens[k]);
+                rc = PRTE_ERR_SILENT;
+                goto done;
+            }
+            node = prte_node_match(NULL, tokens[k]);
+            if (NULL == node) {
+                prte_show_help("help-ras-base.txt", "ras-base:activate-unknown", true, tokens[k]);
+                rc = PRTE_ERR_SILENT;
+                goto done;
+            }
+            rc = ras_base_activate_select(sel, node, tokens[k]);
+            if (PRTE_SUCCESS != rc) {
+                goto done;
+            }
+
+        } else if (0 == strcasecmp(&tokens[k][1], "all")) {
+            /* every allocated node that is not in the DVM.  Finding none is
+             * not an error: "activate all" is a statement about what the
+             * DVM's membership should include, and if it already includes
+             * everything the allocation holds then it is satisfied. */
+            for (n = 0; n < prte_node_pool->size; n++) {
+                node = (prte_node_t *) pmix_pointer_array_get_item(prte_node_pool, n);
+                if (NULL == node || !ras_base_activatable(node)) {
+                    continue;
+                }
+                if (!ras_base_activate_selected(sel, node)) {
+                    pmix_pointer_array_add(sel, node);
+                }
+            }
+
+        } else if ('n' == tokens[k][1] || 'N' == tokens[k][1]) {
+            /* a specific node of the allocation, by index */
+            if (!ras_base_read_count(&tokens[k][2], &nodeidx)) {
+                prte_show_help("help-dash-host.txt", "dash-host:invalid-relative-node-syntax",
+                               true, tokens[k]);
+                rc = PRTE_ERR_SILENT;
+                goto done;
+            }
+            /* pool entry 0 is the HNP's own node, which is part of the
+             * allocation only when the resource manager included it - the
+             * same offset parse_dash_host() applies to this syntax */
+            if (!prte_hnp_is_allocated) {
+                ++nodeidx;
+            }
+            if (nodeidx >= prte_node_pool->size) {
+                prte_show_help("help-dash-host.txt", "dash-host:relative-node-out-of-bounds",
+                               true, nodeidx, tokens[k]);
+                rc = PRTE_ERR_SILENT;
+                goto done;
+            }
+            node = (prte_node_t *) pmix_pointer_array_get_item(prte_node_pool, nodeidx);
+            if (NULL == node) {
+                prte_show_help("help-dash-host.txt", "dash-host:relative-node-not-found",
+                               true, nodeidx, tokens[k]);
+                rc = PRTE_ERR_SILENT;
+                goto done;
+            }
+            rc = ras_base_activate_select(sel, node, tokens[k]);
+            if (PRTE_SUCCESS != rc) {
+                goto done;
+            }
+
+        } else if ('e' == tokens[k][1] || 'E' == tokens[k][1]) {
+            /* "+e" is valid --host syntax, so it gets its own refusal rather
+             * than the generic "that is not relative node syntax".  It means
+             * "nodes with no application process running on them", which is
+             * not a question about DVM membership at all: the nodes it picks
+             * are mostly ones the DVM is already on, so honoring it here
+             * would launch nothing and report success. */
+            prte_show_help("help-ras-base.txt", "ras-base:activate-empty", true, tokens[k]);
+            rc = PRTE_ERR_SILENT;
+            goto done;
+
+        } else {
+            prte_show_help("help-dash-host.txt", "dash-host:invalid-relative-node-syntax",
+                           true, tokens[k]);
+            rc = PRTE_ERR_SILENT;
+            goto done;
+        }
+    }
+
+done:
+    PMIx_Argv_free(tokens);
+    return rc;
+}
+
+/*
+ * Resolve one activation request - a host specification, a hostfile, or both -
+ * into the selection.  This is the single entry point both requesters share:
+ * the command line folds its hostfile into the host list as "file=<path>"
+ * while the PMIx form carries it as a separate attribute, so the two arrive
+ * differently and are parsed identically from here on.  Either argument may be
+ * NULL; the hostfile argument may name several files, comma-delimited, as
+ * every other hostfile attribute may.
+ */
+static int ras_base_activate_resolve(const char *hosts, const char *hostfile,
+                                     pmix_pointer_array_t *sel)
+{
+    char **files;
+    int k, rc = PRTE_SUCCESS;
+
+    if (NULL != hosts && '\0' != *hosts) {
+        rc = ras_base_activate_spec(hosts, sel);
+        if (PRTE_SUCCESS != rc) {
+            return rc;
+        }
+    }
+
+    if (NULL == hostfile || '\0' == *hostfile) {
+        return PRTE_SUCCESS;
+    }
+    files = PMIx_Argv_split(hostfile, ',');
+    if (NULL == files) {
+        return PRTE_SUCCESS;
+    }
+    for (k = 0; NULL != files[k]; k++) {
+        rc = ras_base_activate_hostfile(files[k], sel);
+        if (PRTE_SUCCESS != rc) {
+            break;
+        }
+    }
+    PMIx_Argv_free(files);
+
+    return rc;
+}
+
+/*
+ * Commit a resolved selection: mark every entry PRTE_NODE_STATE_ADDED so the
+ * next DVM extension launches a daemon there, and report how many entries that
+ * actually changed.  A count of zero means every named node is already in the
+ * DVM or already on its way in - nothing to launch, and nothing to wait for.
+ *
+ * Committing is separate from resolving so that a request naming several
+ * specifications is all-or-nothing: a bad token in a later one cannot leave
+ * nodes marked for a grow that never happens.
+ */
+static int ras_base_activate_commit(pmix_pointer_array_t *sel)
+{
+    int i, nactivated = 0;
+    prte_node_t *node;
+
+    for (i = 0; i < sel->size; i++) {
+        node = (prte_node_t *) pmix_pointer_array_get_item(sel, i);
+        if (NULL == node) {
+            continue;
+        }
+        if (PRTE_NODE_STATE_ADDED == node->state) {
+            /* already claimed by a pending grow, which will launch it */
+            continue;
+        }
+        node->state = PRTE_NODE_STATE_ADDED;
+        ++nactivated;
+    }
+
+    return nactivated;
+}
+
+int prte_ras_base_activate_nodes(const char *hosts, const char *hostfile,
+                                 int *nactivated)
+{
+    pmix_pointer_array_t sel;
+    int rc;
+
+    *nactivated = 0;
+    if ((NULL == hosts || '\0' == *hosts) &&
+        (NULL == hostfile || '\0' == *hostfile)) {
+        /* nothing named at all - the caller asked for an activation without
+         * saying what to activate */
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    PMIX_CONSTRUCT(&sel, pmix_pointer_array_t);
+    pmix_pointer_array_init(&sel, 8, INT_MAX, 8);
+
+    rc = ras_base_activate_resolve(hosts, hostfile, &sel);
+    if (PRTE_SUCCESS == rc) {
+        *nactivated = ras_base_activate_commit(&sel);
+    }
+    PMIX_DESTRUCT(&sel);
+
+    return rc;
+}
+
+int prte_ras_base_activate_hosts(prte_job_t *jdata)
+{
+    int i, rc, nactivated;
+    prte_app_context_t *app;
+    char *spec;
+    pmix_pointer_array_t sel;
+    bool found = false, adding = false;
+
+    PMIX_CONSTRUCT(&sel, pmix_pointer_array_t);
+    pmix_pointer_array_init(&sel, 8, INT_MAX, 8);
+
+    for (i = 0; i < jdata->apps->size; i++) {
+        app = (prte_app_context_t *) pmix_pointer_array_get_item(jdata->apps, i);
+        if (NULL == app) {
+            continue;
+        }
+        /* note whether this same request also grows the allocation - it
+         * decides who activates the grow, below */
+        if (prte_get_attribute(&app->attributes, PRTE_APP_ADD_HOST, NULL, PMIX_STRING) ||
+            prte_get_attribute(&app->attributes, PRTE_APP_ADD_HOSTFILE, NULL, PMIX_STRING)) {
+            adding = true;
+        }
+        spec = NULL;
+        if (!prte_get_attribute(&app->attributes, PRTE_APP_ACTIVATE_HOSTS,
+                                (void **) &spec, PMIX_STRING) ||
+            NULL == spec) {
+            continue;
+        }
+        found = true;
+        rc = ras_base_activate_resolve(spec, NULL, &sel);
+        free(spec);
+        if (PRTE_SUCCESS != rc) {
+            PMIX_DESTRUCT(&sel);
+            return rc;
+        }
+    }
+
+    if (!found) {
+        PMIX_DESTRUCT(&sel);
+        return PRTE_SUCCESS;
+    }
+
+    /* every token resolved, so the selection can now be committed */
+    nactivated = ras_base_activate_commit(&sel);
+    PMIX_DESTRUCT(&sel);
+
+    if (0 == nactivated) {
+        /* every named node is already in the DVM, or already on its way in.
+         * There is nothing to launch, so leave the DVM ready and let the job
+         * proceed - marking it not-ready here would park the job waiting on
+         * a grow that never runs. */
+        PMIX_OUTPUT_VERBOSE((5, prte_ras_base_framework.framework_output,
+                             "%s ras:base:activate_hosts nothing to activate",
+                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+        return PRTE_SUCCESS;
+    }
+
+    PMIX_OUTPUT_VERBOSE((5, prte_ras_base_framework.framework_output,
+                         "%s ras:base:activate_hosts activating %d node%s",
+                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), nactivated,
+                         (1 == nactivated) ? "" : "s"));
+
+    if (adding) {
+        /* This same request carries --add-host/--add-hostfile, and
+         * prte_ras_base_add_hosts() has already posted the asynchronous
+         * request that inserts those nodes and then activates a grow.  That
+         * grow launches on every node marked PRTE_NODE_STATE_ADDED, ours
+         * included, so it is the one to wait for.  Activating a second grow
+         * here would race ahead of the insertion and extend the DVM before
+         * the added nodes existed. */
+        return PRTE_SUCCESS;
+    }
+
+    /* mark that the DVM is not ready so the launch does not continue until
+     * the new daemons are up - the VM_READY re-entry at the end of the grow
+     * marks it ready again and releases the job from the cache */
+    prte_dvm_ready = false;
+    prte_ras_base_activate_dvm_grow();
 
     return PRTE_SUCCESS;
 }

@@ -33,6 +33,9 @@
 #define PRTE_RAS_SLURM_H
 
 #include "prte_config.h"
+
+#include <time.h>
+
 #include "src/mca/ras/base/base.h"
 #include "src/mca/ras/ras.h"
 
@@ -49,15 +52,18 @@ BEGIN_C_DECLS
 /* To check if Jansson is available in compilation */
 bool prte_ras_slurm_have_jansson(void);
 
-/* Whether this build can serve the elastic modify surface at all, reporting
- * why not when it cannot.  Every entry point of that surface asks first. */
-bool prte_ras_slurm_have_extensions(void);
+/* Whether this build can serve the elastic modify surface at all.  Every
+ * entry point of that surface asks first, with quiet=false, so the refusal
+ * is reported.  Callers that just need the answer (e.g. deciding whether to
+ * set up bookkeeping at init time) pass quiet=true to suppress that. */
+bool prte_ras_slurm_have_extensions(bool quiet);
 
 /* Features requiring JSON parser */
 int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table);
 int prte_ras_slurm_add_modified_resources(const char *slurm_jobid, pmix_list_t *node_list);
 int prte_ras_slurm_detach_nodes(const char *slurm_jobid, prte_session_t *session, pmix_pointer_array_t *removed_nodes);
 int prte_ras_slurm_check_resources(const char *slurm_jobid);
+int prte_ras_slurm_get_job_times(const char *slurm_jobid, time_t *start_time, time_t *end_time);
 
 /* Features to serve cancel requests */
 int prte_ras_slurm_add_pending_req(const char *request_id, const char *slurm_job_id);
@@ -152,6 +158,7 @@ extern const char *const num_obj_subfields[NUM_OBJ_SUBFIELD_COUNT];
 
 enum record_job_data_field {
     PRTE_JOB_DATA_NODES,
+    PRTE_JOB_DATA_NODELIST,
     PRTE_JOB_DATA_JOB_ID,
     PRTE_JOB_DATA_COUNT
 };

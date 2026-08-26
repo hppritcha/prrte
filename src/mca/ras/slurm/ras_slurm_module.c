@@ -77,6 +77,7 @@ static int prte_ras_slurm_finalize(void);
  * RAS slurm module
  */
 prte_ras_base_module_t prte_ras_slurm_module = {
+    .scheduler_owned = true,
     .init = init,
     .allocate = prte_ras_slurm_allocate,
     .modify = modify,
@@ -305,7 +306,14 @@ static pmix_status_t modify(prte_pmix_server_req_t *req)
 {
     int err = PRTE_SUCCESS;
 
-    if(PMIX_ALLOC_EXTEND == req->allocdir) {
+    /* PMIX_ALLOC_NEW is a synonym for PMIX_ALLOC_EXTEND here: Slurm cannot
+     * grow an allocation in place, so an extend is always a second, disjoint
+     * job - "new" to the scheduler - that the DVM then spans.
+     *
+     * Both are claimed outright, and a grow this component cannot ask Slurm
+     * for is refused rather than passed on: inside a Slurm allocation there
+     * is no next module that could legitimately serve it. */
+    if(PMIX_ALLOC_EXTEND == req->allocdir || PMIX_ALLOC_NEW == req->allocdir) {
         err = prte_ras_slurm_serve_extend_req(req);
         req->pstatus = prte_pmix_convert_rc(err);
     } else if(PMIX_ALLOC_RELEASE == req->allocdir) {

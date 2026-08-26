@@ -310,7 +310,14 @@ typedef struct {
     pmix_rank_t n_dmns;
     // All faults known, globally confirmed or not
     pmix_bitmap_t failed_dmns;
-    // All daemons globally confirmed to have failed
+    // All daemons globally confirmed to have failed - i.e. the subset of
+    // failed_dmns whose departure the HNP has already broadcast. Its one
+    // consumer is send_failures_notice, which subtracts it from failed_dmns
+    // to work out which of this daemon's subtree failures a NEW parent has
+    // yet to hear about. prte_rml_compute_routing_tree re-initializes it (the
+    // subtraction is a bitmap XOR, which needs both operands the same width,
+    // and a grow widens failed_dmns) but carries the marks across, because
+    // nothing else in the daemon records that a departure has been broadcast.
     pmix_bitmap_t global_failed_dmns;
     // Ranks that have permanently departed the DVM (shrunk out, or lost to a
     // fault in a launched/elastic DVM). Unlike failed_dmns, this set is NOT
@@ -326,6 +333,18 @@ typedef struct {
     // the daemon returns (the "unheal" path). Only bootstrap faults populate
     // it -- a launched/elastic departure remains permanent in dead_dmns.
     pmix_bitmap_t absent_dmns;
+    // Ranks that have come back (the unheal path cleared their absent mark)
+    // and have not since been confirmed dead again. Constructed once, like the
+    // two sets above. Its one job is to bound what may be *inferred*: a peer's
+    // report of our lineage is a snapshot of that peer's view when it sent,
+    // and a revival travels as its own xcast, so a notice that crossed with
+    // one carries a lineage predating the return. Acting on it would bury a
+    // daemon that is alive and talking to us, so a rank in this set may only
+    // be declared dead by something that observed it directly - a lost socket,
+    // or the HNP's arbitrated broadcast. Cleared again when such a death is
+    // recorded, so a rank that returns and later really dies is not pinned
+    // alive forever.
+    pmix_bitmap_t revived_dmns;
 
     // Highest boot epoch (incarnation) known for each daemon rank, indexed by
     // rank; 0 means "not yet learned". A rebooted bootstrap daemon returns with
@@ -401,8 +420,25 @@ PRTE_EXPORT void prte_rml_send_callback(int status, pmix_proc_t *peer,
                                         prte_rml_tag_t tag, void *cbdata);
 PRTE_EXPORT void prte_rml_compute_routing_tree(void);
 PRTE_EXPORT void prte_rml_update_ancestors(pmix_data_array_t* ancestors);
+/* Reconcile a peer's report of THIS daemon's ancestor list (root first, not
+ * including us) against prte_rml_base.ancestors.  Both notices that reshape the
+ * tree carry such a list - the adoption notice a parent sends down, and the
+ * failure notice a child sends up - and both reconcile it here.
+ *
+ * `report` is normalized in place against our own failure knowledge; `inferred`
+ * receives the ranks that must have died when the return is
+ * PRTE_RML_ANCESTRY_INFERRED, and is left empty otherwise.  Both arrays belong
+ * to the caller.  Nothing is left marked failed: the caller decides whether to
+ * act on the inference by driving prte_rml_repair_routing_tree(). */
+PRTE_EXPORT prte_rml_ancestry_t prte_rml_reconcile_ancestry(pmix_data_array_t* report,
+                                                            pmix_data_array_t* inferred);
+/* Repair the routing tree around a set of departed ranks and notify the fault
+ * handlers.  `epoch` is the collective recovery epoch the HNP issued with the
+ * global notice being applied; it is carried through to the handlers on the
+ * status and is meaningful only when `global` is true - pass 0 on every local
+ * repair, which does not move the epoch. */
 PRTE_EXPORT void prte_rml_repair_routing_tree(pmix_data_array_t* failed_ranks,
-                                              bool global);
+                                              bool global, uint32_t epoch);
 PRTE_EXPORT void prte_rml_revive_routing_tree(pmix_rank_t rank);
 PRTE_EXPORT void prte_rml_fault_handler(const prte_rml_recovery_status_t* s);
 PRTE_EXPORT int prte_rml_get_num_contributors(pmix_rank_t *dmns, size_t ndmns);

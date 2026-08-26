@@ -67,8 +67,6 @@ typedef struct {
     prte_ranking_policy_t ranking;
     // default ppr setting
     char *ppr;
-    /* default device for dist mapping */
-    char *device;
     /* whether or not child jobs should inherit mapping/ranking/binding directives from their parent
      * by default */
     bool inherit;
@@ -88,7 +86,28 @@ typedef struct {
     /* whether the topology reports any core objects at all; when false, a
      * user request to map or bind to "core" must fall back to hwthreads */
     bool have_cores;
+    /* nodes this mapping operation re-sized, and what they said before.
+     * Only an unmanaged allocation can be re-sized, and only for the job
+     * being mapped - a "-host node:N" states how many slots that job may
+     * take on the node, not a change to the allocation - so the original
+     * counts go back when the map is done. Emptied by
+     * prte_rmaps_base_restore_resized() at the end of every map. */
+    pmix_list_t resized_nodes;
 } prte_rmaps_base_t;
+
+/* one entry of prte_rmaps_base.resized_nodes: the node is borrowed, since
+ * the pool owns it and outlives any mapping */
+typedef struct {
+    pmix_list_item_t super;
+    prte_node_t *node;
+    int32_t slots;
+    /* whether the node carried PRTE_NODE_FLAG_SLOTS_GIVEN before we re-sized
+     * it. Growing a node to satisfy a "-host node:N" sets that flag, and it
+     * decides whether a later job may oversubscribe the node - so it has to
+     * go back with the count. */
+    bool slots_given;
+} prte_rmaps_base_resize_t;
+PRTE_EXPORT PMIX_CLASS_DECLARATION(prte_rmaps_base_resize_t);
 
 /**
  * Global instance of rmaps-wide framework data
@@ -115,12 +134,28 @@ PRTE_EXPORT void prte_rmaps_base_map_job(int sd, short args, void *cbdata);
 PRTE_EXPORT char *prte_rmaps_base_print_mapping(prte_mapping_policy_t mapping);
 PRTE_EXPORT char *prte_rmaps_base_print_ranking(prte_ranking_policy_t ranking);
 
+/* Record that this mapping re-sized a node, so the count it had before can be
+ * put back when the map completes. Recording the same node twice keeps the
+ * first (original) value. Call this BEFORE changing the node. */
+PRTE_EXPORT void prte_rmaps_base_record_resize(prte_node_t *node, int32_t slots);
+
+/* Put every re-sized node back the way we found it. Called on both outcomes
+ * of a map: a job that failed to map has no more claim on the extra slots
+ * than one that succeeded. */
+PRTE_EXPORT void prte_rmaps_base_restore_resized(void);
+
 PRTE_EXPORT int prte_rmaps_base_filter_nodes(prte_app_context_t *app, pmix_list_t *nodes,
                                              bool remove);
 
 PRTE_EXPORT int prte_rmaps_base_set_default_mapping(prte_job_t *jdata,
                                                     prte_rmaps_options_t *options);
 PRTE_EXPORT int prte_rmaps_base_set_mapping_policy(prte_job_t *jdata, char *spec);
+
+/* Resolve an interleave level name to its hwloc object type.  Returns
+ * false for a name that is not an accepted level - which includes "node",
+ * deliberately: SPAN owns the cross-node dimension. */
+PRTE_EXPORT bool prte_rmaps_base_interleave_level(const char *name,
+                                                 hwloc_obj_type_t *type);
 PRTE_EXPORT int prte_rmaps_base_set_app_mapping_policy(prte_app_context_t *app,
                                                         char *spec);
 PRTE_EXPORT int prte_rmaps_base_set_app_ranking_policy(prte_app_context_t *app,
@@ -162,6 +197,36 @@ PRTE_EXPORT int prte_rmaps_base_check_oversubscribed(prte_job_t *jdata,
 PRTE_EXPORT void prte_rmaps_base_get_cpuset(prte_job_t *jdata,
                                             prte_node_t *node,
                                             prte_rmaps_options_t *options);
+
+/* Enumerating the devices a node offers - see rmaps_base_devices.c.
+ *
+ * "begin" builds the per-node picture and hands back an opaque context;
+ * "count" is how many processes that node can take, "locale" the object the
+ * j-th of them is placed against, "record" notes on a proc which devices it
+ * was given, and "end" releases the context.  A caller that places more than
+ * one process per device calls "locale" repeatedly with the same index.
+ *
+ * "begin" also performs the two checks that must happen before any process
+ * is placed on the node: that the requested binding is not coarser than the
+ * devices are local to, and whether every device shares one locality (which
+ * is a warning, not an error). */
+PRTE_EXPORT int prte_rmaps_base_devices_begin(prte_node_t *node,
+                                              prte_rmaps_options_t *opts,
+                                              void **ctx);
+PRTE_EXPORT unsigned prte_rmaps_base_devices_count(prte_node_t *node,
+                                                   prte_rmaps_options_t *opts,
+                                                   void *ctx);
+PRTE_EXPORT hwloc_obj_t prte_rmaps_base_devices_locale(prte_node_t *node,
+                                                       prte_rmaps_options_t *opts,
+                                                       void *ctx, unsigned j);
+PRTE_EXPORT void prte_rmaps_base_devices_record(prte_proc_t *proc,
+                                                prte_rmaps_options_t *opts,
+                                                void *ctx, unsigned j);
+PRTE_EXPORT void prte_rmaps_base_devices_end(void *ctx);
+/* How many processes the whole node list can take, for the "are there
+ * enough?" check a mapper makes before placing any of them. */
+PRTE_EXPORT size_t prte_rmaps_base_devices_total(pmix_list_t *node_list,
+                                                 prte_rmaps_options_t *opts);
 
 PRTE_EXPORT int prte_rmaps_base_check_support(prte_job_t *jdata,
                                               prte_node_t *node,

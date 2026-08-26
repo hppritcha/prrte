@@ -8,7 +8,7 @@
  * Copyright (c) 2014-2020 Intel, Inc.  All rights reserved.
  * Copyright (c) 2014-2017 Research Organization for Information Science
  *                         and Technology (RIST). All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * Copyright (c) 2026      Sandia National Laboratories  All rights reserved.
  * $COPYRIGHT$
  *
@@ -101,8 +101,6 @@ int prte_grpcomm_init(void)
                   PRTE_RML_PERSISTENT, prte_grpcomm_xcast_recv, NULL);
     PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_XCAST_ACK,
                   PRTE_RML_PERSISTENT, prte_grpcomm_xcast_ack, NULL);
-    /* A bulk broadcast's exchange partners are not routing-tree neighbours, so
-     * the RML hands their losses here instead of repairing the tree. */
 
     /* fence receives */
     PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_FENCE,
@@ -110,8 +108,6 @@ int prte_grpcomm_init(void)
     /* setup recv for barrier release */
     PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_FENCE_RELEASE,
                   PRTE_RML_PERSISTENT, prte_grpcomm_fence_release, NULL);
-    /* ...and for a fence's lateral allgather, which arrives from exchange
-     * partners rather than from a routing-tree child */
 
     /* group receives */
     PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_GROUP,
@@ -134,12 +130,27 @@ void prte_grpcomm_finalize(void)
 
     PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_XCAST);
     PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_XCAST_ACK);
-    prte_rml_lateral_set_lost_callback(NULL);
     PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_FENCE);
     PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_FENCE_RELEASE);
     PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_GROUP);
     PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_GROUP_RELEASE);
     return;
+}
+
+int prte_grpcomm_assign_context_id(size_t *ctxid)
+{
+    if (NULL == ctxid) {
+        return PRTE_ERR_BAD_PARAM;
+    }
+    /* The pool is this daemon's own counter, and nothing reconciles two of
+     * them - see the header. Refusing here is what keeps the "only the master
+     * assigns" rule in one place, rather than repeated at each caller. */
+    if (!PRTE_PROC_IS_MASTER) {
+        return PRTE_ERR_NOT_SUPPORTED;
+    }
+    *ctxid = (size_t) prte_grpcomm_globals.context_id;
+    --prte_grpcomm_globals.context_id;
+    return PRTE_SUCCESS;
 }
 
 bool prte_grpcomm_proc_departed(const pmix_proc_t *proc)
@@ -208,6 +219,21 @@ bool prte_grpcomm_procs_lost(const pmix_proc_t *procs, size_t nprocs)
     return false;
 }
 
+/* The master's issued-epoch counter: the number it has handed out, which is
+ * not the same as the number it has applied.  See prte_grpcomm_issue_epoch()
+ * in grpcomm.h for why the two are separate. */
+static uint32_t issued_epoch = 0;
+
+uint32_t prte_grpcomm_current_epoch(void)
+{
+    return prte_grpcomm_globals.recovery_epoch;
+}
+
+uint32_t prte_grpcomm_issue_epoch(void)
+{
+    return ++issued_epoch;
+}
+
 void prte_grpcomm_advance_epoch(uint32_t to)
 {
     if (to <= prte_grpcomm_globals.recovery_epoch) {
@@ -238,7 +264,15 @@ void prte_grpcomm_fault_handler(const prte_rml_recovery_status_t* status)
      * global scope is what provides that - one broadcast, same order
      * everywhere, after the routing tree has been repaired. */
     if (PRTE_RML_FAULT_SCOPE_GLOBAL == status->scope) {
-        prte_grpcomm_advance_epoch(
-            prte_grpcomm_globals.recovery_epoch + 1);
+        /* The epoch is the master's to decide and rides on the notice as an
+         * absolute value, rather than each daemon counting the notices it has
+         * seen.  Counting locally makes the number a function of what a daemon
+         * received: one missed broadcast leaves it a step behind for the rest
+         * of the DVM's life, with every contribution it offers dropped as
+         * stale, and a daemon launched into a DVM that has already recovered
+         * has necessarily missed all of them.  Taking the value from the
+         * notice makes the number reconstructable from any message that
+         * carries one, which is what lets a joining daemon be told it. */
+        prte_grpcomm_advance_epoch(status->epoch);
     }
 }

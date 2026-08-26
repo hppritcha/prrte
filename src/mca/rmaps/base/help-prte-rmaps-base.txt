@@ -498,3 +498,135 @@ requirements:
   cpus/proc:    %d
 
 Please adjust the request and try again.
+#
+[rmaps:bind-above-device]
+A binding was requested that is coarser than the devices the job was
+mapped against:
+
+  Binding:  %s
+  Device:   %s
+  Node:     %s
+
+Mapping by a device means placing each process near that device, and an
+object that contains the device's locality - and more besides - is not
+near it. Binding there would hand the process cpus the device is not
+local to, which is the thing mapping by device is meant to avoid.
+
+Please either bind to an object at or below the device's locality (numa,
+l3cache, core, hwthread are the usual choices), or map by something other
+than a device.
+#
+[rmaps:device-not-nameable]
+Mapping by a device was requested, but the devices on this node carry no
+identity that can be given to the vendor's runtime:
+
+  Device class: %s
+  Node:         %s
+  Device:       %s
+
+A GPU can only be named to the library that will compute on it by the
+vendor's own identifier - NVIDIA's GPU-<uuid>, AMD's equivalent, and so
+on. hwloc records that identifier only when it is built with the vendor's
+backend (NVML for NVIDIA, RSMI for AMD, Level Zero for Intel). Built
+without them, hwloc still reports the GPUs and PRRTE can still place
+processes next to them, but neither can tell a process which one it got
+in terms the process can use.
+
+PRRTE refuses the request rather than mapping and saying nothing, because
+the two are indistinguishable while the job runs: the placement looks
+correct, and the only symptom is that every process on the node uses the
+same device.
+
+To use this option, rebuild hwloc with the vendor backend enabled and
+rebuild PRRTE against it - it is the hwloc PRRTE itself was built with
+that matters, since each daemon discovers its own node. Otherwise, map by
+a cpu object (numa or package are usually closest in effect) and let the
+application select its device.
+#
+[rmaps:degenerate-device-locality]
+All of the requested devices on a node are equally close to every cpu on
+it, so binding cannot express "near this device":
+
+  Device:   %s
+  Node:     %s
+  Found:    %d devices sharing one locality
+
+The job will run, and each process is still assigned its own device - on
+this node that assignment is the whole of what mapping by device buys
+you, and it is reported to each process. But the binding will be no more
+specific than it would have been without the directive.
+
+This is a property of the machine, not of the request: it happens when
+every device hangs off one PCI complex rather than off individual NUMA
+domains or packages.
+#
+[rmaps:bad-interleave-level]
+The "interleave" qualifier was given a level that is not recognized:
+
+  Level: %s
+
+Accepted levels are "package", "numa", "l3cache", "l2cache" and
+"l1cache". The level defaults to "package" when none is given.
+
+Note that "node" is deliberately not accepted. Interleaving across nodes
+is what the "SPAN" qualifier already expresses; "interleave" reorders the
+devices within each node.
+#
+[rmaps:interleave-needs-device]
+The "interleave" qualifier was given with a mapping policy it cannot
+apply to:
+
+  Mapping policy: %s
+
+"interleave" reorders the list of devices a job is mapped against, so it
+is meaningful only in combination with "--map-by device=<class|name>".
+#
+[rmaps:too-few-devices]
+More processes were requested than there are devices to map them
+against:
+
+  Processes requested: %d
+  Device:              %s
+  Processes placeable: %d
+
+("Processes placeable" counts assignments, not devices: with the "ndev"
+qualifier each process takes several devices, so the number of processes
+that fit is smaller than the number of devices present.)
+
+A device is assigned to a process rather than subdivided between
+processes, so by default each device takes one process and a job asking
+for more than there are devices cannot be mapped.
+
+If sharing the devices is what you intended, say so with the "shared"
+qualifier:
+
+  --map-by device=<class>:shared
+
+Otherwise reduce the number of processes, or map by something other than
+a device.
+
+Note this is a separate question from the "overload-allowed" qualifier
+on "--bind-to", which concerns running more processes than there are
+CPUs. Sharing a device and overloading a CPU are different resources and
+different decisions.
+#
+[rmaps:shared-needs-device]
+The "shared" qualifier was given with a mapping policy it cannot apply
+to:
+
+  Mapping policy: %s
+
+"shared" says that several processes may be assigned the same device, so
+it is meaningful only in combination with
+"--map-by device=<class|name>".
+
+If you meant to run more processes than there are CPUs, that is the
+"overload-allowed" qualifier on "--bind-to" instead.
+#
+[rmaps:ndev-needs-device]
+The "ndev" qualifier was given with a mapping policy it cannot apply to:
+
+  Mapping policy: %s
+
+"ndev" says how many devices each process is to be assigned, so it is
+meaningful only in combination with "--map-by device=<class|name>".

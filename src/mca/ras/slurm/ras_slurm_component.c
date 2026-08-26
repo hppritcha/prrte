@@ -52,7 +52,7 @@ static int prte_mca_ras_slurm_component_query(pmix_mca_base_module_t **module, i
 
 prte_mca_ras_slurm_component_t prte_mca_ras_slurm_component = {
     .super = {
-        PRTE_RAS_BASE_VERSION_2_0_0,
+        PRTE_MCA_BASE_VERSION(ras),
 
         /* Component name and version */
         .pmix_mca_component_name = "slurm",
@@ -124,7 +124,7 @@ static int ras_slurm_register(void)
 
     prte_mca_ras_slurm_component.propagate_time = true;
     (void) pmix_mca_base_component_var_register(component, "propagate_time",
-                                                "Propagate original time limit when requesting additional resources",
+                                                "Propagate original time limit when requesting additional resources, and trim the resulting job to the end of the original allocation",
                                                 PMIX_MCA_BASE_VAR_TYPE_BOOL,
                                                 &prte_mca_ras_slurm_component.propagate_time);
 

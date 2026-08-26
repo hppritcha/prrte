@@ -159,18 +159,19 @@ static int pack_epoch_frame(pmix_data_buffer_t *framed, pmix_data_buffer_t *body
 static void abort_fence_op(prte_grpcomm_fence_t *coll, pmix_status_t st)
 {
     pmix_data_buffer_t *reply;
-    pmix_status_t rc;
+    pmix_status_t prc;
+    int rc;
 
     PMIX_DATA_BUFFER_CREATE(reply);
     rc = fence_sig_pack(reply, coll->sig);
-    if (PMIX_SUCCESS != rc) {
+    if (PRTE_SUCCESS != rc) {
         PRTE_ERROR_LOG(rc);
         PMIX_DATA_BUFFER_RELEASE(reply);
         return;
     }
-    rc = PMIx_Data_pack(NULL, reply, &st, 1, PMIX_INT32);
-    if (PMIX_SUCCESS != rc) {
-        PRTE_ERROR_LOG(rc);
+    prc = PMIx_Data_pack(NULL, reply, &st, 1, PMIX_INT32);
+    if (PMIX_SUCCESS != prc) {
+        PMIX_ERROR_LOG(prc);
         PMIX_DATA_BUFFER_RELEASE(reply);
         return;
     }
@@ -312,7 +313,7 @@ void prte_grpcomm_fence_fault_handler(const prte_rml_recovery_status_t* status)
         return;
     }
 
-        if (!PRTE_PROC_IS_MASTER) {
+    if (!PRTE_PROC_IS_MASTER) {
         return;
     }
     PMIX_LIST_FOREACH_SAFE(coll, nxt, &prte_grpcomm_globals.fence_ops,
@@ -387,13 +388,6 @@ static void fence(int sd, short args, void *cbdata)
         st = prte_pmix_convert_rc(rc);
         goto done;
     }
-
-    /* Say how we intend to move this fence's contributions. Nobody downstream
-     * obeys it - every participant decides for itself, because there is no
-     * originator to decide for them - so this is not an instruction but an
-     * assertion, and the receiver's job is to notice if it disagrees. Packed
-     * unguarded: every daemon in a DVM runs the same build, so the bytes are
-     * never conditional even when the behaviour is. */
 
     // pack the info structs
     rc = PMIx_Data_pack(NULL, relay, &cd->ninfo, 1, PMIX_SIZE);
@@ -593,7 +587,10 @@ void prte_grpcomm_fence_recv(int status, pmix_proc_t *sender,
         }
     }
 
-    /* cycle thru the info to look for keys we support */
+    /* Merge the directives this contribution carried into the tracker. The
+     * array itself is freed unread below - what gets forwarded upward is
+     * rebuilt from the tracker in tree_gather_answer(), so writing the merged
+     * values back into these entries would say nothing to anybody. */
     for (n=0; n < ninfo; n++) {
         if (PMIX_CHECK_KEY(&info[n], PMIX_TIMEOUT)) {
             PMIX_VALUE_GET_NUMBER(rc, &info[n].value, timeout, int);
@@ -605,9 +602,6 @@ void prte_grpcomm_fence_recv(int status, pmix_proc_t *sender,
             if (coll->timeout < timeout) {
                 coll->timeout = timeout;
             }
-            /* update the info with the collected value */
-            info[n].value.type = PMIX_INT;
-            info[n].value.data.integer = coll->timeout;
 
         } else if (PMIX_CHECK_KEY(&info[n], PMIX_LOCAL_COLLECTIVE_STATUS)) {
             PMIX_VALUE_GET_NUMBER(rc, &info[n].value, st, pmix_status_t);
@@ -620,9 +614,6 @@ void prte_grpcomm_fence_recv(int status, pmix_proc_t *sender,
                 PMIX_SUCCESS == coll->status) {
                 coll->status = st;
             }
-            /* update the info with the collected value */
-            info[n].value.type = PMIX_STATUS;
-            info[n].value.data.status = coll->status;
         }
     }
 
@@ -741,8 +732,8 @@ static void tree_gather_answer(prte_grpcomm_fence_t *coll)
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
         PMIX_DATA_BUFFER_CREATE(reply);
         rc = fence_sig_pack(reply, coll->sig);
-        if (PMIX_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
+        if (PRTE_SUCCESS != rc) {
+            PRTE_ERROR_LOG(rc);
             PMIX_DATA_BUFFER_RELEASE(reply);
             return;
         }
@@ -771,8 +762,8 @@ static void tree_gather_answer(prte_grpcomm_fence_t *coll)
 
     PMIX_DATA_BUFFER_CREATE(reply);
     rc = fence_sig_pack(reply, coll->sig);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
+    if (PRTE_SUCCESS != rc) {
+        PRTE_ERROR_LOG(rc);
         PMIX_DATA_BUFFER_RELEASE(reply);
         return;
     }
@@ -862,8 +853,8 @@ void prte_grpcomm_fence_release(int status, pmix_proc_t *sender,
 
     /* unpack the signature */
     rc = fence_sig_unpack(buffer, &sig);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
+    if (PRTE_SUCCESS != rc) {
+        PRTE_ERROR_LOG(rc);
         return;
     }
 
@@ -893,6 +884,21 @@ void prte_grpcomm_fence_release(int status, pmix_proc_t *sender,
         ret = rc;
     }
 
+    /* Retire the tracker BEFORE delivering, not after. This fence is over the
+     * moment we have its result; everything below is delivery, and delivery is
+     * exactly when the next fence can start. The callback completes the local
+     * clients' PMIx_Fence, and a client is free to fence again over the same
+     * participants as soon as it returns - a signature is only its participant
+     * list, so that next fence looks up the very tracker we are about to free
+     * and would join a collective that has already been answered.
+     *
+     * Taking it off the list first costs nothing: we still hold the reference
+     * that keeps `coll` alive for the callback below, and nothing between here
+     * and the release needs to find it by lookup. The abort path above does
+     * the same thing for the same reason, by clearing cbfunc rather than by
+     * unlinking. */
+    pmix_list_remove_item(&prte_grpcomm_globals.fence_ops, &coll->super);
+
     /* execute the callback */
     if (NULL != coll->cbfunc) {
         coll->cbfunc(ret, bo.bytes, bo.size, coll->cbdata, relcb, bo.bytes);
@@ -904,7 +910,6 @@ void prte_grpcomm_fence_release(int status, pmix_proc_t *sender,
          * callback above was handed it. */
         PMIX_BYTE_OBJECT_DESTRUCT(&bo);
     }
-    pmix_list_remove_item(&prte_grpcomm_globals.fence_ops, &coll->super);
     PMIX_RELEASE(coll);
     PMIX_RELEASE(sig);
 }

@@ -247,7 +247,7 @@ int prte_pmix_server_register_nspace(prte_job_t *jdata,
     gid_t gid;
     pmix_list_t *cache;
     hwloc_obj_t machine;
-    pmix_proc_t pproc, *parentproc, *procptr;
+    pmix_proc_t pproc, *parentproc = NULL, *procptr;
     pmix_status_t ret;
     pmix_info_t devinfo[2];
     prte_pmix_reg_caddy_t *cd;
@@ -257,6 +257,7 @@ int prte_pmix_server_register_nspace(prte_job_t *jdata,
     prte_pmix_server_pset_t *pset;
     pmix_cpuset_t cpuset;
     uint32_t ui32, *ui32_ptr;
+    pmix_data_array_t *devarray;
     uint32_t nodesize;
     prte_job_t *parent = NULL;
     pmix_device_distance_t *distances;
@@ -545,6 +546,21 @@ int prte_pmix_server_register_nspace(prte_job_t *jdata,
     if (prte_get_attribute(&jdata->attributes, PRTE_JOB_XML_OUTPUT, (void**)&fptr, PMIX_BOOL)) {
         PMIX_INFO_LIST_ADD(ret, info, PMIX_IOF_XML_OUTPUT, &flag, PMIX_BOOL);
     }
+#ifdef PMIX_IOF_INHERIT
+    /* Whether this job is to inherit the output forwarding of the job that
+     * spawned it. PMIx asks this on the server the child's output ARRIVES
+     * at, which need not be the one that processed the spawn, so the answer
+     * has to travel with the job rather than with the spawn request - and
+     * this is what carries it there. The mapper resolved it, subject to the
+     * same inherit rule that governs mapping, ranking and binding.
+     *
+     * Sent only to say NO: absence means inherit, on both sides of the
+     * interface, so a job with no opinion adds nothing to the wire. */
+    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_NO_IOF_INHERIT, NULL, PMIX_BOOL)) {
+        bool noinherit = false;
+        PMIX_INFO_LIST_ADD(ret, info, PMIX_IOF_INHERIT, &noinherit, PMIX_BOOL);
+    }
+#endif
     tmp = NULL;
     if (prte_get_attribute(&jdata->attributes, PRTE_JOB_OUTPUT_TO_FILE, (void **) &tmp, PMIX_STRING)
         && NULL != tmp) {
@@ -649,12 +665,37 @@ int prte_pmix_server_register_nspace(prte_job_t *jdata,
         PMIX_INFO_LIST_RELEASE(iarray);
     }
 
-    /* get the parent job that spawned this one */
+    /* Get the parent job that spawned this one, if a *process* did.
+     *
+     * The proxy is not automatically that: a prterun-style launch records the
+     * daemon itself, and a plain "prun ./app" records prun's own tool procID.
+     * Neither is a parent process - a tool is not a member of a job and has no
+     * procs to be spawned by - so PMIX_PARENT_ID must not be published for
+     * either. An app reads that key to ask "was I spawned by another
+     * application process?", and publishing prun's id answers yes to every
+     * ordinary launch, which is how a program that branches on it (a spawned
+     * child doing one thing, its parent another) ends up running the wrong
+     * half of itself. The identical screen, and the reasoning, is in
+     * prte_pmix_server_connection_spawned() (pmix_server_connect.c).
+     *
+     * strncmp, not PMIX_CHECK_NSPACE: that macro treats an empty nspace on
+     * either side as a wildcard match, and this test must answer only for the
+     * namespace it was actually given.
+     */
     if (prte_get_attribute(&jdata->attributes, PRTE_JOB_LAUNCH_PROXY, (void **) &parentproc, PMIX_PROC)) {
-        parent = prte_get_job_data_object(parentproc->nspace);
-        if (NULL != parent && PMIX_CHECK_NSPACE(PRTE_PROC_MY_NAME->nspace, parent->nspace)) {
-            PMIX_PROC_RELEASE(parentproc);
+        if (0 != strncmp(PRTE_PROC_MY_NAME->nspace, parentproc->nspace, PMIX_MAX_NSLEN)) {
+            parent = prte_get_job_data_object(parentproc->nspace);
+        }
+        if (NULL != parent && PRTE_FLAG_TEST(parent, PRTE_JOB_FLAG_TOOL)) {
             parent = NULL;
+        }
+        if (NULL == parent) {
+            /* release it here: the tail of this function only releases it
+             * when a parent was found, so every rejecting path must clean up
+             * its own copy or the proc object leaks once per job launched
+             */
+            PMIX_PROC_RELEASE(parentproc);
+            parentproc = NULL;
         }
     }
 
@@ -733,10 +774,19 @@ int prte_pmix_server_register_nspace(prte_job_t *jdata,
                     }
                 }
                 hwloc_bitmap_free(cpuset.bitmap);
-            } else {
-                /* the proc is not bound */
+            } else if (PRTE_PROC_MY_NAME->rank == node->daemon->name.rank) {
+                /* the proc is not bound, and we are the daemon that will
+                 * fork it, so we know that rather than merely not having
+                 * been told */
                 PMIX_INFO_LIST_ADD(ret, pmap, PMIX_LOCALITY_STRING, NULL, PMIX_STRING);
             }
+            /* Nothing published for a remote proc with no cpuset: the launch
+             * message scatters the bindings, so what we hold for a proc some
+             * other daemon forks is nothing at all - and a NULL locality here
+             * is a positive claim that it is unbound, which the receiver
+             * cannot tell from silence.  A get for it falls through to
+             * dmodex_req, which declines it for the same reason and asks the
+             * daemon that does know. */
             if (PRTE_PROC_MY_NAME->rank == node->daemon->name.rank) {
                 /* create and pass a proc-level session directory */
                 rc = prte_session_dir(&pptr->name);
@@ -787,6 +837,23 @@ int prte_pmix_server_register_nspace(prte_job_t *jdata,
 
             if (map->num_nodes < prte_hostname_cutoff) {
                 PMIX_INFO_LIST_ADD(ret, pmap, PMIX_HOSTNAME, pptr->node->name, PMIX_STRING);
+            }
+
+            /* the device this proc was mapped against, when it was mapped by
+             * one. PRRTE cannot bind a process to a device the way it binds
+             * to cpus - no such mechanism exists - so the assignment is only
+             * worth making if the process can be told about it. The value is
+             * the device's UUID rather than an index: a runtime's own device
+             * numbering need not be the topology's (CUDA orders by speed
+             * before bus by default), so an ordinal would name a different
+             * device than the one we chose. The same UUID appears in the
+             * PMIX_DEVICE_DISTANCES this process can query, which is what
+             * lets it correlate the two. */
+            devarray = NULL;
+            if (prte_get_attribute(&pptr->attributes, PRTE_PROC_DEVICE_ID,
+                                   (void **) &devarray, PMIX_DATA_ARRAY)) {
+                PMIX_INFO_LIST_ADD(ret, pmap, PMIX_DEVICE_ID, devarray, PMIX_DATA_ARRAY);
+                PMIX_DATA_ARRAY_FREE(devarray);
             }
             PMIX_INFO_LIST_CONVERT(ret, pmap, &darray);
             PMIX_INFO_LIST_ADD(ret, info, PMIX_PROC_INFO_ARRAY, &darray, PMIX_DATA_ARRAY);

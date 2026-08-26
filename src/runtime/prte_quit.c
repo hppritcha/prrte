@@ -302,6 +302,11 @@ static char *print_aborted_job(prte_job_t *job,
                                        (unsigned long) proc->pid, nodename, prte_tool_basename,
                                        prte_tool_basename);
         return output;
+    } else if (PRTE_PROC_STATE_KILLED_BY_RELEASE == proc->state) {
+        output = pmix_show_help_string("help-prun.txt", "prun:proc-killed-by-release", true,
+                                       prte_tool_basename, (unsigned long) proc->name.rank,
+                                       nodename, prte_tool_basename);
+        return output;
     } else if (PRTE_PROC_STATE_COMM_FAILED == proc->state) {
         output = pmix_show_help_string("help-prun.txt", "prun:proc-comm-failed", true,
                                        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
@@ -367,6 +372,8 @@ static char *dump_job(prte_job_t *job)
             ++num_killed;
         } else if (PRTE_PROC_STATE_SENSOR_BOUND_EXCEEDED == pptr->state) {
             ++num_killed;
+        } else if (PRTE_PROC_STATE_KILLED_BY_RELEASE == pptr->state) {
+            ++num_killed;
         }
     }
     /* see if there is a guilty party */
@@ -392,14 +399,22 @@ char *prte_dump_aborted_procs(prte_job_t *jdata)
     }
     PRTE_FLAG_SET(jdata, PRTE_JOB_FLAG_ERR_REPORTED);
 
-    /* if this job is not a launcher itself, then get the launcher for this job */
+    /* The launcher is only wanted so we can search its children for the job
+     * that failed; if it is gone, fall back to the job we were handed. Its
+     * absence is routine - a spawned job outlives its parent by default, and
+     * the parent's job object is released as soon as the parent completes. */
     if (PMIX_NSPACE_INVALID(jdata->launcher)) {
         launcher = jdata;
     } else {
         launcher = prte_get_job_data_object(jdata->launcher);
         if (NULL == launcher) {
-            output = strdup("LAUNCHER JOB OBJECT NOT FOUND");
-            return output;
+            PMIX_OUTPUT_VERBOSE((2, prte_state_base_framework.framework_output,
+                                 "%s prte_dump_aborted_procs: launcher %s of job %s is gone - "
+                                 "reporting on that job directly",
+                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                                 PRTE_JOBID_PRINT(jdata->launcher),
+                                 PRTE_JOBID_PRINT(jdata->nspace)));
+            launcher = jdata;
         }
     }
 

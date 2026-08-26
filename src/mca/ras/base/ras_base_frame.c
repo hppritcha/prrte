@@ -51,6 +51,7 @@
  */
 prte_ras_base_t prte_ras_base = {
     .selected_modules = PMIX_LIST_STATIC_INIT,
+    .scheduler_owned = false,
     .deferred_releases = PMIX_LIST_STATIC_INIT,
     .total_slots_alloc = 0,
     .multiplier = 0,
@@ -114,7 +115,7 @@ static int prte_ras_base_open(pmix_mca_base_open_flag_t flags)
     return pmix_mca_base_framework_components_open(&prte_ras_base_framework, flags);
 }
 
-PMIX_MCA_BASE_FRAMEWORK_DECLARE(prte, ras, "PRTE Resource Allocation Subsystem", ras_register,
+PRTE_MCA_BASE_FRAMEWORK_DECLARE(ras, "PRTE Resource Allocation Subsystem", ras_register,
                                 prte_ras_base_open, prte_ras_base_close,
                                 prte_ras_base_static_components,
                                 PMIX_MCA_BASE_FRAMEWORK_FLAG_DEFAULT);

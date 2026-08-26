@@ -70,12 +70,31 @@ static void inherit_env_directives(prte_job_t *jdata,
  * the length of what the user actually wrote. */
 static bool ppr_object(const char *obj,
                        hwloc_obj_type_t *maptype,
-                       prte_binding_policy_t *mapdepth)
+                       prte_binding_policy_t *mapdepth,
+                       char **device)
 {
     size_t len = strlen(obj);
 
     if (0 == len) {
         return false;
+    }
+    /* "device=<class>" names the devices rather than an hwloc level, so the
+     * pattern reads "N procs per device of this class".  It is spelled the
+     * same way as the --map-by directive deliberately: it is the same
+     * resource, asked about a different way round. */
+    if (0 == strncasecmp(obj, "device=", 7)) {
+        if ('\0' == obj[7]) {
+            return false;
+        }
+        if (NULL != device) {
+            if (NULL != *device) {
+                free(*device);
+            }
+            *device = strdup(&obj[7]);
+        }
+        *maptype = HWLOC_OBJ_OS_DEVICE;
+        *mapdepth = PRTE_BIND_TO_NONE;
+        return true;
     }
     if (0 == strncasecmp(obj, "node", len)) {
         *maptype = HWLOC_OBJ_MACHINE;
@@ -238,9 +257,9 @@ int prte_rmaps_base_resolve_app_options(prte_job_t *jdata,
         switch (opts->map) {
             case PRTE_MAPPING_BYNODE:
             case PRTE_MAPPING_BYSLOT:
-            case PRTE_MAPPING_BYDIST:
             case PRTE_MAPPING_PELIST:
             case PRTE_MAPPING_COLOCATE:
+            case PRTE_MAPPING_BYDEVICE:
                 opts->maptype = HWLOC_OBJ_MACHINE;
                 opts->mapdepth = PRTE_BIND_TO_NONE;
                 break;
@@ -293,7 +312,7 @@ int prte_rmaps_base_resolve_app_options(prte_job_t *jdata,
             NULL != str) {
             char **pk = PMIx_Argv_split(str, ':');
             if (2 != PMIx_Argv_count(pk) ||
-                !ppr_object(pk[1], &opts->maptype, &opts->mapdepth)) {
+                !ppr_object(pk[1], &opts->maptype, &opts->mapdepth, &opts->map_device)) {
                 prte_show_help("help-prte-rmaps-ppr.txt", "invalid-ppr", true, str);
                 PMIx_Argv_free(pk);
                 free(str);
@@ -330,16 +349,35 @@ int prte_rmaps_base_resolve_app_options(prte_job_t *jdata,
 
     /* 6. PRTE_APP_MAP_FILE — read directly by seq/rank_file components via app->attributes */
 
-    /* 7. PRTE_APP_DIST_DEVICE → opts->dist_device */
+    /* 7. PRTE_APP_MAP_DEVICE → opts->map_device */
     str = NULL;
-    if (prte_get_attribute(&app->attributes, PRTE_APP_DIST_DEVICE, (void **)&str, PMIX_STRING)) {
-        if (NULL != opts->dist_device) {
-            free(opts->dist_device);
+    if (prte_get_attribute(&app->attributes, PRTE_APP_MAP_DEVICE, (void **) &str, PMIX_STRING)) {
+        if (NULL != opts->map_device) {
+            free(opts->map_device);
         }
-        opts->dist_device = str;
+        opts->map_device = str;
     }
 
-    /* 8. PRTE_APP_BINDING_LIMIT → opts->limit */
+    /* 8. PRTE_APP_MAP_INTERLEAVE → opts->map_interleave */
+    str = NULL;
+    if (prte_get_attribute(&app->attributes, PRTE_APP_MAP_INTERLEAVE, (void **) &str, PMIX_STRING)) {
+        if (NULL != opts->map_interleave) {
+            free(opts->map_interleave);
+        }
+        opts->map_interleave = str;
+    }
+
+    /* 9. PRTE_APP_MAP_SHARED → opts->map_shared */
+    opts->map_shared = prte_get_attribute(&app->attributes, PRTE_APP_MAP_SHARED,
+                                          NULL, PMIX_BOOL);
+
+    /* 10. PRTE_APP_MAP_NDEV → opts->map_ndev */
+    u16 = 0;
+    if (prte_get_attribute(&app->attributes, PRTE_APP_MAP_NDEV, (void **) &u16ptr, PMIX_UINT16)) {
+        opts->map_ndev = u16;
+    }
+
+    /* 11. PRTE_APP_BINDING_LIMIT → opts->limit */
     if (prte_get_attribute(&app->attributes, PRTE_APP_BINDING_LIMIT, (void **)&u16ptr, PMIX_UINT16)) {
         opts->limit = u16;
     }
@@ -412,9 +450,13 @@ static void free_strings(prte_rmaps_options_t *opts)
         free(opts->cpuset);
         opts->cpuset = NULL;
     }
-    if (NULL != opts->dist_device) {
-        free(opts->dist_device);
-        opts->dist_device = NULL;
+    if (NULL != opts->map_device) {
+        free(opts->map_device);
+        opts->map_device = NULL;
+    }
+    if (NULL != opts->map_interleave) {
+        free(opts->map_interleave);
+        opts->map_interleave = NULL;
     }
 }
 
@@ -553,6 +595,8 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
     bool bind_inherited = false;
     prte_rmaps_base_selected_module_t *mod;
     prte_job_t *parent = NULL;
+    prte_job_t *iof_parent = NULL;
+    bool iof_declined = false;
     prte_app_context_t *app;
     bool inherit = false;
     pmix_proc_t *nptr = NULL, *target_proc;
@@ -755,6 +799,22 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
             /* we do allow inheritance of the defaults */
             inherit = true;
         } else if (NULL != (parent = prte_get_job_data_object(nptr->nspace))) {
+            /* Output forwarding asks the same question with a DIFFERENT
+             * default, so it cannot key off the `inherit` the arms below
+             * resolve. prte_rmaps_base.inherit is false unless the user
+             * says otherwise - a spawned job does not pick up mapping,
+             * ranking and binding unless asked - whereas output
+             * forwarding inherits unless it is REFUSED, on both sides of
+             * the PMIx interface. Keying off the resolved value silenced
+             * every spawned job.
+             *
+             * So capture the explicit refusal, and the parent, here:
+             * two of the arms below null the parent out. */
+            iof_parent = parent;
+            iof_declined = prte_get_attribute(&jdata->attributes, PRTE_JOB_NOINHERIT,
+                                              NULL, PMIX_BOOL) ||
+                           prte_get_attribute(&parent->attributes, PRTE_JOB_NOINHERIT,
+                                              NULL, PMIX_BOOL);
             if (PRTE_FLAG_TEST(parent, PRTE_JOB_FLAG_TOOL)) {
                 // we don't inherit anything from tools as they were not
                 // mapped by us
@@ -779,6 +839,34 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
                                 "mca:rmaps: dynamic job %s %s inherit launch directives - parent %s",
                                 PRTE_JOBID_PRINT(jdata->nspace), inherit ? "will" : "will not",
                                 (NULL == parent) ? "N/A" : PRTE_JOBID_PRINT((parent->nspace)));
+
+            /* Who receives this job's output. A spawned job is treated
+             * the way its parent is being treated, so the daemons
+             * interested in the parent's output are interested in this
+             * one's - unless inheritance was explicitly refused.
+             *
+             * This is the routing half of that behavior; PMIx supplies
+             * the matching half, deciding that a subscription covering
+             * the parent job also covers its children. Both are needed:
+             * this puts the bytes in front of the right PMIx server, and
+             * that gets them from there to the tool. */
+            if (iof_declined) {
+                /* PMIx asks this again on the server the child's output
+                 * ARRIVES at, which need not be this one, and it cannot
+                 * reach the answer itself - so record it where the job's
+                 * PMIx information is built and can carry it there. Set
+                 * only to say NO: absence of the attribute, like absence
+                 * of PMIX_IOF_INHERIT, means the job inherits. */
+                prte_set_attribute(&jdata->attributes, PRTE_JOB_NO_IOF_INHERIT,
+                                   PRTE_ATTR_GLOBAL, NULL, PMIX_BOOL);
+            } else if (NULL != iof_parent) {
+                rc = pmix_bitmap_copy(&jdata->iof_daemons, &iof_parent->iof_daemons);
+                if (PMIX_SUCCESS != rc) {
+                    /* not fatal to the launch - the job simply starts with
+                     * no inherited watchers, which is what it had before */
+                    PMIX_ERROR_LOG(rc);
+                }
+            }
         } else {
             inherit = true;
         }
@@ -1020,6 +1108,15 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
 
     /* set some convenience params */
     prte_get_attribute(&jdata->attributes, PRTE_JOB_CPUSET, (void**)&options.cpuset, PMIX_STRING);
+    prte_get_attribute(&jdata->attributes, PRTE_JOB_MAP_DEVICE, (void**)&options.map_device, PMIX_STRING);
+    prte_get_attribute(&jdata->attributes, PRTE_JOB_MAP_INTERLEAVE, (void**)&options.map_interleave, PMIX_STRING);
+    options.map_shared = prte_get_attribute(&jdata->attributes, PRTE_JOB_MAP_SHARED, NULL, PMIX_BOOL);
+    {
+        uint16_t nd = 0, *ndptr = &nd;
+        if (prte_get_attribute(&jdata->attributes, PRTE_JOB_MAP_NDEV, (void**)&ndptr, PMIX_UINT16)) {
+            options.map_ndev = nd;
+        }
+    }
     if (prte_get_attribute(&jdata->attributes, PRTE_JOB_PES_PER_PROC, (void **) &u16ptr, PMIX_UINT16)) {
         options.cpus_per_rank = u16;
     } else {
@@ -1047,7 +1144,7 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
         }
         /* compute the #procs per resource */
         options.pprn = strtoul(ck[0], NULL, 10);
-        if (!ppr_object(ck[1], &options.maptype, &options.mapdepth)) {
+        if (!ppr_object(ck[1], &options.maptype, &options.mapdepth, &options.map_device)) {
             /* unknown spec */
             prte_show_help("help-prte-rmaps-ppr.txt", "unrecognized-ppr-option", true,
                            ck[1], tmp);
@@ -1165,9 +1262,21 @@ ranking:
     switch (options.map) {
         case PRTE_MAPPING_BYNODE:
         case PRTE_MAPPING_BYSLOT:
-        case PRTE_MAPPING_BYDIST:
         case PRTE_MAPPING_PELIST:
         case PRTE_MAPPING_COLOCATE:
+            options.mapdepth = PRTE_BIND_TO_NONE;
+            options.maptype = HWLOC_OBJ_MACHINE;
+            break;
+        case PRTE_MAPPING_BYDEVICE:
+            /* A device's locality is not known until the node is - it is
+             * NUMA-sized on one machine and package-sized on another, and is
+             * frequently an hwloc Group, which has no position in the
+             * PRTE_BIND_TO_* ladder at all. So there is no value mapdepth
+             * could take that would make the fixed "cannot bind above the
+             * map" check below mean the right thing. Leave it at NONE so
+             * that check does not fire on a basis nobody knows yet; the
+             * device mapper applies the real ceiling per node, against the
+             * locality it actually found. */
             options.mapdepth = PRTE_BIND_TO_NONE;
             options.maptype = HWLOC_OBJ_MACHINE;
             break;
@@ -1513,12 +1622,16 @@ ranking:
              * the mappers compute their own per node */
             app_options.job_cpuset = NULL;
             app_options.target = NULL;
-            /* nor of the job-level strings: a pe-list mapper frees and
+            /* nor of the job-level string: a pe-list mapper frees and
              * rewrites "cpuset" as it places procs, so each app needs its
              * own copy rather than a second pointer to the job's */
             app_options.cpuset = (NULL == options.cpuset) ? NULL : strdup(options.cpuset);
-            app_options.dist_device = (NULL == options.dist_device) ? NULL
-                                                                   : strdup(options.dist_device);
+            app_options.map_device = (NULL == options.map_device) ? NULL
+                                                                  : strdup(options.map_device);
+            app_options.map_interleave = (NULL == options.map_interleave) ? NULL
+                                                                          : strdup(options.map_interleave);
+            app_options.map_shared = options.map_shared;
+            app_options.map_ndev = options.map_ndev;
             app_options.app_idx = n;
             /* where this app's ranks start: the mappers that number their
              * own procs need the cursor the base is threading, or every app
@@ -1643,6 +1756,10 @@ cleanup:
     }
     /* release the colocation target array if one was provided/created */
     PMIX_DATA_ARRAY_FREE(darray);
+    /* a node this map grew to satisfy a "-host node:N" goes back to the size
+     * the allocation says it is: the spec sized this job's claim on the node,
+     * not the node */
+    prte_rmaps_base_restore_resized();
     /* reset any node map flags we used so the next job will start clean */
     for (int i = 0; i < jdata->map->nodes->size; i++) {
         if (NULL != (node = (prte_node_t *) pmix_pointer_array_get_item(jdata->map->nodes, i))) {

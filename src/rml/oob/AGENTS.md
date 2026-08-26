@@ -64,23 +64,52 @@ relaying is just "send again from here."
 
 ## The wire header
 
-Every message carries a `prte_oob_tcp_hdr_t` (`oob_tcp_hdr.h`): `origin`, final
-`dst`, `tag`, a sequence number, payload length, the origin's boot `epoch`, and
-a message `type` (`IDENT`/`PROBE` for the handshake, `USER` for a normal
-message). It is exchanged **only** among daemons of the same DVM, which all run
-the same build, so it is **not** a stable ABI — you may change its layout, but
-every daemon must agree; there is no versioning.
+Every message carries a `prte_oob_tcp_hdr_t` (`oob_tcp_hdr.h`): the origin's
+boot `epoch`, the `origin` and final `dst` **ranks**, the `tag`, a sequence
+number, the payload length, and a message `type` (`IDENT`/`PROBE` for the
+handshake, `USER` for a normal message). It is exchanged **only** among daemons
+of the same DVM, which all run the same build, so it is **not** a stable ABI —
+you may change its layout, but every daemon must agree; there is no versioning.
 
-Two rules that are not obvious from the struct:
+Five rules that are not obvious from the struct:
 
+- **A data message carries no namespace at all.** Its wire length is exactly
+  `PRTE_OOB_TCP_HDR_FIXED` — 30 bytes — and the receiver rebuilds both procids
+  with *its own* nspace via `PRTE_OOB_TCP_HDR_PROC()`. Three things make that
+  safe rather than merely usually-true: only `ess/hnp` and the prted path open
+  an OOB endpoint (no tool and no application process has one), every send
+  entry point takes a **rank** which `send_buffer()` resolves in
+  `PRTE_PROC_MY_NAME->nspace`, and a relay only forwards traffic of its own
+  job. So a foreign namespace is unrepresentable, not just unused. This is
+  what the header costs now; it began as two whole `pmix_proc_t` at 552 bytes
+  and rides *every* RML message — for a cpuset slice with 101 bytes of
+  payload it was 85% of the message.
+- **The connect handshake does carry one, and that is where it is checked.**
+  `tcp_peer_recv_connect_ack` refuses a peer whose nspace is not ours (and
+  refuses one that gives none, which would otherwise fall back to ours and
+  defeat the check). Once per connection, instead of restated on every
+  message. Do not remove it to "simplify": it is the enforcement that lets
+  every other header omit the field.
+- **`nslen` describes the wire length by itself.** The handshake sets it, a
+  data header sets it to zero, and both are read the same way — fixed part
+  first, then `nslen` characters, then the terminator the receiver supplies
+  (`PRTE_OOB_TCP_HDR_END_NSPACE`). Anything that sends or reads a header uses
+  `PRTE_OOB_TCP_HDR_FIXED` and `PRTE_OOB_TCP_HDR_LEN()`, **never**
+  `sizeof(prte_oob_tcp_hdr_t)` — the struct is 288 bytes, because the nspace
+  array is the receiver's landing space.
+- **Reading a name out of a header takes two reads off the socket**, even
+  though the second is empty for a data message: `hdr_recvd` is not enough to
+  build a `pmix_proc_t`, `nspace_recvd` is the flag that says the names are
+  complete.
 - **Every multi-byte field is byte-order converted**, by
   `MCA_OOB_TCP_HDR_HTON`/`_NTOH`. Add a field, extend both macros — a field
   that is quietly not converted works perfectly until two daemons differ in
-  endianness.
-- **The whole struct goes on the wire, padding included.** The handshake builds
-  its header on the stack, so zero it before filling it in; leaving a field (or
-  the padding) undefined ships uninitialized bytes and trips every memory
-  checker.
+  endianness. `nslen` is a single byte and needs no conversion, which is why
+  the length macros may be used on a header in either order.
+- **The fixed part goes on the wire whole, padding included.** The handshake
+  builds its header on the stack, so zero it before filling it in; leaving a
+  field (or the padding) undefined ships uninitialized bytes and trips every
+  memory checker.
 
 ## Message-size bound
 
@@ -129,13 +158,19 @@ In a launcher-less (bootstrapped) DVM daemons boot independently, so:
 
 ## Which thread services a peer's socket
 
-By default, all of it runs on `prte_event_base` — one progress thread, exactly
-as it always did. `prte_oob_progress_threads` (`prte_oob_base.num_progress_threads`,
-default **0**) starts N worker progress threads and hands each peer one of them,
-round-robin, at construction (`peer->evbase`). The point is not extra bandwidth —
-one thread's `writev` copy rate is several times a 10-25 GbE link — it is
-**occupancy**: while the main thread is deflating an xcast, registering a
-namespace, or running the odls fork path, nothing services a socket at all.
+`peer_cons` asks the **process-wide worker pool**
+([`src/runtime/prte_worker_pool.h`](../../runtime/prte_worker_pool.h)) for a
+base at construction (`peer->evbase`); the pool holds
+`prte_num_worker_threads` bases (default **8**) on a ring and hands them out in
+rotation. The OOB does not own that pool — it is shared with the odls fork
+path, and it is built by `prte_init` and torn down by `prte_finalize`. Setting
+`prte_num_worker_threads` to 0 makes every assignment `prte_event_base`, which
+is exactly how the transport ran before any of this existed.
+
+The point is not extra bandwidth — one thread's `writev` copy rate is several
+times a 10-25 GbE link — it is **occupancy**: while the main thread is
+deflating an xcast, registering a namespace, or running the odls fork path,
+nothing services a socket at all.
 
 The split is deliberate and narrow:
 
@@ -182,11 +217,12 @@ Four rules keep that safe, and all four are load-bearing:
   false`. If you add a third place that queues onto a peer, it needs the same
   tail.
 
-With `num_progress_threads == 0`, `peer->evbase` **is** `prte_event_base`:
+With an empty pool, `peer->evbase` **is** `prte_event_base`:
 `PRTE_OOB_COMPLETE_SEND` completes inline instead of posting, the rebind is a
 delete/re-set onto the base the events were already on, and the mutex is
-uncontended. `prte_oob_base.ev_bases` still exists and still holds one entry, so
-every call site indexes it unconditionally — do not "optimize" that array away.
+uncontended. `prte_worker_pool_assign()` never returns NULL, precisely so
+`peer_cons` needs no special case — and a peer built before the pool is up, or
+after it is gone, still gets a usable base.
 
 The one piece of state outside this directory that a worker touches directly is
 the RML's incarnation table (`prte_rml_epoch_ok`, bootstrap only), which
@@ -209,6 +245,18 @@ a socket handler call has to be safe off the main thread or has to be shifted.
   default callback and a lost message for RELM. From inside the transport, use
   `PRTE_OOB_COMPLETE_SEND(peer, msg)` instead: it completes inline when the peer
   is on the main base and posts the completion there when it is not.
+- **Every path that gives up on a peer drains its queue**, through
+  `tcp_peer_fail_queued_sends()` — the one place that does it, so the rule above
+  cannot be honored in one arm and forgotten in the next. It is not only
+  `prte_oob_tcp_peer_close()`: `prte_oob_tcp_peer_try_connect()` gives up in
+  five places of its own (out of memory, `socket()` or an unrecoverable
+  `bind()` failing, no address succeeding, the IDENT handshake failing), and
+  all but one of those used to return without touching the queue. They are
+  reconnect paths as well as first-connect ones, so what is queued there can
+  be real work rather than a handshake. Collect the on-deck `peer->send_msg`
+  as well as `peer->send_queue` — it is not on the list and is the one most
+  easily missed — lift both under `peer->lock`, and complete them outside it,
+  since completion runs the originator's callback.
 - **The recv object owns its payload.** `prte_oob_tcp_recv_t`'s destructor
   frees `data`; the paths that hand the payload on (`PMIx_Data_load` for local
   delivery, the relay) null the pointer first. Add a third path and it has to
@@ -243,7 +291,12 @@ a socket handler call has to be safe off the main thread or has to be shifted.
 ## Testing
 
 `prte_oob_split_and_resolve` — the interface-selection parser — is covered by
-`test/unit/rml/test_rml`, which runs under `make check` with no DVM. Everything
+`test/unit/rml/test_rml`, which runs under `make check` with no DVM. So is the
+queued-send drain above (`test_queued_sends_complete_on_close`), driven through
+`prte_oob_tcp_peer_close()` because that is the one give-up path reachable
+without sockets; the arms in `prte_oob_tcp_peer_try_connect()` share the same
+drain but cannot be provoked from a unit test, since they need `socket()` or
+`bind()` to fail. Everything
 else in this directory needs sockets between real daemons and lives in the
 `test_rml` phase of `contrib/dockerswarm/run-tests.sh`: relaying through an
 intermediate hop (which needs `--prtemca rml_base_radix 2`, since a ten-node

@@ -106,7 +106,7 @@ Note the sequences deliberately **skip** some offsets (e.g. job error
 
 Every component fills in the same vtable, declared in `plm.h` as
 `prte_plm_base_module_t` (version macro
-`PRTE_PLM_BASE_VERSION_2_0_0`). **All entries are mandatory** in
+`PRTE_MCA_BASE_VERSION(plm)`). **All entries are mandatory** in
 principle, but in practice most components reuse the base implementations
 for everything except `spawn`, `init`, and `finalize`. The selected
 module is copied wholesale into the global `prte_plm`.
@@ -454,6 +454,30 @@ rather than reading `map->daemon_vpid_start`: a target whose session is gone
 would otherwise leave the campaign with no requester, and a successful grow
 would emit no phase-two completion event at all.
 
+An allocation the spawn itself asked for (`PMIX_SPAWN_ALLOC`) is served at
+this point too, and is the one thing that stops the launch path rather than
+continuing it: `prte_ras_base_spawn_alloc()` posts the request, the request
+holds the job, and `prte_plm_base_spawn_alloc_granted()`/`_failed()` pick the
+launch back up (or answer the requester) when it resolves. The job is
+deliberately **not** parked in `prte_cache` to wait — the cache is drained by
+whatever DVM-ready event comes next, which would launch it while its own
+allocation was still being obtained. It goes in only once a grow is known to
+be in flight, which is the same thing everything else in the cache is waiting
+for. The other half of that contract lives in `prte_plm_base_spawn_response`:
+a job that obtained an allocation and then failed to launch hands it back
+before its requester is told, and the answer follows the release.
+
+That scan resolves a requester through the *session* owning each target,
+which an **activation** (`--activate`, `PMIX_ALLOC_ACTIVATE`) has none of —
+it names nodes the allocation already held, which stay in the general pool.
+Such a requester is carried instead by
+`prte_plm_base_add_grow_requester()`, held in a short-lived pending list
+that the campaign adopts when it is recorded. Anything the pass does not
+hand to a campaign is answered by the wrapper around
+`setup_virtual_machine()` — success where the launch ran and simply had
+nothing to record, failure where it did not run at all — so a requester is
+never stranded, and never answered by some later grow's campaign.
+
 `map->num_new_daemons` is the key output: `== 0` means every node
 already has a daemon, so the component fast-forwards to
 `DAEMONS_REPORTED`. It also records elastic **grow campaigns** and the
@@ -468,10 +492,27 @@ daemon via `prte_grpcomm.xcast(PRTE_RML_TAG_DAEMON, …)`:
 
 - `prte_plm_base_prted_exit(cmd)` — `PRTE_DAEMON_EXIT_CMD`, or
   `PRTE_DAEMON_HALT_VM_CMD` when terminating abnormally / before wireup.
+  **It is one-shot**: the `prte_prteds_term_ordered` latch at the top makes
+  every later call a no-op, so a daemon that was not listening when the
+  broadcast went out never hears it by any other means. That is what
+  `prte_plm_base_prted_exit_late()` is for — see below.
 - `prte_plm_base_prted_terminate_job(nspace)` — wildcard-proc → kill.
 - `prte_plm_base_prted_kill_local_procs(procs)` —
   `PRTE_DAEMON_KILL_LOCAL_PROCS`.
 - `prte_plm_base_prted_signal_local_procs(job, signal)`.
+
+A daemon reporting in *after* that broadcast gets the order point to point,
+from `prte_plm_base_prted_exit_late()` (the command it re-sends is the one
+`prte_plm_base_prted_exit()` latched, so an abnormal teardown stays
+abnormal). Without it the DVM does not come down at all: the HNP holds no
+contact info for a daemon that has not reported, so the broadcast's send to
+it fails and `errmgr/dvm` swallows that failure — rightly, since a daemon
+that has not reported is not a dead one — and nothing remembers that it
+still owes an exit. It then reports, becomes a live routing child, and the
+HNP terminates only once its child count reaches zero. An elastic grow
+overlapping the end of the last job is the ordinary way in, and the symptom
+is a `prterun` that hangs forever plus an orphaned `prted` on the added
+node (issue #2707).
 
 ### jobid / HNP name (`plm_base_jobid.c`)
 
@@ -554,7 +595,7 @@ placed daemons) or wireup stalls.
   parsed and never applied. Both are gone. A dead knob is worse than no
   knob — it makes a user's correct diagnosis look wrong. `prte_plm_globals_t`
   is likewise down to the fields something actually reads.
-- **The version macro is `PRTE_PLM_BASE_VERSION_2_0_0`** (`plm` 2.0.0).
+- **The version macro is `PRTE_MCA_BASE_VERSION(plm)`** (`plm` 2.0.0).
 - Standard PRRTE rules still apply: `prte_config.h` first, braces on
   every block, `NULL ==`/constant-on-left comparisons, no new compiler
   warnings, `PRTE_ERROR_LOG` for unexpected errors.

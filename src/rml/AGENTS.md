@@ -50,7 +50,7 @@ TCP. If you find such comments, they are cruft — fix them.
 | File | Responsibility |
 |------|----------------|
 | `rml_fault_handler.c` | The RML's own reaction to a recomputed tree: sets process states and drives death/adoption notices. |
-| `relm/` | RELM — reliable messaging that survives daemon failures by re-driving messages over the repaired tree. Has its own small state machine (`relm/state_machine.c`, `relm/base/`). See [`relm/AGENTS.md`](relm/AGENTS.md). |
+| `relm/` | RELM — reliable messaging that survives daemon failures by re-driving messages over the repaired tree. Has its own small state machine (`relm/state_machine.c`, `relm/state_updates.c`, `relm/link_updates.c`). See [`relm/AGENTS.md`](relm/AGENTS.md). |
 
 The transport lives in [`oob/`](oob/AGENTS.md), which has its own editing map.
 
@@ -104,16 +104,19 @@ relm fault handlers.
 
 `PRTE_PROC_STATE_COMM_FAILED` is what makes the HNP act on a departure: mark the
 daemon not-alive, decrement `num_daemons`, print `node-died`, and fail the jobs
-that had procs on it. It is raised in **two** places, and both are needed:
+that had procs on it. It is raised from **two kinds of place**, and both are
+needed:
 
 - `prte_mca_oob_tcp_component_lost_connection` — the daemon that actually lost
   the socket. This is also what drives the HNP's countdown to
   `DAEMONS_TERMINATED` during a *normal* teardown (the errmgr's
   `prte_prteds_term_ordered` branch), so it cannot be removed.
-- `prte_rml_recv_failures_notice` — a daemon that only *heard* about the death,
-  for the ranks it had not already recorded.
+- `report_new_departures()` in `rml_fault_handler.c` — a daemon that only
+  *learned* of the death, for the ranks it had not already recorded. Three
+  paths call it: the failure notice (`prte_rml_recv_failures_notice`) and the
+  two lineage inferences, from a child's report and from an adoption notice.
 
-The second one is easy to think unnecessary, and its absence was a real hang.
+The second kind is easy to think unnecessary, and its absence was a real hang.
 At the default radix a ten-node DVM is **flat**, so the HNP is every daemon's
 parent and is always the one that loses the socket; the first path alone looks
 sufficient. Give the tree any depth and an interior daemon becomes the detector:
@@ -123,10 +126,141 @@ dead node's procs are never marked terminated, the job never completes, and its
 tool waits forever. `prun` against a radix-2 DVM hung indefinitely where the
 same DVM at radix 64 released instantly.
 
-Two properties keep the pair from double-reporting: the notice path reports only
-ranks not already in `failed_dmns` (so the detector's own rank, echoed back by
-the HNP's global broadcast, is skipped), and the errmgr independently ignores a
-comm failure for a daemon it has already torn out.
+Two properties keep these from double-reporting: a report names only ranks not
+already in `failed_dmns` (so the detector's own rank, echoed back by the HNP's
+global broadcast, is skipped), and the errmgr independently ignores a comm
+failure for a daemon it has already torn out.
+
+That dedup is also why the three learning paths have to stay behind one
+function. `failed_dmns` is the *only* record of what this daemon already knows,
+and `prte_rml_repair_routing_tree` sets it — so a path that repairs without
+reporting does not merely stay quiet, it makes every later report for that rank
+look like a duplicate and suppresses it permanently. The two inference paths
+were exactly that: they repaired the tree on a deduced death and told nobody, so
+whichever of them won the race against the real notice silently ate the
+`COMM_FAILED`. Hence the ordering rule in `report_new_departures` — report
+*before* the repair, which is safe because the state activation is
+thread-shifted and cannot outrun it.
+
+Do **not** be tempted to move the raise into `prte_rml_repair_routing_tree`
+itself, next to the fault-handler fan-out. Repairing the tree and reporting a
+departure are different questions and the code needs each without the other: a
+DVM shrink repairs for every target and must not report (the campaign tears them
+out itself), an ordered teardown reports without repairing at all (and that
+report is what terminates the daemons), and `errmgr/prted` repairs from inside
+its own error handler, where a report would re-enter it. `docs/todo.rst`,
+"Decided against", carries the full reasoning.
+
+### Both recovery notices carry a lineage, and both reconcile it the same way
+
+A repair emits two notices, and until recently only one of them said anything
+about the *shape* of the tree:
+
+| | tag | payload | sent when |
+|---|---|---|---|
+| parent → child | `DAEMON_ADOPTED` | the child's new ancestor list (`[my ancestors…, me]`) | our children changed, or we were promoted |
+| child → parent | `DAEMON_DIED` | the failed ranks **in the sender's own subtree**, plus (now) the sender's ancestor list | every repair, to the current lifeline |
+
+The HNP does not send that second one upward — it has nowhere to send it — but
+it reuses the same tag and the same packing routine to broadcast the confirmed
+set downward, which is why the first field on the wire is the `global` flag and
+why the ancestor list rides only the upward leg. A lineage means nothing to a
+daemon receiving a broadcast.
+
+The downward leg carries one more field the upward leg does not: the
+**collective recovery epoch** this failure moves the DVM to, packed straight
+after the `global` flag and delivered to the fault handlers on
+`prte_rml_recovery_status_t::epoch`. Only the HNP issues one
+(`prte_grpcomm_issue_epoch()`), because the point of the value is that every
+daemon adopts the *same* number rather than counting the notices it happened
+to receive — a daemon that missed one would otherwise be a step behind
+forever, which is precisely the state a daemon launched into an already
+recovered DVM is in. The RML carries it and does not read it; what it means is
+in [`src/grpcomm/AGENTS.md`](../grpcomm/AGENTS.md), under "The epoch".
+
+The upward notice's rank array cannot describe a re-home. It is filtered by
+`radix_subtree_contains(&cur_node, …)`, and the ancestor whose death moved the
+sender is by definition *not* in the sender's subtree — so the notice a
+re-homing daemon sends its new parent is, in the ordinary case, **empty**. A
+parent that had not yet detected that death learned nothing from it and went on
+routing the child's traffic through a dead ancestor until one of its own sends
+timed out. That gap is what the ancestor list closes: its last entry is the
+parent it was sent to, so stripping that entry leaves the sender's view of the
+*receiver's* lineage, directly comparable with the receiver's own.
+
+`prte_rml_reconcile_ancestry()` is the single implementation both directions
+use. It applies our own failure knowledge to the report (`update_ancestors`,
+which can only shorten a list), and then walks our list toward the report one
+hypothesised death at a time. Its verdict is one of four:
+
+- **`AGREED`** — nothing to do; the common case, and the only one a test can
+  force (see below).
+- **`INFERRED`** — the peer knows of ancestor deaths we do not, and the array
+  names them. The caller drives `prte_rml_repair_routing_tree()`.
+- **`STALE`** — reconciling would require declaring a **returned** rank dead;
+  see below.
+- **`INCONSISTENT`** — no set of deaths reconciles the two views.
+
+The two directions deliberately differ on that last one. An adoption notice is
+how a daemon learns *its own* lineage, so a report it cannot place means it no
+longer knows where it is: `FORCED_EXIT`. A failure notice is an accelerant —
+everything it can tell us also arrives by a path that does not depend on a
+peer's honesty (our own lost socket, or the HNP's arbitrated broadcast) — so an
+unplaceable report going *up* is logged and dropped. Both directions also
+require the report to name us before any of this runs.
+
+Three things here are load-bearing, and two of them were bugs:
+
+- **Do not pad the report out to our own length.** `update_ancestors` fills an
+  empty slot with "the previous ancestor's next inheritor", which is right for a
+  hole in the middle of a real list and nonsense for a slot invented past its
+  end. The reconciliation used to pad, and a report of `[0]` — all the HNP sends
+  when it adopts a grandchild after losing the daemon between — became `[0,2]` at
+  radix 2, rank 2 being the root's *other* child and no ancestor of the receiver
+  at any point in the DVM's life. That reconciled against nothing, and an
+  unplaceable adoption notice is a `FORCED_EXIT`. The trigger was not exotic: a
+  dead interior daemon whose parent noticed before its grandchild did. A
+  legitimately shorter report is what the tail loop handles.
+
+- **A rank that has RETURNED may not be inferred dead.** `revived_dmns` records
+  them (set by `prte_rml_revive_routing_tree`, cleared when a death is actually
+  recorded). A report is a snapshot of the sender's view when it *sent*, and a
+  revival travels as its own xcast: a notice that crossed with one carries a
+  lineage from before the return, and it reconciles perfectly — by burying a
+  daemon that is alive and talking to us. That is the `STALE` verdict, and it
+  abandons the whole reconciliation rather than skipping the one rank.
+
+- **Nothing may be left marked.** The walk sets bits in `failed_dmns` as it
+  hypothesises, because that is what makes `update_ancestors` step past a rank;
+  every one of them is cleared again before returning, since deciding whether any
+  of it is real is the *caller's* job.
+
+- **`record_inference` is what makes the walk terminate**, and both of its
+  remaining refusals matter. It will not infer a rank that is *already* failed —
+  nothing can be inferred about one, so seeing it means the walk is not
+  converging — which bounds the walk at one accepted inference per daemon. And
+  it will not infer **rank 0**: the root is every ancestor list's first entry
+  and has no inheritor to route around, which is why `update_ancestors` starts
+  at index 1 — so a hypothesised root death is never revisited and the loop
+  spins forever. The unit test for that one *hangs* rather than failing, which
+  is worth knowing before you go looking for it.
+
+`test/unit/rml/test_rml_routing.c::test_reconcile_ancestry` pins all of it,
+including both bugs above, by standing the two views up directly — each report
+is the ancestor list the peer's own `compute_routing_tree()` produces from the
+failures that peer knows about, so a change to the radix math moves both sides.
+
+**What the container harness cannot force.** The swarm case
+(`contrib/dockerswarm/run-tests.sh`, "a re-homed daemon reports the lineage
+that explains the re-home") kills two interior daemons at once, which is the
+shape that separates a daemon's new parent from the death that gave it one. It
+pins the wire path and the recovery — the lineage travels, every parent checks
+it, and the DVM tears down instead of a daemon deciding the tree is
+unreconcilable — but not the *inference*. The new parent discovers the death by
+trying to send to it, and in a container the dead daemon's host is still up, so
+that connect is refused immediately rather than hanging the way a vanished
+node's would; the parent wins its own race and finds nothing left to learn. The
+window this closes is a real cluster's, where a node that goes away sends no RST.
 
 ### The tree layout, precisely
 
@@ -267,6 +401,31 @@ connection path.
   (#2491). The DVM never reuses a daemon vpid, so a hole in `[0, num_daemons)`
   is permanent.
 
+- **What a recompute may and may not throw away.** `compute_routing_tree` is
+  the whole of a resize's effect on the tree, and the rule it follows is that
+  it re-derives everything it can and preserves only what it cannot. Ancestors,
+  lifeline, children and `cur_node` are rebuilt from the fault-free radix
+  positions (`build_tree_from_base`) rather than mutated, and `failed_dmns` is
+  rebuilt too — every path that sets a bit in it also records the rank in
+  `dead_dmns` or `absent_dmns` (`repair_routing_tree`; `reconcile_ancestry`'s
+  provisional marks are undone before it returns), so restoring those two
+  reproduces it exactly, at the new width.
+  `global_failed_dmns` is the one thing that is **not** derivable: nothing else
+  in the daemon records that a departure has already been broadcast, so it is
+  re-initialized to the new span and its marks are copied back across the wipe.
+  Both halves of that are load-bearing. The set exists so a re-homed daemon can
+  subtract it from `failed_dmns` and report to a new parent only what that
+  parent may not know (`send_failures_notice`); dropping the marks made every
+  parent change after a grow re-report every departure in the subtree. And the
+  subtraction is `pmix_bitmap_bitwise_xor_inplace`, which returns
+  `PMIX_ERR_BAD_PARAM` and modifies **nothing** when the two bitmaps hold
+  different numbers of words — so simply carrying the set forward unwidened,
+  the obvious alternative, would silently defeat the very subtraction it was
+  preserved for. `test_global_failures_survive_recompute` pins both.
+  The remaining `prte_rml_base` sets — `absent_dmns`, `revived_dmns`,
+  `lateral_links`, `peer_epochs` — are never touched by the recompute at all,
+  each for its own reason given where it is declared.
+
 - **A daemon we LAUNCH is told the departure set on its command line**, by
   `prte_plm_base_prted_append_basic_args` (`rml_base_dead_dmns`, a
   range-collapsed list such as `2,7:9` — colon-separated, because every
@@ -366,9 +525,12 @@ worth stating rather than re-deriving:
   *caddy* + `PRTE_PMIX_THREADSHIFT` (see `PRTE_OOB_SEND`,
   `prte_rml_recv_buffer_nb`). Never read or write shared RML state off that
   thread, and never block on it. The one exception is deliberate and bounded:
-  a peer's *socket* send/recv handlers can be put on a worker progress thread
-  (`prte_oob_progress_threads`, default 0 — off), so that the wire keeps moving
-  while the main thread computes. Everything those handlers hand upward —
+  a peer's *socket* send/recv handlers run on a worker progress thread drawn
+  from the process-wide pool (`prte_worker_pool_assign()`, sized by
+  `prte_num_worker_threads`, default 8 — set it to 0 to put them back on the
+  main thread), so that the wire keeps moving while the main thread computes.
+  That pool is shared with the odls fork path, so a thread carrying your
+  sockets may also be forking a child. Everything those handlers hand upward —
   message delivery, relaying, send completions, the connection state machine —
   still comes back to `prte_event_base`. See [`oob/AGENTS.md`](oob/AGENTS.md),
   *Which thread services a peer's socket*, before adding anything to those
@@ -382,7 +544,25 @@ worth stating rather than re-deriving:
   its layout, but every daemon must agree — there is no versioning. It *is*
   byte-order converted, though, so keep `MCA_OOB_TCP_HDR_HTON`/`_NTOH` covering
   every multi-byte field you add, and zero a header before filling it — the
-  whole struct goes on the wire, padding included.
+  fixed part goes on the wire whole, padding included. Note that the struct is
+  **not** the message: it ends in an nspace that only the connect handshake
+  sends, so a send or a read is sized by
+  `PRTE_OOB_TCP_HDR_FIXED`/`PRTE_OOB_TCP_HDR_LEN()` and never by `sizeof`
+  (288 bytes of struct, 30 on the wire for a data message). See
+  [`oob/AGENTS.md`](oob/AGENTS.md), *The wire header*.
+- **The RML cannot address another DVM, and is not meant to.** Every send
+  entry point takes a `pmix_rank_t`, and `send_buffer()` builds the
+  destination as that rank in `PRTE_PROC_MY_NAME->nspace`; `prte_oob_base_send_nb`
+  resolves the next hop the same way. So a `pmix_proc_t` naming a foreign
+  daemon loses its namespace here, silently, and the message goes to the local
+  daemon of that rank. The one feature that wanted to cross — a data server
+  hosted by another DVM (`prte_pmix_server_uri`) — reaches it over a PMIx
+  **tool** connection instead; see
+  [`../runtime/data_server/AGENTS.md`](../runtime/data_server/AGENTS.md). Do
+  not add a foreign-namespace send without dealing with the rest: the routing
+  tree, `prte_rml_is_node_up()` and the boot-epoch table are all indexed by
+  rank within *this* DVM, so a foreign rank collides with a local one at every
+  layer.
 - **One transport, one router.** Do not reintroduce component/module
   abstraction to "make it pluggable" unless there is a real second
   implementation; that abstraction is exactly what was removed.

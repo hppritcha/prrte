@@ -55,6 +55,7 @@
 #include "src/util/pmix_show_help.h"
 #include "src/util/prte_show_help.h"
 
+#include "src/prted/pmix/pmix_server_internal.h"
 #include "src/runtime/prte_globals.h"
 #include "src/runtime/prte_locks.h"
 #include "src/runtime/prte_quit.h"
@@ -107,10 +108,18 @@ static int finalize(void)
     return PRTE_SUCCESS;
 }
 
+/* Every path into here is a failure taking a job down - job_errors and the
+ * unrecoverable arms of proc_errors - which is exactly the event a connected
+ * assemblage is defined by: the host is to treat its members as one
+ * application, so a failure that costs this job its life costs every job
+ * connected to it too.  Doing it here rather than at each call site is what
+ * keeps the two from drifting apart. */
 static void _terminate_job(pmix_nspace_t jobid)
 {
     pmix_pointer_array_t procs;
     prte_proc_t pobj;
+
+    prte_pmix_server_connection_job_failed(jobid);
 
     PMIX_CONSTRUCT(&procs, pmix_pointer_array_t);
     pmix_pointer_array_init(&procs, 1, 1, 1);
@@ -277,8 +286,18 @@ static void proc_errors(int fd, short args, void *cbdata)
                          PRTE_NAME_PRINT(proc), prte_proc_state_to_str(state));
 
     /* get the job object */
-    if (prte_finalizing || NULL == (jdata = prte_get_job_data_object(proc->nspace))) {
-        /* could be a race condition */
+    if (prte_finalizing) {
+        PMIX_RELEASE(caddy);
+        return;
+    }
+    if (NULL == (jdata = prte_get_job_data_object(proc->nspace))) {
+        /* This proc has died and we hold nothing to account it against, so
+         * nothing below can run.  Dropping it silently - which is what "could
+         * be a race condition" amounted to - is what leaves the DVM waiting
+         * forever on a job it can no longer see.  Note the error states land
+         * HERE rather than in track_procs, so this is the arrival point for a
+         * proc that exited non-zero or died on a signal. */
+        prte_state_base_orphaned_proc(proc, state);
         PMIX_RELEASE(caddy);
         return;
     }
@@ -633,6 +652,40 @@ keep_going:
                     jdata->exit_code = PRTE_ERROR_DEFAULT_EXIT_CODE;
                 }
                 /* kill the job */
+                _terminate_job(jdata->nspace);
+            }
+        }
+        break;
+
+    /* This proc's node was released from the DVM and the departing daemon
+     * killed it.  Planned for the DVM, not for the job, so it is handled like
+     * the loss of a daemon - except that the cause is known and can be named. */
+    case PRTE_PROC_STATE_KILLED_BY_RELEASE:
+        pmix_output_verbose(5, prte_errmgr_base_framework.framework_output,
+                             "%s errmgr:dvm: proc %s killed by the release of node %s",
+                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(proc),
+                             (NULL == pptr->node) ? "unknown" : pptr->node->name);
+        if (flag) {
+            /* a job that can absorb the loss is told and keeps running */
+            check_send_notification(jdata, pptr, PMIX_ERR_PROC_KILLED_BY_RELEASE);
+            // recover the resources used by this proc
+            prte_state_base_recover_resources(jdata, pptr);
+        } else {
+            if (!PRTE_FLAG_TEST(jdata, PRTE_JOB_FLAG_ABORTED)) {
+                jdata->state = PRTE_JOB_STATE_KILLED_BY_RELEASE;
+                /* point to the first rank to cause the problem */
+                prte_set_attribute(&jdata->attributes, PRTE_JOB_ABORTED_PROC, PRTE_ATTR_LOCAL, pptr,
+                                   PMIX_POINTER);
+                /* retain the object so it doesn't get free'd */
+                PMIX_RETAIN(pptr);
+                PRTE_FLAG_SET(jdata, PRTE_JOB_FLAG_ABORTED);
+                /* the proc was killed, so it reported no exit code of its
+                 * own - without one the termination reads as success */
+                jdata->exit_code = pptr->exit_code;
+                if (0 == jdata->exit_code) {
+                    jdata->exit_code = PRTE_ERROR_DEFAULT_EXIT_CODE;
+                }
+                /* kill what is left of the job */
                 _terminate_job(jdata->nspace);
             }
         }

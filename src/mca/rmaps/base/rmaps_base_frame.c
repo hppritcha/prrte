@@ -62,7 +62,6 @@ prte_rmaps_base_t prte_rmaps_base = {
     .mapping = 0,
     .ranking = 0,
     .ppr = NULL,
-    .device = NULL,
     .inherit = false,
     .hwthread_cpus = false,
     .file = NULL,
@@ -72,8 +71,17 @@ prte_rmaps_base_t prte_rmaps_base = {
     .default_mapping_policy = NULL,
     .default_ranking_policy = NULL,
     .require_hwtcpus = false,
-    .have_cores = true
+    .have_cores = true,
+    .resized_nodes = PMIX_LIST_STATIC_INIT
 };
+
+static void rsz_con(prte_rmaps_base_resize_t *p)
+{
+    p->node = NULL;
+    p->slots = 0;
+    p->slots_given = false;
+}
+PMIX_CLASS_INSTANCE(prte_rmaps_base_resize_t, pmix_list_item_t, rsz_con, NULL);
 
 static int prte_rmaps_base_register(pmix_mca_base_register_flag_t flags)
 {
@@ -84,11 +92,13 @@ static int prte_rmaps_base_register(pmix_mca_base_register_flag_t flags)
     prte_rmaps_base.default_mapping_policy = NULL;
     ret = pmix_mca_base_var_register("prte", NULL, NULL, "mapby",
                                      "Default mapping Policy [slot | hwthread | core | l1cache | "
-                                      "l2cache | l3cache | numa | package | node | seq | dist | ppr | "
+                                      "l2cache | l3cache | numa | package | node | seq | ppr | "
+                                      "device=<class|name> (gpu, network (aka nic, fabric,\n"
+                                      " openfabrics), block, or a device name such as mlx5_0) | "
                                       "rankfile | pe-list=a,b (comma-delimited ranges of cpus to use for this job)],"
                                       " with supported colon-delimited modifiers: PE=y (for multiple cpus/proc), "
                                       "SPAN, OVERSUBSCRIBE, NOOVERSUBSCRIBE, NOLOCAL, HWTCPUS, CORECPUS, "
-                                      "DEVICE=dev (for dist policy), INHERIT, NOINHERIT, ORDERED, FILE=%s (path to file containing sequential "
+                                      "INHERIT, NOINHERIT, ORDERED, FILE=%s (path to file containing sequential "
                                       "or rankfile entries). For more details, see \"prterun --help map-by\". "
                                       "The full directive need not be provided — "
                                       "only enough characters are required to uniquely identify the "
@@ -134,6 +144,9 @@ static int prte_rmaps_base_close(void)
         PMIX_RELEASE(item);
     }
     PMIX_DESTRUCT(&prte_rmaps_base.selected_modules);
+    /* a map always drains this, but a teardown in the middle of one must
+     * not leak what it left */
+    PMIX_LIST_DESTRUCT(&prte_rmaps_base.resized_nodes);
     hwloc_bitmap_free(prte_rmaps_base.available);
     hwloc_bitmap_free(prte_rmaps_base.baseset);
 
@@ -150,6 +163,7 @@ static int prte_rmaps_base_open(pmix_mca_base_open_flag_t flags)
 
     /* init the globals */
     PMIX_CONSTRUCT(&prte_rmaps_base.selected_modules, pmix_list_t);
+    PMIX_CONSTRUCT(&prte_rmaps_base.resized_nodes, pmix_list_t);
     prte_rmaps_base.available = hwloc_bitmap_alloc();
     prte_rmaps_base.baseset = hwloc_bitmap_alloc();
 
@@ -172,7 +186,7 @@ static int prte_rmaps_base_open(pmix_mca_base_open_flag_t flags)
     return pmix_mca_base_framework_components_open(&prte_rmaps_base_framework, flags);
 }
 
-PMIX_MCA_BASE_FRAMEWORK_DECLARE(prte, rmaps, "PRTE Mapping Subsystem", prte_rmaps_base_register,
+PRTE_MCA_BASE_FRAMEWORK_DECLARE(rmaps, "PRTE Mapping Subsystem", prte_rmaps_base_register,
                                 prte_rmaps_base_open, prte_rmaps_base_close,
                                 prte_rmaps_base_static_components,
                                 PMIX_MCA_BASE_FRAMEWORK_FLAG_DEFAULT);
@@ -211,6 +225,44 @@ PMIX_CLASS_INSTANCE(prte_rmaps_base_selected_module_t,
  * accepted for a job and silently rejected (a bare PRTE_ERR_BAD_PARAM, no
  * message) for an app.
  */
+/*
+ * The levels a device list may be interleaved across.
+ *
+ * "node" is deliberately absent: interleaving across nodes is what SPAN
+ * already expresses, and giving one behavior two names that then compose
+ * with each other produces nonsense.  SPAN owns the cross-node dimension,
+ * interleave the within-node one.
+ */
+static struct {
+    const char *name;
+    hwloc_obj_type_t type;
+} interleave_levels[] = {
+    {.name = "package", .type = HWLOC_OBJ_PACKAGE},
+    {.name = "numa", .type = HWLOC_OBJ_NUMANODE},
+    {.name = "l3cache", .type = HWLOC_OBJ_L3CACHE},
+    {.name = "l2cache", .type = HWLOC_OBJ_L2CACHE},
+    {.name = "l1cache", .type = HWLOC_OBJ_L1CACHE},
+    {.name = NULL, .type = HWLOC_OBJ_MACHINE}
+};
+
+bool prte_rmaps_base_interleave_level(const char *name, hwloc_obj_type_t *type)
+{
+    size_t n;
+
+    if (NULL == name || 0 == strlen(name)) {
+        return false;
+    }
+    for (n = 0; NULL != interleave_levels[n].name; n++) {
+        if (PMIX_CHECK_CLI_OPTION((char *) name, (char *) interleave_levels[n].name)) {
+            if (NULL != type) {
+                *type = interleave_levels[n].type;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 /*
  * Validate a pe-list value: a comma-delimited list of cpu ids and id ranges,
  * "0-3,6".
@@ -271,6 +323,10 @@ static int check_modifiers(char *ck, prte_job_t *jdata,
     bool core_cpus_given = false;
     bool oversubscribe_given = false;
     bool nooversubscribe_given = false;
+    bool shared = false;
+    long ndev;
+    char *eptr;
+    uint16_t ndev16;
 
     pmix_output_verbose(5, prte_rmaps_base_framework.framework_output,
                         "%s rmaps:base check modifiers with %s",
@@ -457,6 +513,103 @@ static int check_modifiers(char *ck, prte_job_t *jdata,
             } else {
                 prte_set_attribute(attrs, (NULL != app) ? PRTE_APP_MAP_FILE : PRTE_JOB_FILE,
                                    PRTE_ATTR_GLOBAL, val, PMIX_STRING);
+            }
+
+        } else if (PMIX_CHECK_CLI_OPTION(ck2[i], PRTE_CLI_INTERLEAVE)) {
+            /* NOTE: this arm must stay AFTER the INHERIT arm above.  The
+             * option matcher compares only as far as the shorter of its two
+             * arguments and has no view of the other options, so the first
+             * arm that prefix-matches wins - and ":i" has meant INHERIT for
+             * as long as there has been one.  Tested earlier, this arm would
+             * silently change what an existing command line does. */
+            val = pmix_cli_qualifier_value(ck2[i]);
+            if (NULL == val) {
+                /* the level defaults to the package: it is the only one that
+                 * does anything interesting on a conventional two-socket
+                 * node, and the one whose crossing costs the most */
+                val = "package";
+            }
+            if (!prte_rmaps_base_interleave_level(val, NULL)) {
+                prte_show_help("help-prte-rmaps-base.txt", "rmaps:bad-interleave-level",
+                               true, val);
+                PMIx_Argv_free(ck2);
+                return PRTE_ERR_SILENT;
+            }
+            if (NULL == attrs) {
+                prte_show_help("help-prte-rmaps-base.txt", "unsupported-default-modifier",
+                               true, "mapping policy", PRTE_CLI_INTERLEAVE);
+                PMIx_Argv_free(ck2);
+                return PRTE_ERR_SILENT;
+            }
+            prte_set_attribute(attrs,
+                               (NULL != app) ? PRTE_APP_MAP_INTERLEAVE : PRTE_JOB_MAP_INTERLEAVE,
+                               PRTE_ATTR_GLOBAL, val, PMIX_STRING);
+
+        } else if (PMIX_CHECK_CLI_OPTION(ck2[i], PRTE_CLI_NDEV)) {
+            /* how many devices each proc is given.  Tested before SHARED
+             * only because they share no prefix; both sit after SPAN for
+             * the reason given below. */
+            val = pmix_cli_qualifier_value(ck2[i]);
+            if (NULL == val) {
+                prte_show_help("help-prte-rmaps-base.txt", "missing-value", true,
+                               "mapping policy", "NDEV", ck2[i]);
+                PMIx_Argv_free(ck2);
+                return PRTE_ERR_SILENT;
+            }
+            ndev = strtol(val, &eptr, 10);
+            if ('\0' != *eptr || 0 >= ndev || UINT16_MAX < ndev) {
+                prte_show_help("help-prte-rmaps-base.txt", "invalid-value", true,
+                               "mapping policy", "NDEV", ck2[i]);
+                PMIx_Argv_free(ck2);
+                return PRTE_ERR_SILENT;
+            }
+            if (NULL == attrs) {
+                prte_show_help("help-prte-rmaps-base.txt", "unsupported-default-modifier",
+                               true, "mapping policy", PRTE_CLI_NDEV);
+                PMIx_Argv_free(ck2);
+                return PRTE_ERR_SILENT;
+            }
+            ndev16 = (uint16_t) ndev;
+            prte_set_attribute(attrs,
+                               (NULL != app) ? PRTE_APP_MAP_NDEV : PRTE_JOB_MAP_NDEV,
+                               PRTE_ATTR_GLOBAL, &ndev16, PMIX_UINT16);
+
+        } else if (PMIX_CHECK_CLI_OPTION(ck2[i], PRTE_CLI_SHARED)) {
+            /* NOTE: like the interleave arm above, this must stay near the
+             * END of the chain - and in particular after SPAN.  The option
+             * matcher compares only as far as the shorter of its two
+             * arguments and has no view of the other options, so the first
+             * arm that prefix-matches wins, and ":s" has meant SPAN for as
+             * long as there has been one. */
+            val = pmix_cli_qualifier_value(ck2[i]);
+            if (NULL == val) {
+                /* the bare qualifier asks for it */
+                shared = true;
+            } else if (0 == strcasecmp(val, "true") || 0 == strcasecmp(val, "1")
+                       || 0 == strcasecmp(val, "yes")) {
+                shared = true;
+            } else if (0 == strcasecmp(val, "false") || 0 == strcasecmp(val, "0")
+                       || 0 == strcasecmp(val, "no")) {
+                shared = false;
+            } else {
+                prte_show_help("help-prte-rmaps-base.txt", "invalid-value", true,
+                               "mapping policy", "SHARED", ck2[i]);
+                PMIx_Argv_free(ck2);
+                return PRTE_ERR_SILENT;
+            }
+            if (NULL == attrs) {
+                prte_show_help("help-prte-rmaps-base.txt", "unsupported-default-modifier",
+                               true, "mapping policy", PRTE_CLI_SHARED);
+                PMIx_Argv_free(ck2);
+                return PRTE_ERR_SILENT;
+            }
+            /* a bool attribute means "true" by its presence, and setting it
+             * false removes it - which is exactly the default, so nothing
+             * needs recording for shared=false */
+            if (shared) {
+                prte_set_attribute(attrs,
+                                   (NULL != app) ? PRTE_APP_MAP_SHARED : PRTE_JOB_MAP_SHARED,
+                                   PRTE_ATTR_GLOBAL, NULL, PMIX_BOOL);
             }
 
         } else {
@@ -910,6 +1063,41 @@ int prte_rmaps_base_set_mapping_policy(prte_job_t *jdata, char *inspec)
         PRTE_SET_MAPPING_POLICY(tmp, PRTE_MAPPING_PELIST);
         PRTE_SET_MAPPING_DIRECTIVE(tmp, PRTE_MAPPING_GIVEN);
 
+    } else if (PMIX_CHECK_CLI_OPTION(cptr, PRTE_CLI_DEVICE)) {
+        /* place procs against the devices in each node's topology. The value
+         * is either a device class ("gpu", "network", ...) or the name or
+         * uuid of one particular device, in which case every proc is placed
+         * near that one - which is what the removed "dist" policy did, said
+         * with one directive instead of a policy plus an MCA parameter.
+         * There is deliberately no bare "--map-by gpu": the class is the
+         * directive's value, which is what lets a new class be supported by
+         * adding a value rather than a directive. */
+        if (NULL == jdata) {
+            prte_show_help("help-prte-rmaps-base.txt", "unsupported-default-policy", true,
+                           "mapping", cptr);
+            PMIx_Argv_free(ck);
+            free(cptr);
+            if (NULL != val) {
+                free(val);
+            }
+            return PRTE_ERR_SILENT;
+        }
+        if (NULL == val || 0 == strlen(val)) {
+            /* "device" with nothing after the "=" names no device at all */
+            prte_show_help("help-prte-rmaps-base.txt", "missing-value",
+                           true, "mapping", ck[0]);
+            PMIx_Argv_free(ck);
+            free(cptr);
+            if (NULL != val) {
+                free(val);
+            }
+            return PRTE_ERR_SILENT;
+        }
+        prte_set_attribute(&jdata->attributes, PRTE_JOB_MAP_DEVICE, PRTE_ATTR_GLOBAL,
+                           val, PMIX_STRING);
+        PRTE_SET_MAPPING_POLICY(tmp, PRTE_MAPPING_BYDEVICE);
+        PRTE_SET_MAPPING_DIRECTIVE(tmp, PRTE_MAPPING_GIVEN);
+
     } else {
         prte_show_help("help-prte-rmaps-base.txt", "unrecognized-policy",
                        true, "mapping", cptr);
@@ -928,6 +1116,35 @@ int prte_rmaps_base_set_mapping_policy(prte_job_t *jdata, char *inspec)
     PRTE_SET_MAPPING_DIRECTIVE(tmp, PRTE_MAPPING_GIVEN);
 
 setpolicy:
+    /* interleave reorders a device list, so it means nothing anywhere else.
+     * Refuse it by name rather than as an unknown qualifier - the spelling
+     * is legal, just not here. The check waits until now because the
+     * qualifiers are parsed before the directive they belong to. */
+    if (NULL != jdata
+        && prte_get_attribute(&jdata->attributes, PRTE_JOB_MAP_INTERLEAVE, NULL, PMIX_STRING)
+        && PRTE_MAPPING_BYDEVICE != PRTE_GET_MAPPING_POLICY(tmp)) {
+        prte_show_help("help-prte-rmaps-base.txt", "rmaps:interleave-needs-device", true,
+                       prte_rmaps_base_print_mapping(tmp));
+        return PRTE_ERR_SILENT;
+    }
+    /* "shared" says devices may be shared, so it means nothing where there
+     * are no devices - refuse it by name rather than as an unknown
+     * qualifier, since the spelling is legal, just not here */
+    if (NULL != jdata
+        && prte_get_attribute(&jdata->attributes, PRTE_JOB_MAP_SHARED, NULL, PMIX_BOOL)
+        && PRTE_MAPPING_BYDEVICE != PRTE_GET_MAPPING_POLICY(tmp)) {
+        prte_show_help("help-prte-rmaps-base.txt", "rmaps:shared-needs-device", true,
+                       prte_rmaps_base_print_mapping(tmp));
+        return PRTE_ERR_SILENT;
+    }
+    if (NULL != jdata
+        && prte_get_attribute(&jdata->attributes, PRTE_JOB_MAP_NDEV, NULL, PMIX_UINT16)
+        && PRTE_MAPPING_BYDEVICE != PRTE_GET_MAPPING_POLICY(tmp)) {
+        prte_show_help("help-prte-rmaps-base.txt", "rmaps:ndev-needs-device", true,
+                       prte_rmaps_base_print_mapping(tmp));
+        return PRTE_ERR_SILENT;
+    }
+
     if (NULL == jdata) {
         prte_rmaps_base.mapping = tmp;
     } else {
@@ -1183,6 +1400,24 @@ int prte_rmaps_base_set_app_mapping_policy(prte_app_context_t *app, char *inspec
         prte_set_attribute(&app->attributes, PRTE_APP_CPUSET, PRTE_ATTR_GLOBAL,
                            val, PMIX_STRING);
         PRTE_SET_MAPPING_POLICY(tmp, PRTE_MAPPING_PELIST);
+    } else if (PMIX_CHECK_CLI_OPTION(cptr, PRTE_CLI_DEVICE)) {
+        /* the devices this app is to be placed against - as much its own
+         * business as the object it maps by. Must stay in step with the
+         * job-level arm above: a directive accepted at one level and refused
+         * at the other is the recurring bug in this file */
+        if (NULL == val || 0 == strlen(val)) {
+            prte_show_help("help-prte-rmaps-base.txt", "missing-value",
+                           true, "mapping", ck[0]);
+            PMIx_Argv_free(ck);
+            free(cptr);
+            if (NULL != val) {
+                free(val);
+            }
+            return PRTE_ERR_SILENT;
+        }
+        prte_set_attribute(&app->attributes, PRTE_APP_MAP_DEVICE, PRTE_ATTR_GLOBAL,
+                           val, PMIX_STRING);
+        PRTE_SET_MAPPING_POLICY(tmp, PRTE_MAPPING_BYDEVICE);
     } else if (PMIX_CHECK_CLI_OPTION(cptr, PRTE_CLI_RANKFILE)) {
         /* the file naming this app's rank->host+cpuset assignments. The
          * FILE= qualifier was parsed above onto PRTE_APP_MAP_FILE; without
@@ -1223,6 +1458,26 @@ int prte_rmaps_base_set_app_mapping_policy(prte_app_context_t *app, char *inspec
     PRTE_SET_MAPPING_DIRECTIVE(tmp, PRTE_MAPPING_GIVEN);
 
 setpolicy:
+    /* interleave reorders a device list, so it means nothing anywhere else -
+     * see the job-level parser, which refuses it the same way */
+    if (prte_get_attribute(&app->attributes, PRTE_APP_MAP_INTERLEAVE, NULL, PMIX_STRING)
+        && PRTE_MAPPING_BYDEVICE != PRTE_GET_MAPPING_POLICY(tmp)) {
+        prte_show_help("help-prte-rmaps-base.txt", "rmaps:interleave-needs-device", true,
+                       prte_rmaps_base_print_mapping(tmp));
+        return PRTE_ERR_SILENT;
+    }
+    if (prte_get_attribute(&app->attributes, PRTE_APP_MAP_SHARED, NULL, PMIX_BOOL)
+        && PRTE_MAPPING_BYDEVICE != PRTE_GET_MAPPING_POLICY(tmp)) {
+        prte_show_help("help-prte-rmaps-base.txt", "rmaps:shared-needs-device", true,
+                       prte_rmaps_base_print_mapping(tmp));
+        return PRTE_ERR_SILENT;
+    }
+    if (prte_get_attribute(&app->attributes, PRTE_APP_MAP_NDEV, NULL, PMIX_UINT16)
+        && PRTE_MAPPING_BYDEVICE != PRTE_GET_MAPPING_POLICY(tmp)) {
+        prte_show_help("help-prte-rmaps-base.txt", "rmaps:ndev-needs-device", true,
+                       prte_rmaps_base_print_mapping(tmp));
+        return PRTE_ERR_SILENT;
+    }
     prte_set_attribute(&app->attributes, PRTE_APP_MAPBY, PRTE_ATTR_GLOBAL, &tmp, PMIX_UINT16);
     return PRTE_SUCCESS;
 }

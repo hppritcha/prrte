@@ -75,6 +75,40 @@ static int pack_epoch_frame(pmix_data_buffer_t *framed, pmix_data_buffer_t *body
     return PRTE_SUCCESS;
 }
 
+/* Turn an info list into the array we pack, screening the conversion.
+ *
+ * PMIx_Info_list_convert() answers PMIX_ERR_EMPTY for a list nothing was ever
+ * added to - the ordinary case for a construct that carries no group info and
+ * no endpoints - and on that early return it is under no obligation to have
+ * touched the caller's pmix_data_array_t. Callers here hand it an
+ * uninitialized stack variable, so reading darray.array/darray.size after an
+ * unchecked call reads whatever was on the stack, packs that many pmix_info_t
+ * from that pointer, and then hands the same pointer to
+ * PMIX_DATA_ARRAY_DESTRUCT. Initialize it ourselves and answer an empty array
+ * on any failure, so the array is always one the caller can pack from and
+ * destruct. */
+static void convert_info_list(void *ilist, pmix_data_array_t *darray,
+                              pmix_info_t **info, size_t *ninfo)
+{
+    pmix_status_t rc;
+
+    PMIX_DATA_ARRAY_INIT(darray, PMIX_INFO);
+    rc = PMIx_Info_list_convert(ilist, darray);
+    if (PMIX_SUCCESS != rc) {
+        /* an empty list is not an error - it just means there is nothing of
+         * this kind to carry */
+        if (PMIX_ERR_EMPTY != rc) {
+            PMIX_ERROR_LOG(rc);
+        }
+        PMIX_DATA_ARRAY_INIT(darray, PMIX_INFO);
+        *info = NULL;
+        *ninfo = 0;
+        return;
+    }
+    *info = (pmix_info_t *) darray->array;
+    *ninfo = darray->size;
+}
+
 /* Take a copy of a proc array a directive carried into the signature.
  *
  * The array belongs to the caller: the directives come straight from the
@@ -252,7 +286,7 @@ static void abort_group_op(prte_grpcomm_group_t *coll, pmix_status_t st)
     PMIX_DATA_BUFFER_CREATE(reply);
     /* pack the signature */
     rc = pack_signature(reply, coll->sig);
-    if (PMIX_SUCCESS != rc) {
+    if (PRTE_SUCCESS != rc) {
         PRTE_ERROR_LOG(rc);
         PMIX_DATA_BUFFER_RELEASE(reply);
         return;
@@ -561,7 +595,6 @@ void prte_grpcomm_group_fault_handler(const prte_rml_recovery_status_t* status)
             }
         }
     }
-
 }
 
 
@@ -569,7 +602,7 @@ static void group(int sd, short args, void *cbdata)
 {
     prte_pmix_grp_caddy_t *cd = (prte_pmix_grp_caddy_t*)cbdata;
     prte_grpcomm_group_signature_t sig;
-    prte_grpcomm_group_t *coll;
+    prte_grpcomm_group_t *coll = NULL;
     pmix_data_buffer_t *relay, *framed;
     pmix_status_t rc, st = PMIX_SUCCESS;
     int timeout = 0;
@@ -619,12 +652,17 @@ static void group(int sd, short args, void *cbdata)
      * from the completed memo so this one is not mistaken for a straggler */
     group_op_forget(&sig);
 
-    /* create a tracker for this operation */
+    /* create a tracker for this operation. A failure here has to leave by the
+     * error label like any other: the two info lists are open, and - more to
+     * the point - nothing else is going to answer the participant. This entry
+     * point already returned PRTE_SUCCESS to the PMIx server, so a silent
+     * return leaves the client blocked in PMIx_Group_construct with no
+     * collective in flight to ever release it. */
     if (NULL == (coll = get_tracker(&sig, true))) {
         PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
-        PMIX_RELEASE(cd);
         PMIX_DESTRUCT(&sig);
-        return;
+        rc = PMIX_ERR_NOT_FOUND;
+        goto error;
     }
     coll->cbfunc = cd->cbfunc;
     coll->cbdata = cd->cbdata;
@@ -664,13 +702,12 @@ static void group(int sd, short args, void *cbdata)
 
     if (PMIX_GROUP_CONSTRUCT == sig.op) {
         // pack any group info
-        PMIx_Info_list_convert(grpinfo, &darray);
-        info = (pmix_info_t*)darray.array;
-        ninfo = darray.size;
+        convert_info_list(grpinfo, &darray, &info, &ninfo);
         rc = PMIx_Data_pack(NULL, relay, &ninfo, 1, PMIX_SIZE);
         if (PMIX_SUCCESS != rc) {
             PMIX_ERROR_LOG(rc);
             PMIX_DATA_BUFFER_RELEASE(relay);
+            PMIX_DATA_ARRAY_DESTRUCT(&darray);
             PMIX_DESTRUCT(&sig);
             goto error;
         }
@@ -679,6 +716,7 @@ static void group(int sd, short args, void *cbdata)
             if (PMIX_SUCCESS != rc) {
                 PMIX_ERROR_LOG(rc);
                 PMIX_DATA_BUFFER_RELEASE(relay);
+                PMIX_DATA_ARRAY_DESTRUCT(&darray);
                 PMIX_DESTRUCT(&sig);
                 goto error;
             }
@@ -686,13 +724,12 @@ static void group(int sd, short args, void *cbdata)
         PMIX_DATA_ARRAY_DESTRUCT(&darray);
 
         // pack any endpts
-        PMIx_Info_list_convert(endpts, &darray);
-        info = (pmix_info_t*)darray.array;
-        ninfo = darray.size;
+        convert_info_list(endpts, &darray, &info, &ninfo);
         rc = PMIx_Data_pack(NULL, relay, &ninfo, 1, PMIX_SIZE);
         if (PMIX_SUCCESS != rc) {
             PMIX_ERROR_LOG(rc);
             PMIX_DATA_BUFFER_RELEASE(relay);
+            PMIX_DATA_ARRAY_DESTRUCT(&darray);
             PMIX_DESTRUCT(&sig);
             goto error;
         }
@@ -701,6 +738,7 @@ static void group(int sd, short args, void *cbdata)
             if (PMIX_SUCCESS != rc) {
                 PMIX_ERROR_LOG(rc);
                 PMIX_DATA_BUFFER_RELEASE(relay);
+                PMIX_DATA_ARRAY_DESTRUCT(&darray);
                 PMIX_DESTRUCT(&sig);
                 goto error;
             }
@@ -793,6 +831,16 @@ error:
     if (NULL != endpts) {
         PMIx_Info_list_release(endpts);
     }
+    /* Our contribution never entered the rollup, so nothing upstream knows to
+     * fail this participant - we have to, right here. Take it off the tracker
+     * first: the tracker itself stays (a release from the controller, which
+     * can still abort the operation, has to find it), and a release arriving
+     * later would otherwise complete the same client a second time with the
+     * same cbdata. This is the same rule the fence entry point follows. */
+    if (NULL != coll) {
+        coll->cbfunc = NULL;
+        coll->cbdata = NULL;
+    }
     if (NULL != cd->cbfunc) {
         cd->cbfunc(rc, NULL, 0, cd->cbdata, NULL, NULL);
     }
@@ -809,7 +857,7 @@ void prte_grpcomm_grp_recv(int status, pmix_proc_t *sender,
     struct timeval tv;
     size_t n, nendpts, ngrpinfo;
     pmix_status_t st;
-    pmix_info_t *endpts, *grpinfo = NULL;
+    pmix_info_t *endpts = NULL, *grpinfo = NULL;
     prte_grpcomm_group_signature_t *sig = NULL;
     prte_grpcomm_group_t *coll;
     PRTE_HIDE_UNUSED_PARAMS(status, tag, cbdata);
@@ -1162,11 +1210,15 @@ static void check_complete(prte_grpcomm_group_t *coll)
                 goto answer;
 #endif
             }
-            /* if we were asked to provide a context id, do so */
+            /* if we were asked to provide a context id, do so. This runs
+             * only on the master (see the guard above), which is what
+             * prte_grpcomm_assign_context_id() requires - it is shared with
+             * the job-control path an invited group's leader uses, so that
+             * the two cannot hand out the same number */
             if (coll->sig->assignID) {
-                coll->sig->ctxid = prte_grpcomm_globals.context_id;
-                --prte_grpcomm_globals.context_id;
-                coll->sig->ctxid_assigned = true;
+                if (PRTE_SUCCESS == prte_grpcomm_assign_context_id(&coll->sig->ctxid)) {
+                    coll->sig->ctxid_assigned = true;
+                }
             }
 
             // construct the final membership
@@ -1288,20 +1340,22 @@ answer:
         PMIX_DATA_BUFFER_CREATE(reply);
 
         /* pack the signature */
+        /* pack_signature answers in PRTE codes - log it through the
+         * decoder that knows them */
         rc = pack_signature(reply, coll->sig);
-        if (PMIX_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
+        if (PRTE_SUCCESS != rc) {
+            PRTE_ERROR_LOG(rc);
             PMIX_DATA_BUFFER_RELEASE(reply);
-            PMIX_PROC_FREE(finalmembership, nfinal);
-            return;
+            /* the abort below puts this on the wire as a PMIx status */
+            rc = prte_pmix_convert_rc(rc);
+            goto failed;
         }
         /* pack the status */
         rc = PMIx_Data_pack(NULL, reply, &coll->status, 1, PMIX_STATUS);
         if (PMIX_SUCCESS != rc) {
             PMIX_ERROR_LOG(rc);
             PMIX_DATA_BUFFER_RELEASE(reply);
-            PMIX_PROC_FREE(finalmembership, nfinal);
-            return;
+            goto failed;
         }
 
         if (PMIX_GROUP_CONSTRUCT == coll->sig->op) {
@@ -1310,16 +1364,14 @@ answer:
             if (PMIX_SUCCESS != rc) {
                 PMIX_ERROR_LOG(rc);
                 PMIX_DATA_BUFFER_RELEASE(reply);
-                PMIX_PROC_FREE(finalmembership, nfinal);
-                return;
+                goto failed;
             }
             if (0 < nfinal) {
                 rc = PMIx_Data_pack(NULL, reply, finalmembership, nfinal, PMIX_PROC);
                 if (PMIX_SUCCESS != rc) {
                     PMIX_ERROR_LOG(rc);
                     PMIX_DATA_BUFFER_RELEASE(reply);
-                    PMIX_PROC_FREE(finalmembership, nfinal);
-                    return;
+                    goto failed;
                 }
                 PMIX_PROC_FREE(finalmembership, nfinal);
             }
@@ -1330,7 +1382,7 @@ answer:
             if (PMIX_SUCCESS != rc) {
                 PMIX_ERROR_LOG(rc);
                 PMIX_DATA_BUFFER_RELEASE(reply);
-                return;
+                goto failed;
             }
             if (0 < coll->ndeparted) {
                 rc = PMIx_Data_pack(NULL, reply, coll->departed,
@@ -1338,42 +1390,38 @@ answer:
                 if (PMIX_SUCCESS != rc) {
                     PMIX_ERROR_LOG(rc);
                     PMIX_DATA_BUFFER_RELEASE(reply);
-                    return;
+                    goto failed;
                 }
             }
 
             // pack any group info
-            PMIx_Info_list_convert(coll->grpinfo, &darray);
-            info = (pmix_info_t*)darray.array;
-            ninfo = darray.size;
+            convert_info_list(coll->grpinfo, &darray, &info, &ninfo);
             rc = PMIx_Data_pack(NULL, reply, &ninfo, 1, PMIX_SIZE);
             if (PMIX_SUCCESS != rc) {
                 PMIX_ERROR_LOG(rc);
                 PMIX_DATA_BUFFER_RELEASE(reply);
                 PMIX_DATA_ARRAY_DESTRUCT(&darray);
-                return;
+                goto failed;
             }
             if (0 < ninfo) {
-               rc =  PMIx_Data_pack(NULL, reply, info, ninfo, PMIX_INFO);
+               rc = PMIx_Data_pack(NULL, reply, info, ninfo, PMIX_INFO);
                 if (PMIX_SUCCESS != rc) {
                     PMIX_ERROR_LOG(rc);
                     PMIX_DATA_BUFFER_RELEASE(reply);
                     PMIX_DATA_ARRAY_DESTRUCT(&darray);
-                    return;
+                    goto failed;
                 }
             }
             PMIX_DATA_ARRAY_DESTRUCT(&darray);
 
             // pack any endpts
-            PMIx_Info_list_convert(coll->endpts, &darray);
-            info = (pmix_info_t*)darray.array;
-            ninfo = darray.size;
+            convert_info_list(coll->endpts, &darray, &info, &ninfo);
             rc = PMIx_Data_pack(NULL, reply, &ninfo, 1, PMIX_SIZE);
             if (PMIX_SUCCESS != rc) {
                 PMIX_ERROR_LOG(rc);
                 PMIX_DATA_BUFFER_RELEASE(reply);
                 PMIX_DATA_ARRAY_DESTRUCT(&darray);
-                return;
+                goto failed;
             }
             if (0 < ninfo) {
                 rc = PMIx_Data_pack(NULL, reply, info, ninfo, PMIX_INFO);
@@ -1381,7 +1429,7 @@ answer:
                     PMIX_ERROR_LOG(rc);
                     PMIX_DATA_BUFFER_RELEASE(reply);
                     PMIX_DATA_ARRAY_DESTRUCT(&darray);
-                    return;
+                    goto failed;
                 }
             }
             PMIX_DATA_ARRAY_DESTRUCT(&darray);
@@ -1391,6 +1439,21 @@ answer:
          * buffer is still ours to free */
         (void) prte_grpcomm_release_bcast(PRTE_RML_TAG_GROUP_RELEASE, reply);
         PMIX_DATA_BUFFER_RELEASE(reply);
+        return;
+
+failed:
+        /* We could not build the release. "converged" is already latched, so
+         * nothing will drive this tracker again, and on the controller there
+         * is no recovery either - the restart deliberately skips a converged
+         * tracker here because its release is supposed to be on the wire. So
+         * a bare return leaves every participant in the DVM blocked in
+         * PMIx_Group_construct forever. Fail them instead: the abort carries
+         * only the signature and a status, which is far the smallest message
+         * we could still manage to build, and it drives each daemon's release
+         * path to complete its own clients and retire the tracker. */
+        PMIX_PROC_FREE(finalmembership, nfinal);
+        abort_group_op(coll, (PMIX_SUCCESS == rc) ? PMIX_ERROR : rc);
+        return;
 
     } else {
         PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_globals.output,
@@ -1402,9 +1465,10 @@ answer:
         PMIX_DATA_BUFFER_CREATE(reply);
 
         /* pack the signature */
+        /* pack_signature answers in PRTE codes - see the note above */
         rc = pack_signature(reply, coll->sig);
-        if (PMIX_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
+        if (PRTE_SUCCESS != rc) {
+            PRTE_ERROR_LOG(rc);
             PMIX_DATA_BUFFER_RELEASE(reply);
             return;
         }
@@ -1427,9 +1491,7 @@ answer:
 
         if (PMIX_GROUP_CONSTRUCT == coll->sig->op) {
             // pack any group info
-            PMIx_Info_list_convert(coll->grpinfo, &darray);
-            info = (pmix_info_t*)darray.array;
-            ninfo = darray.size;
+            convert_info_list(coll->grpinfo, &darray, &info, &ninfo);
             rc = PMIx_Data_pack(NULL, reply, &ninfo, 1, PMIX_SIZE);
             if (PMIX_SUCCESS != rc) {
                 PMIX_ERROR_LOG(rc);
@@ -1449,9 +1511,7 @@ answer:
             PMIX_DATA_ARRAY_DESTRUCT(&darray);
 
             // pack any endpts
-            PMIx_Info_list_convert(coll->endpts, &darray);
-            info = (pmix_info_t*)darray.array;
-            ninfo = darray.size;
+            convert_info_list(coll->endpts, &darray, &info, &ninfo);
             rc = PMIx_Data_pack(NULL, reply, &ninfo, 1, PMIX_SIZE);
             if (PMIX_SUCCESS != rc) {
                 PMIX_ERROR_LOG(rc);
@@ -1460,7 +1520,7 @@ answer:
                 return;
             }
             if (0 < ninfo) {
-                rc =PMIx_Data_pack(NULL, reply, info, ninfo, PMIX_INFO);
+                rc = PMIx_Data_pack(NULL, reply, info, ninfo, PMIX_INFO);
                 if (PMIX_SUCCESS != rc) {
                     PMIX_ERROR_LOG(rc);
                     PMIX_DATA_BUFFER_RELEASE(reply);
@@ -1649,6 +1709,12 @@ static void group_op_remember(prte_grpcomm_group_signature_t *sig)
            pmix_list_get_size(&prte_grpcomm_globals.completed_group_ops)) {
         memo = (prte_grpcomm_group_memo_t *)
             pmix_list_remove_first(&prte_grpcomm_globals.completed_group_ops);
+        /* answers NULL for an empty list, and the loop bound above is the
+         * only thing that says this one is not - screen it rather than hand
+         * a NULL to the reference count */
+        if (NULL == memo) {
+            break;
+        }
         PMIX_RELEASE(memo);
     }
     memo = PMIX_NEW(prte_grpcomm_group_memo_t);
@@ -2183,6 +2249,8 @@ static prte_grpcomm_group_t *get_tracker(prte_grpcomm_group_signature_t *sig,
                     }
                     coll->sig->members = p;
                     coll->sig->nmembers = n;
+                } else {
+                    PMIX_LIST_DESTRUCT(&plist);
                 }
 
             } else if (sig->follower) {
@@ -2235,6 +2303,8 @@ static prte_grpcomm_group_t *get_tracker(prte_grpcomm_group_signature_t *sig,
                     coll->sig->addmembers = p;
                     coll->sig->naddmembers = n;
                     coll->nfollowers = n;
+                } else {
+                    PMIX_LIST_DESTRUCT(&plist);
                 }
             }
             // if they specified a final order, see if one was already given

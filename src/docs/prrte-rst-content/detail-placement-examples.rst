@@ -302,6 +302,106 @@ since the ``-np`` option indicated that only 6 processes should be
 launched.
 
 
+Mapping Processes to Devices
+----------------------------
+
+Consider a two-socket node with eight NUMA domains and four GPUs, where
+the GPUs are attached to NUMA domains 1 and 2 on the first socket but 6
+and 7 on the second. That asymmetry is the case device mapping exists
+for: no ``--mapby numa`` or ``--mapby package`` expression selects those
+four domains, because they are not at the same position within each
+socket.
+
+.. code::
+
+   $ prun -n 4 --mapby device=gpu --bindto core ./a.out
+
+places one process per GPU, in PCI bus order, each bound to the first
+available core in the CPUs local to its own GPU --- on the machine
+described above, cores 16, 32, 96 and 112.
+
+Binding may be to any object at or below the device's locality:
+
+.. code::
+
+   $ prun -n 1 --mapby device=gpu --bindto numa ./a.out
+
+binds the process to the whole NUMA domain its GPU is attached to,
+while ``--bindto l3cache`` binds it to one L3 cache within that domain
+and ``--bindto core`` to a single core. Asking for ``--bindto package``
+on this machine is an error: a package contains the GPU's NUMA domain
+and three others, so binding there would place the process on CPUs the
+GPU is not local to.
+
+A device is assigned to a process rather than subdivided between processes,
+so by default each device takes one process: asking for more processes than
+there are devices is an error. Where sharing the devices is intended, say so
+with the ``shared`` qualifier:
+
+.. code::
+
+   $ prun -n 8 --mapby device=gpu:shared --bindto core ./a.out
+
+On the four-GPU machine above that runs two processes per GPU. Note the
+processes still get separate cores: sharing a device and overloading a CPU
+are different resources and different decisions, which is why they have
+different qualifiers --- ``shared`` here, and ``overload-allowed`` on
+``--bindto`` for the CPUs.
+
+Where a job wants its processes spread across sockets rather than filling
+the first, add the ``interleave`` qualifier:
+
+.. code::
+
+   $ prun -n 2 --mapby device=gpu:interleave --bindto core ./a.out
+
+This reorders the device list so that consecutive processes land on
+different packages --- on the machine above, cores 16 and 96 rather than
+16 and 32. The level may be given explicitly (``interleave=numa``, for
+instance); it defaults to ``package``.
+
+Where a process needs more than one device, ``ndev`` says how many:
+
+.. code::
+
+   $ prun -n 2 --mapby device=gpu:ndev=2 --bindto package ./a.out
+
+gives each of the two processes two GPUs. A process holding devices in
+different NUMA domains is local to neither of them alone, so its locality
+becomes whatever contains them both --- here the package, which is why
+binding to a package is legal in this case and an error without ``ndev``.
+
+Because the devices are handed out in groups taken in order from the device
+list, ``interleave`` composes with ``ndev``: the interleaving decides the
+order, and the grouping then takes contiguous runs of it.
+
+The reverse ratio --- several processes on each device rather than several
+devices for each process --- is a ``ppr`` pattern, spelled the same way as
+every other:
+
+.. code::
+
+   $ prun --mapby ppr:2:device=gpu --bindto core ./a.out
+
+places two processes on each GPU, each bound to its own core within that
+GPU's locality. As with any ``ppr`` pattern the process count follows from
+the pattern when ``-n`` is not given: four GPUs yield eight processes.
+
+Naming a single device rather than a class places every process near
+that one device, which suits a job whose performance depends on one
+particular fabric interface:
+
+.. code::
+
+   $ prun -n 8 --mapby device=mlx5_0 --bindto core ./a.out
+
+Other classes are selected the same way: ``device=network`` for the
+node's network interfaces and ``device=block`` for block devices.
+``device=nic``, ``device=fabric`` and ``device=openfabrics`` all mean
+``device=network``: a card that presents both an OpenFabrics device and
+a network interface is one device under any of them.
+
+
 Mapping Processes to Nodes Using Policies
 -----------------------------------------
 

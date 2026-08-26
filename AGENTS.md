@@ -25,6 +25,49 @@ the same bar as a thoughtful human contributor.
 
 ---
 
+## GOLDEN RULE: a bug you find is a bug you fix — attribution is not the work
+
+**Never answer a defect with who caused it.** Not "that is pre-existing", not
+"that is not my change", not "that came from another project", not "that is
+the harness". Whether a problem is yours, mine, a contributor's from four
+years ago, or an upstream library's, changes exactly one thing — where the
+fix gets written — and nothing else. It never determines *whether* the problem
+gets fixed, and it is never the headline of a report.
+
+This is a rule about how effort is spent. Time spent proving a fault belongs
+to someone else buys the project nothing: the bug is still there afterwards,
+and everyone involved is now poorer by the hours it took. The same hours
+spent on the fault itself end with it gone. So when a test goes red, when a
+run hangs, when something crashes — go at the mechanism, not the ownership.
+
+What this rule requires in practice:
+
+- **Root-cause it, then fix it.** Finding a defect creates the obligation to
+  deal with it. Land the fix in the same effort where you can; where the fix
+  genuinely belongs in another repository (PMIx, hwloc), write it there and
+  say so plainly — that is routing, not attribution.
+- **Report the mechanism, never the blame.** "A proc can be activated RUNNING
+  after its terminate join completed, so the HNP never sees it die" is a
+  report. "This is pre-existing, not from my change" is a deflection wearing
+  a report's clothes. State what breaks, how it breaks, and what fixes it.
+- **Provenance appears only where it does work.** In a commit message
+  explaining what a change restores, in a regression test's comment naming the
+  case that produced it, in a decision about which branch a fix lands on. If
+  the sentence you are writing is arguing about *whose* fault it is, delete
+  it.
+- **Never weigh whether an unrelated defect is worth reporting because of
+  where it came from.** Discovering a real bug in code you did not touch is a
+  good outcome, not an inconvenience, and it does not become someone else's
+  problem by virtue of its age.
+
+There is exactly one legitimate use for the A/B test that separates "before my
+change" from "after": deciding whether your change *introduced* a regression
+you must then repair. That is a debugging technique, and its output is a fix.
+The moment its output becomes an argument about ownership, it has stopped
+being engineering.
+
+---
+
 ## What is PRRTE?
 
 PRRTE (PMIx Reference RunTime Environment) is an open-source, production
@@ -158,6 +201,53 @@ Each component directory must contain:
 
 The component's `query` function returns a priority; the highest-priority
 component that successfully opens wins selection.
+
+### Framework interface versions
+
+A framework states the version of the interface its components are built
+against, and PMIx's `pmix_mca_base_components_open()` refuses a component
+that does not match. That matters because components are run-time
+loadable: an installed plugin older than the library loading it is what
+any partial upgrade produces, and it presents whatever module struct its
+header had at the time.
+
+**The numbers live in one place: the framework's own header.** Three
+macros — `PRTE_MCA_<name>_MAJOR_VERSION`, `_MINOR_VERSION`,
+`_RELEASE_VERSION` — feed both the component stamp and the framework
+declaration, which reach them by pasting the framework's name through
+`PRTE_MCA_FW_VER()` in [`src/pmix/pmix-internal.h`](src/pmix/pmix-internal.h):
+
+```c
+/* in plm.h */
+#define PRTE_MCA_plm_MAJOR_VERSION   2
+#define PRTE_MCA_plm_MINOR_VERSION   0
+#define PRTE_MCA_plm_RELEASE_VERSION 0
+
+/* in each plm component */
+    PRTE_MCA_BASE_VERSION(plm),
+
+/* in plm_base_frame.c */
+PRTE_MCA_BASE_FRAMEWORK_DECLARE(plm, NULL, ...);
+```
+
+Neither side restates the numbers, so bumping an interface is one edit in
+one header. **Bump it whenever you change `prte_<fw>_base_module_t` in a
+way a component built against the previous version would not survive** —
+adding an entry point is the usual case, since an older component leaves
+it NULL and the caller has no reason to expect that.
+
+The framework name is a **bare token, lower case, and must be the
+framework's directory name**: the same token is stringified into the
+component struct and pasted into the macro names, so `plm` and not
+`"plm"` or `PLM`. (This is why `prtebacktrace` components now stamp
+`prtebacktrace` where they used to say `backtrace` — the old spelling did
+not match the framework, which would have put any MCA parameter they
+registered under the wrong prefix.)
+
+PRRTE keeps its own `PRTE_MCA_BASE_VERSION` / `PRTE_MCA_BASE_FRAMEWORK_DECLARE`
+rather than using PMIx's because PMIx's stamp the project as `"pmix"`
+with PMIx's version numbers; these say `"prte"` with PRRTE's. Everything
+below that level is PMIx's code.
 
 ---
 

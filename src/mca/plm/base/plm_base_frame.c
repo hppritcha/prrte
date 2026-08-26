@@ -134,6 +134,10 @@ static int prte_plm_base_close(void)
         }
     }
 
+    /* a size change granted but never launched still owes its requester an
+     * answer, and this is the last chance to give one */
+    prte_plm_base_flush_grow_requesters();
+
     if (NULL != prte_plm_globals.base_nspace) {
         free(prte_plm_globals.base_nspace);
         /* the tool-attach path in plm_base_receive reads this to mint a
@@ -160,7 +164,7 @@ static int prte_plm_base_open(pmix_mca_base_open_flag_t flags)
     return pmix_mca_base_framework_components_open(&prte_plm_base_framework, flags);
 }
 
-PMIX_MCA_BASE_FRAMEWORK_DECLARE(prte, plm, NULL, mca_plm_base_register, prte_plm_base_open,
+PRTE_MCA_BASE_FRAMEWORK_DECLARE(plm, NULL, mca_plm_base_register, prte_plm_base_open,
                                 prte_plm_base_close, prte_plm_base_static_components,
                                 PMIX_MCA_BASE_FRAMEWORK_FLAG_DEFAULT);
 

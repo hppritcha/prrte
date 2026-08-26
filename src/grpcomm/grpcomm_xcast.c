@@ -133,12 +133,11 @@ static void send_ack(signature_t* sig, pmix_rank_t ack_id);
 static void request_ack(pmix_rank_t from, signature_t* sig, pmix_rank_t ack_id);
 // Remove local tracking and ack to parent
 static void finish_op(op_t *op);
-// Finish every op that is now both complete and next in op-id order
+// Finish every op whose subtree has reported. Ops are held in op-id order
+// and finish_op is what enforces that they retire in it
 static void drive_completions(void);
 // Give up on this op's exchange and get the payload the tree way
 static void tree_whole_forward(op_t *op);
-// How this broadcast will travel - decided by its originator, and only there
-// Is an op ahead of this one in op-id order still waiting on its payload?
 
 
 // Pack the xcast message forwarded to our children.  Takes no destination:
@@ -274,7 +273,10 @@ int prte_grpcomm_xcast_nb(prte_rml_tag_t tag, pmix_data_buffer_t *msg,
             PMIX_ERROR_LOG(rc);
             PMIx_Data_buffer_destruct(&msg_copy);
             PMIX_RELEASE(op);
-            return rc;
+            /* this entry point answers in PRTE codes - callers log it with
+             * PRTE_ERROR_LOG and at least one runs it back through
+             * prte_pmix_convert_rc(), which would mistranslate a PMIx status */
+            return prte_pmix_convert_status(rc);
         }
 
         PMIx_Data_unload(&msg_copy, &op->msg);
@@ -285,10 +287,10 @@ int prte_grpcomm_xcast_nb(prte_rml_tag_t tag, pmix_data_buffer_t *msg,
      * access framework-global data safely */
 
     prte_event_set(prte_event_base, &op->ev, -1, PRTE_EV_WRITE, begin_xcast, op);
-    PMIX_POST_OBJECT(&op);
+    PMIX_POST_OBJECT(op);
     prte_event_active(&op->ev, PRTE_EV_WRITE, 1);
 
-    return PMIX_SUCCESS;
+    return PRTE_SUCCESS;
 }
 
 void prte_grpcomm_xcast_recv(
@@ -308,12 +310,11 @@ void prte_grpcomm_xcast_recv(
     signature_t sig;
     if(PMIX_SUCCESS != unpack_sig(buffer, &sig)) return;
 
-    /* An op-id of zero is an originator relaying to the controller, not a
-     * forward down the tree. The distinction decides how the payload that
-     * follows is laid out: the relay always carries it whole, because that hop
-     * is an ordinary point-to-point send even when the broadcast is going to
-     * Capture it before the controller stamps an id
-     * on the signature below. */
+    /* An op-id of zero is an originator relaying to the controller rather than
+     * a forward down the tree; the controller stamps the real id below. The
+     * two carry the same fields in the same order - pack_relay_msg and
+     * pack_forward_msg are deliberately identical - so nothing downstream has
+     * to tell them apart. */
 
     // A daemon that has never seen any xcast (op_id_inited == 0) yet is being
     // handed an op is a *late joiner*: a daemon grown into a running DVM, or one
@@ -419,7 +420,8 @@ void prte_grpcomm_xcast_recv(
     PMIX_OUTPUT_VERBOSE((
         1, prte_grpcomm_globals.output,
         "%s grpcomm:xcast:recv: new xcast of tag %u with op_id %lu",
-        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), op->msg_tag, sig.op_id
+        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), (unsigned) op->msg_tag,
+        (unsigned long) sig.op_id
     ));
 
     // We need to process (invoke the user msg's callback, generally) and
@@ -575,16 +577,6 @@ void prte_grpcomm_xcast_fault_handler(
         }
     }
 
-    /* Any exchange still running has lost a participant, and no rearrangement
-     * of the survivors can produce the block that participant owed. Give up on
-     * it and let the payload come down the repaired tree instead. Done after
-     * the tree work above so the replays it sends go to the new children. */
-    {
-        op_t* op;
-        op_t* next_op;
-        PMIX_LIST_FOREACH_SAFE(op, next_op, &XCAST.ops, op_t){
-        }
-    }
     drive_completions();
 }
 
@@ -592,14 +584,17 @@ static void begin_xcast(int sd, short args, void* cbdata){
     PRTE_HIDE_UNUSED_PARAMS(sd, args);
 
     op_t* op = (op_t*) cbdata;
-    PMIX_ACQUIRE_OBJECT(&op);
+    PMIX_ACQUIRE_OBJECT(op);
 
 
     // setup the payload
     pmix_data_buffer_t *xcast_msg = PMIx_Data_buffer_create();
+    /* the packers answer in PMIx statuses - PRTE_RML_RELIABLE_SEND below
+     * answers in PRTE codes, so the two failures below are logged through
+     * different decoders on purpose */
     int rc = pack_relay_msg(xcast_msg, op);
     if (PMIX_SUCCESS != rc) {
-        PRTE_ERROR_LOG(rc);
+        PMIX_ERROR_LOG(rc);
         PMIX_DATA_BUFFER_RELEASE(xcast_msg);
         PMIX_RELEASE(op);
         return;
@@ -669,8 +664,9 @@ static void send_ack_msg(
     } else {
         PRTE_RML_SEND(ret, dest, msg, PRTE_RML_TAG_XCAST_ACK);
     }
-    if(PMIX_SUCCESS != ret){
-        PMIX_ERROR_LOG(ret);
+    /* the RML answers in PRTE codes, unlike the packers above */
+    if(PRTE_SUCCESS != ret){
+        PRTE_ERROR_LOG(ret);
         PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_FORCED_EXIT);
         PMIx_Data_buffer_release(msg);
     }
@@ -985,9 +981,10 @@ static prte_rml_payload_t* build_forward_payload(op_t* op){
     pmix_data_buffer_t* xcast_msg = PMIx_Data_buffer_create();
     prte_rml_payload_t* payload;
 
+    /* pack_forward_msg answers in PMIx statuses */
     int rc = pack_forward_msg(xcast_msg, op);
     if (PMIX_SUCCESS != rc) {
-        PRTE_ERROR_LOG(rc);
+        PMIX_ERROR_LOG(rc);
         PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_FORCED_EXIT);
         PMIX_DATA_BUFFER_RELEASE(xcast_msg);
         return NULL;
@@ -1054,6 +1051,23 @@ static void process_wireup(pmix_data_buffer_t *msg){
        return;
     }
 
+    /* the collective recovery epoch the DVM has reached.  This is how a daemon
+     * that joined an already-recovered DVM learns it: the failure notices that
+     * moved the epoch were broadcast before this daemon was routable, so they
+     * never arrived, and its contributions would be dropped as stale forever
+     * after (see the epoch member of prte_rml_recovery_status_t).  Adopting is
+     * by highest value seen, so a daemon already at or past this one is
+     * unaffected and no in-flight notice can be undone by a late wireup. */
+    uint32_t epoch = 0;
+    int ecnt = 1;
+    ret = PMIx_Data_unpack(NULL, msg, &epoch, &ecnt, PMIX_UINT32);
+    if(PMIX_SUCCESS != ret){
+       PMIX_ERROR_LOG(ret);
+       PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_FORCED_EXIT);
+       return;
+    }
+    prte_grpcomm_advance_epoch(epoch);
+
     pmix_value_t val = PMIX_VALUE_STATIC_INIT;
     pmix_value_t sval = PMIX_VALUE_STATIC_INIT;
     pmix_proc_t dmn;
@@ -1099,6 +1113,11 @@ static void process_wireup(pmix_data_buffer_t *msg){
         if(PMIX_SUCCESS != ret){ PMIX_ERROR_LOG(ret); break; }
     } while(PMIX_SUCCESS == ret);
 
+    /* Reaching here means the loop broke on a real unpack failure - a wireup
+     * we cannot read leaves this daemon with no route to anyone, so it ends
+     * the job. The clean end of the record stream is the
+     * READ_PAST_END_OF_BUFFER return inside the loop, which is why that one
+     * is a return and not a break. */
     if(val.type != PMIX_UNDEF) PMIx_Value_destruct(&val);
     if(sval.type != PMIX_UNDEF) PMIx_Value_destruct(&sval);
     PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_FORCED_EXIT);
@@ -1131,6 +1150,9 @@ static void process_msg(op_t* op){
         ret = PMIx_Data_embed(msg, &op->msg);
     }
     if(PMIX_SUCCESS != ret){
+        /* this ends the DVM, so it must say why - the decompress failure
+         * above has its own show_help, and this path had nothing at all */
+        PMIX_ERROR_LOG(ret);
         PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_FORCED_EXIT);
         PMIx_Data_buffer_release(msg);
         return;
@@ -1162,7 +1184,10 @@ static void op_con(op_t* p)
     p->replay_pending_parent = false;
 
     p->nreported = 0;
-    p->nexpected = -1;
+    /* "not yet computed" - forward_op() sets the real count. Deliberately the
+     * largest value rather than zero, so an op that has not been forwarded can
+     * never satisfy op_ready() and retire without having been sent anywhere */
+    p->nexpected = SIZE_MAX;
     p->ack_id_up = 0;
     p->ack_id_down = 0;
 

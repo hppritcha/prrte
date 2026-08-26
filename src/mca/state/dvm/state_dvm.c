@@ -265,11 +265,12 @@ static void init_complete(int sd, short args, void *cbdata)
 static void vm_ready(int fd, short args, void *cbdata)
 {
     prte_state_caddy_t *caddy = (prte_state_caddy_t *) cbdata;
-    int rc, i;
+    int rc;
     pmix_data_buffer_t buf;
     prte_job_t *jptr;
     prte_proc_t *dmn;
     int32_t v;
+    uint32_t epoch;
     pmix_value_t *val, *sval;
     pmix_status_t ret;
     PRTE_HIDE_UNUSED_PARAMS(fd, args);
@@ -308,6 +309,33 @@ static void vm_ready(int fd, short args, void *cbdata)
             rc = prte_util_pack_job_catchup(&buf, caddy->jdata);
             if (PRTE_SUCCESS != rc) {
                 PRTE_ERROR_LOG(rc);
+                PMIX_DATA_BUFFER_DESTRUCT(&buf);
+                PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_FORCED_EXIT);
+                PMIX_RELEASE(caddy);
+                return;
+            }
+
+            /* ...and the collective recovery epoch this DVM has reached.  A
+             * daemon that just joined starts at zero, and every fence or group
+             * contribution it makes is then dropped as stale by daemons that
+             * have recovered from a failure - or from an elastic shrink, which
+             * departs its daemon through the same machinery.  It cannot learn
+             * the epoch from the failure notices that moved it: those were
+             * broadcast while this daemon either did not exist or had not yet
+             * reported in, and a broadcast to a daemon with no contact info is
+             * dropped by design (prte_oob_base_send_nb).  This message is
+             * built only once every expected daemon HAS reported, so it is the
+             * first thing that can carry the value to one of them.  Daemons
+             * already at this epoch take it as a no-op.
+             *
+             * The epoch we have applied, rather than the last one issued: a
+             * notice still in flight will also reach the new daemon, which is
+             * routable by now, and the epoch is adopted by highest value seen
+             * so the two orders agree. */
+            epoch = prte_grpcomm_current_epoch();
+            rc = PMIx_Data_pack(NULL, &buf, &epoch, 1, PMIX_UINT32);
+            if (PMIX_SUCCESS != rc) {
+                PMIX_ERROR_LOG(rc);
                 PMIX_DATA_BUFFER_DESTRUCT(&buf);
                 PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_FORCED_EXIT);
                 PMIX_RELEASE(caddy);
@@ -434,13 +462,7 @@ static void vm_ready(int fd, short args, void *cbdata)
             close(prte_state_base.parent_fd);
             prte_state_base.parent_fd = -1;
         }
-        for (i = 0; i < prte_cache->size; i++) {
-            jptr = (prte_job_t *) pmix_pointer_array_get_item(prte_cache, i);
-            if (NULL != jptr) {
-                pmix_pointer_array_set_item(prte_cache, i, NULL);
-                prte_plm.spawn(jptr);
-            }
-        }
+        prte_plm_base_release_cached_jobs();
         /* progress the job */
         caddy->jdata->state = PRTE_JOB_STATE_VM_READY;
         PMIX_RELEASE(caddy);
@@ -518,7 +540,7 @@ static void ready_for_debug(int fd, short args, void *cbdata)
     void *tinfo;
     pmix_status_t rc;
     int n;
-    char *name;
+    char *name, *bkpt;
     prte_app_context_t *app;
     PRTE_HIDE_UNUSED_PARAMS(fd, args);
 
@@ -537,6 +559,17 @@ static void ready_for_debug(int fd, short args, void *cbdata)
     PMIX_PROC_RELEASE(nptr);
     /* pass the nspace of the job */
     PMIX_INFO_LIST_ADD(rc, tinfo, PMIX_NSPACE, jdata->nspace, PMIX_STRING);
+    /* a READY_FOR_DEBUG event is supposed to say WHERE the processes are
+     * waiting.  If the user named the breakpoint, that is the answer - the
+     * procs cannot have reported ready anywhere else.  We have nothing to
+     * say when they did not: a process that stops at a place of its own
+     * choosing reports the name to its local daemon, and that name does not
+     * travel with the daemon's aggregated report to us. */
+    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_BREAKPOINT,
+                           (void **) &bkpt, PMIX_STRING)) {
+        PMIX_INFO_LIST_ADD(rc, tinfo, PMIX_BREAKPOINT, bkpt, PMIX_STRING);
+        free(bkpt);
+    }
     for (n=0; n < jdata->apps->size; n++) {
         app = (prte_app_context_t *) pmix_pointer_array_get_item(jdata->apps, n);
         if (NULL == app) {
@@ -747,6 +780,7 @@ static void check_complete_resume(int fd, short args, void *cbdata)
     int32_t index;
     pmix_proc_t pname;
     uint8_t command = PRTE_PMIX_PURGE_PROC_CMD;
+    size_t ninfo;
     pmix_data_buffer_t *buf;
     pmix_pointer_array_t procs;
     prte_app_context_t *app;
@@ -862,6 +896,16 @@ static void check_complete_resume(int fd, short args, void *cbdata)
         /* pack the nspace to be purged */
         pname.rank = PMIX_RANK_WILDCARD;
         rc = PMIx_Data_pack(NULL, buf, &pname, 1, PMIX_PROC);
+        if (PMIX_SUCCESS != rc) {
+            PMIX_ERROR_LOG(rc);
+            PMIX_DATA_BUFFER_RELEASE(buf);
+            goto release;
+        }
+        /* no directives of our own - the count still has to be there, as
+         * the command carries one and the reader unpacks it
+         * unconditionally */
+        ninfo = 0;
+        rc = PMIx_Data_pack(NULL, buf, &ninfo, 1, PMIX_SIZE);
         if (PMIX_SUCCESS != rc) {
             PMIX_ERROR_LOG(rc);
             PMIX_DATA_BUFFER_RELEASE(buf);
@@ -1079,10 +1123,90 @@ static void cleanup_job(int sd, short args, void *cbdata)
             }
             PMIX_PROC_RELEASE(nptr);
         }
+        /* From here on, the answer to a question about this job is "not
+         * found" rather than "wait" - and the difference is a hang.  A
+         * lookup that fails cannot tell a job we have not heard of YET from
+         * one that has been and gone, so it assumes the first and parks the
+         * request; nothing drains that on a timer.  The daemons record their
+         * own departures where they release their copy of the job
+         * (PRTE_DAEMON_CONT_CLEANUP_JOB); this is the master's copy, and its
+         * lifecycle is here. */
+        prte_pmix_server_job_departed(caddy->jdata->nspace);
         PMIX_RELEASE(caddy->jdata);
     }
     PMIX_RELEASE(caddy);
 }
+
+#ifdef PMIX_SPAWN_TREE_ROOT
+/* Do these two namespaces name the same thing?
+ *
+ * NOT PMIX_CHECK_NSPACE, which answers "true" the moment either side is
+ * empty - wildcard semantics that are right for a match against a request
+ * and wrong here.  Most jobs in a DVM carry an empty launcher, and reading
+ * every one of them as a member of whatever tree we are asking about would
+ * put a stranger's job in a tool's wait set. */
+static bool same_nspace(const char *a, const char *b)
+{
+    if (PMIX_NSPACE_INVALID(a) || PMIX_NSPACE_INVALID(b)) {
+        return false;
+    }
+    return (0 == strncmp(a, b, PMIX_MAX_NSLEN));
+}
+
+/* The root of the spawn tree JDATA belongs to.  prte_job_t::launcher already
+ * holds it, recorded when the job was created and copied transitively from
+ * the parent, so a grandchild names the same root as its parent does.  It is
+ * empty only for a job nobody spawned - the primary job of a prterun, or of a
+ * prun whose tool namespace never got a job object - and such a job is the
+ * root of its own tree. */
+static const char *spawn_tree_root(prte_job_t *jdata)
+{
+    if (PMIX_NSPACE_INVALID(jdata->launcher)) {
+        return jdata->nspace;
+    }
+    return jdata->launcher;
+}
+
+/* How many jobs in ROOT's spawn tree have yet to terminate, not counting
+ * JDATA, whose termination is being reported.
+ *
+ * A job is in the tree if it names ROOT as its launcher, or if it IS the root
+ * - the latter matters when the root is a job rather than a tool, so that a
+ * child ending while its parent is still alive does not report an empty tree.
+ * Tool job objects are skipped: a tool is a namespace the DVM tracks, not a
+ * job that ever reaches a terminal state, so counting one would leave the
+ * tree permanently non-empty.
+ *
+ * "Not yet terminated" is the same test check_complete() applies when a
+ * non-persistent DVM decides whether it can shut down, and deliberately so:
+ * the whole point is that a tool watching a persistent DVM can now wait for
+ * exactly what prterun waits for. */
+static uint32_t spawn_tree_active(prte_job_t *jdata, const char *root)
+{
+    prte_job_t *jptr;
+    uint32_t count = 0;
+    int i;
+
+    for (i = 0; i < prte_job_data->size; i++) {
+        jptr = (prte_job_t *) pmix_pointer_array_get_item(prte_job_data, i);
+        if (NULL == jptr || jptr == jdata) {
+            continue;
+        }
+        if (PMIX_CHECK_NSPACE(jptr->nspace, PRTE_PROC_MY_NAME->nspace) ||
+            PRTE_FLAG_TEST(jptr, PRTE_JOB_FLAG_TOOL)) {
+            continue;
+        }
+        if (!same_nspace(jptr->launcher, root) &&
+            !same_nspace(jptr->nspace, root)) {
+            continue;
+        }
+        if (jptr->state < PRTE_JOB_STATE_TERMINATED) {
+            ++count;
+        }
+    }
+    return count;
+}
+#endif
 
 static void dvm_notify(int sd, short args, void *cbdata)
 {
@@ -1103,6 +1227,10 @@ static void dvm_notify(int sd, short args, void *cbdata)
     pmix_data_range_t range = PMIX_RANGE_SESSION;
     pmix_status_t code, ret;
     char *errmsg = NULL;
+#ifdef PMIX_SPAWN_TREE_ROOT
+    const char *treeroot;
+    uint32_t treeactive;
+#endif
     PRTE_HIDE_UNUSED_PARAMS(sd, args);
 
     PMIX_OUTPUT_VERBOSE((2, prte_state_base_framework.framework_output,
@@ -1179,6 +1307,18 @@ static void dvm_notify(int sd, short args, void *cbdata)
         if (0 < xcode) {
             ++ninfo;
         }
+#ifdef PMIX_SPAWN_TREE_ROOT
+        /* Which spawn tree this job belonged to, and what is left of it.
+         * A tool that launched the root of the tree cannot work either out
+         * for itself: it is told when a job ends, never when one starts, so
+         * at the moment its own job ends it has no way to know whether
+         * anything it started is still running - nor, when some later job
+         * ends, whether that job descended from it or belongs to another
+         * user of the same persistent DVM. */
+        treeroot = spawn_tree_root(jdata);
+        treeactive = spawn_tree_active(jdata, treeroot);
+        ninfo += 2;
+#endif
         PMIX_INFO_CREATE(info, ninfo);
         n = 0;
         /* ensure this only goes to the job terminated event handler */
@@ -1194,6 +1334,10 @@ static void dvm_notify(int sd, short args, void *cbdata)
             pname.rank = PMIX_RANK_WILDCARD;
         }
         PMIX_INFO_LOAD(&info[n++], PMIX_EVENT_AFFECTED_PROC, &pname, PMIX_PROC);
+#ifdef PMIX_SPAWN_TREE_ROOT
+        PMIX_INFO_LOAD(&info[n++], PMIX_SPAWN_TREE_ROOT, treeroot, PMIX_STRING);
+        PMIX_INFO_LOAD(&info[n++], PMIX_SPAWN_TREE_ACTIVE, &treeactive, PMIX_UINT32);
+#endif
         /* and what the application exited with, when that is a thing */
         if (0 < xcode) {
             PMIX_INFO_LOAD(&info[n++], PMIX_EXIT_CODE, &xcode, PMIX_INT);

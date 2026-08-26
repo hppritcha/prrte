@@ -89,11 +89,6 @@ static void wildcard_reg_complete(pmix_status_t status, void *cbdata)
     PMIX_RELEASE(req);
 }
 
-/* answering a dmodex from the job object rather than from the hosting
- * daemon - defined below, next to the key set they cover */
-static bool derivable_key(const char *key);
-static pmix_status_t derive_proc_data(prte_job_t *jdata, prte_proc_t *proct,
-                                      pmix_data_buffer_t *buf);
 static void derived_relfn(void *cbdata);
 
 static void dmodex_req(int sd, short args, void *cbdata)
@@ -179,10 +174,35 @@ static void dmodex_req(int sd, short args, void *cbdata)
 
     /* lookup who is hosting this proc */
     if (NULL == (jdata = prte_get_job_data_object(req->tproc.nspace))) {
-        /* if we don't know the job, then it could be a race
-         * condition where we are being asked about a process
-         * that we don't know about yet. In this case, just
-         * record the request and we will process it later */
+        /* Two very different situations bring us here, and only one of them
+         * is worth waiting for.
+         *
+         * A job we have not heard of YET is a race - the requestor got the
+         * namespace from somewhere and our own record of it is still on its
+         * way - so park the request and answer it when the job turns up.
+         *
+         * A job that has already FINISHED is never coming back.  Its object
+         * was released when it terminated, so parking a request on it parks
+         * it forever: nothing drains this array on a timer, and PMIx
+         * deliberately sets no timeout on a host request so as not to race
+         * us.  That is a real hang, and an easy one to hit - a process that
+         * asks about a job it just spawned (PMIx_Get of the child's job
+         * size; examples/dynamic.c does exactly this) wedges permanently if
+         * the child was short-lived enough to be gone before the question
+         * arrived.  The bigger the job, the longer the question takes to
+         * arrive, and the likelier that is.
+         *
+         * So refuse what we can prove is over rather than waiting on it.
+         * PMIX_ERR_NOT_FOUND is the truth and is what the caller's PMIx_Get
+         * returns; what we must not do is leave them holding. */
+        if (prte_pmix_server_job_has_departed(req->tproc.nspace)) {
+            pmix_output_verbose(2, prte_pmix_server_globals.output,
+                                "%s DMODX REQ FOR %s:%u - JOB HAS ENDED",
+                                PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                                req->tproc.nspace, req->tproc.rank);
+            prc = PMIX_ERR_NOT_FOUND;
+            goto callback;
+        }
         req->local_index = pmix_pointer_array_add(&prte_pmix_server_globals.local_reqs, req);
         return;
     }
@@ -192,6 +212,29 @@ static void dmodex_req(int sd, short args, void *cbdata)
      * it - so just register the nspace so the local PMIx server gets it. The
      * registration completes asynchronously */
     if (PMIX_RANK_WILDCARD == req->tproc.rank) {
+        /* ...but that registration is assembled from the job's map, and the
+         * map is not always there.  It is created when the job is mapped and
+         * released again the moment the job completes
+         * (check_complete_resume), while the job object itself survives until
+         * cleanup_job runs as a later event - and only cleanup_job records
+         * the departure the guard above tests.  So a request landing in
+         * between finds a jdata that is present, is not yet "departed", and
+         * has nothing left to say about placement;
+         * prte_pmix_server_register_nspace() walks map->nodes and takes the
+         * daemon down.  That window is easy to hit exactly where the comment
+         * above says it is - a parent asking about the child it just spawned
+         * (examples/dynamic.c) when the child was short-lived.
+         *
+         * Refuse it the way the proc-level branch below refuses a proc the
+         * mapper has not placed: PMIX_ERR_NOT_FOUND is the truth, and it is
+         * what the caller's PMIx_Get returns. */
+        if (NULL == jdata->map) {
+            pmix_output_verbose(2, prte_pmix_server_globals.output,
+                                "%s DMODX REQ FOR %s:WILDCARD - JOB IS NO LONGER MAPPED",
+                                PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), req->tproc.nspace);
+            prc = PMIX_ERR_NOT_FOUND;
+            goto callback;
+        }
         rc = prte_pmix_server_register_nspace(jdata, wildcard_reg_complete, req);
         if (PRTE_SUCCESS != rc) {
             prc = prte_pmix_convert_rc(rc);
@@ -233,12 +276,22 @@ static void dmodex_req(int sd, short args, void *cbdata)
      * that is an answer eager publication would have had in hand.  Requiring
      * a live daemon here would turn it into a failure. */
     if (prte_pmix_server_globals.lazy_procdata && !refresh_cache &&
-        derivable_key(req->key)) {
+        prte_pmix_server_derivable_key(req->key) &&
+        /* ...but not a binding we do not hold.  The launch message scatters
+         * the cpusets, so a NULL one on a proc we do not host means "never
+         * sent", not "not bound", and answering either way would be a
+         * guess.  Send it to the daemon that forks the proc, which answers
+         * this same closed set of keys straight out of its job object
+         * (pmix_server_dmdx_recv) rather than out of anything the process
+         * has to have published. */
+        (NULL != proct->cpuset || proct->parent == PRTE_PROC_MY_NAME->rank ||
+         (!PMIx_Check_key(req->key, PMIX_CPUSET) &&
+          !PMIx_Check_key(req->key, PMIX_LOCALITY_STRING)))) {
         pmix_data_buffer_t dbuf;
         pmix_byte_object_t bo;
 
         PMIX_DATA_BUFFER_CONSTRUCT(&dbuf);
-        prc = derive_proc_data(jdata, proct, &dbuf);
+        prc = prte_pmix_server_derive_proc_data(jdata, proct, &dbuf);
         if (PMIX_SUCCESS == prc) {
             PMIX_DATA_BUFFER_UNLOAD(&dbuf, bo.bytes, bo.size);
             PMIX_DATA_BUFFER_DESTRUCT(&dbuf);
@@ -365,7 +418,7 @@ callback:
  * the values ourselves with PMIx_Data_store_internal would put them in the
  * INTERNAL scope, which that lookup does not reach.
  */
-static bool derivable_key(const char *key)
+bool prte_pmix_server_derivable_key(const char *key)
 {
     if (NULL == key) {
         /* no key named means "everything you have", and we do not have the
@@ -413,8 +466,8 @@ static pmix_status_t pack_derived(pmix_data_buffer_t *buf, const char *key,
 /* Build the blob describing one proc.  Mirrors the per-proc section of
  * prte_pmix_server_register_nspace() - if a key is added there and a peer can
  * ask for it, it belongs here too, or that key becomes a wire round trip. */
-static pmix_status_t derive_proc_data(prte_job_t *jdata, prte_proc_t *proct,
-                                      pmix_data_buffer_t *buf)
+pmix_status_t prte_pmix_server_derive_proc_data(prte_job_t *jdata, prte_proc_t *proct,
+                                               pmix_data_buffer_t *buf)
 {
     pmix_status_t rc;
     pmix_rank_t vpid;
@@ -491,10 +544,15 @@ static pmix_status_t derive_proc_data(prte_job_t *jdata, prte_proc_t *proct,
         if (PMIX_SUCCESS != rc) {
             return rc;
         }
-    } else {
-        /* an unbound proc still has to answer the locality question, and the
+    } else if (proct->parent == PRTE_PROC_MY_NAME->rank) {
+        /* An unbound proc still has to answer the locality question, and the
          * answer is "nothing to say" - the eager path registers a NULL for
-         * exactly this case */
+         * exactly this case.  Only for a proc we HOST, though: for any other,
+         * a NULL cpuset means the launch message scattered the bindings and
+         * we were not sent this one, which is a different statement.  The
+         * caller above has already refused to derive those two keys in that
+         * case, so what is left here is a request for some other key on a
+         * proc whose binding we cannot speak to - leave both out. */
         PACK_DERIVED(rc, buf, PMIX_LOCALITY_STRING, PMIX_STRING, data.string = NULL);
         if (PMIX_SUCCESS != rc) {
             return rc;

@@ -912,6 +912,20 @@ static int test_hostfile(void)
     PMIX_LIST_DESTRUCT(&nodes);
 
     /*
+     * ...and so is a path that exists but is not a regular file. This is not
+     * pedantry: fopen() opens a directory quite happily, every read from the
+     * result fails with EISDIR, and the lexer does not tell that apart from
+     * "no input yet" - so it spun, and "prun --hostfile /tmp" hung the tool
+     * forever instead of reporting a typo. The refusal has to happen before
+     * the file is opened, which is what this pins.
+     */
+    PMIX_CONSTRUCT(&nodes, pmix_list_t);
+    rc = prte_util_add_hostfile_nodes(&nodes, ".");
+    CHECK("a directory is refused, not parsed", PRTE_SUCCESS != rc);
+    CHECK("and contributed no nodes", 0 == pmix_list_get_size(&nodes));
+    PMIX_LIST_DESTRUCT(&nodes);
+
+    /*
      * A syntax error has to be refused - and, because the parser is a
      * process-global flex scanner reading a process-global FILE*, it also has
      * to leave nothing behind: the good hostfile parsed immediately
@@ -939,6 +953,91 @@ static int test_hostfile(void)
     CHECK("with the same slot count", NULL != nd && 4 == nd->slots);
     PMIX_LIST_DESTRUCT(&nodes);
     unlink(badpath);
+
+    /*
+     * "user@host" names a host and the account to reach it with. Anything
+     * carrying a second "@" is neither a hostname nor a "user@hostname",
+     * and it has to be refused - by name, file and line, like every other
+     * parse failure here. It used to print a bare "WARNING: Unhandled
+     * user@host-combination" through pmix_output and abandon the rest of
+     * the file, naming neither the file nor the line, which is the least
+     * that was said about any failure and the one a user is most likely to
+     * reach by typo. Both token classes that can carry a name have to
+     * refuse it, so check the plain entry and the "rank N=<host>" form.
+     */
+    if (NULL == write_hostfile("hostA\n"
+                               "someone@hostB\n",
+                               badpath, sizeof(badpath))) {
+        fprintf(stderr, "FAIL [hostfile]: could not write a temp hostfile\n");
+        unlink(path);
+        return failures + 1;
+    }
+    PMIX_CONSTRUCT(&nodes, pmix_list_t);
+    rc = prte_util_add_hostfile_nodes(&nodes, badpath);
+    CHECK("a user@host entry parses", PRTE_SUCCESS == rc);
+    nd = find_node(&nodes, "hostB");
+    CHECK("and the host is the part after the @", NULL != nd);
+    if (NULL != nd) {
+        char *uname = NULL;
+        CHECK("and the user is the part before it",
+              prte_get_attribute(&nd->attributes, PRTE_NODE_USERNAME, (void **) &uname,
+                                 PMIX_STRING)
+                  && NULL != uname && 0 == strcmp("someone", uname));
+        if (NULL != uname) {
+            free(uname);
+        }
+    }
+    PMIX_LIST_DESTRUCT(&nodes);
+    unlink(badpath);
+
+    if (NULL == write_hostfile("hostA\n"
+                               "someone@else@hostB\n"
+                               "hostC\n",
+                               badpath, sizeof(badpath))) {
+        fprintf(stderr, "FAIL [hostfile]: could not write a temp hostfile\n");
+        unlink(path);
+        return failures + 1;
+    }
+    PMIX_CONSTRUCT(&nodes, pmix_list_t);
+    rc = prte_util_add_hostfile_nodes(&nodes, badpath);
+    CHECK("a second @ in a host entry is refused", PRTE_SUCCESS != rc);
+    PMIX_LIST_DESTRUCT(&nodes);
+    unlink(badpath);
+
+    if (NULL == write_hostfile("rank 0=someone@else@hostB\n",
+                               badpath, sizeof(badpath))) {
+        fprintf(stderr, "FAIL [hostfile]: could not write a temp hostfile\n");
+        unlink(path);
+        return failures + 1;
+    }
+    PMIX_CONSTRUCT(&nodes, pmix_list_t);
+    rc = prte_util_add_hostfile_nodes(&nodes, badpath);
+    CHECK("a second @ in a rank entry is refused", PRTE_SUCCESS != rc);
+    PMIX_LIST_DESTRUCT(&nodes);
+    unlink(badpath);
+
+    /*
+     * A "rank N" that never reaches its "=" runs the lexer to the end of the
+     * file looking for one, and reported nothing at all when it got there -
+     * the user was handed an error logged against a line of our own source.
+     */
+    if (NULL == write_hostfile("rank 0\n", badpath, sizeof(badpath))) {
+        fprintf(stderr, "FAIL [hostfile]: could not write a temp hostfile\n");
+        unlink(path);
+        return failures + 1;
+    }
+    PMIX_CONSTRUCT(&nodes, pmix_list_t);
+    rc = prte_util_add_hostfile_nodes(&nodes, badpath);
+    CHECK("a rank entry with no host is refused", PRTE_SUCCESS != rc);
+    PMIX_LIST_DESTRUCT(&nodes);
+    unlink(badpath);
+
+    /* and the file the parser gave up on left nothing behind for the next */
+    PMIX_CONSTRUCT(&nodes, pmix_list_t);
+    rc = prte_util_add_hostfile_nodes(&nodes, path);
+    CHECK("a good hostfile still parses after a refused @", PRTE_SUCCESS == rc);
+    CHECK("and reads its three hosts", 3 == pmix_list_get_size(&nodes));
+    PMIX_LIST_DESTRUCT(&nodes);
 
     /* filtering an allocation down to what a hostfile names */
     PMIX_CONSTRUCT(&nodes, pmix_list_t);

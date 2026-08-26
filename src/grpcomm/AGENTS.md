@@ -74,7 +74,7 @@ removed.
 `xcast` forwards the whole payload down the routing tree, `fence` rolls up
 to the controller which broadcasts the answer back. A lateral
 scatter/allgather pair for each was built and then removed — see
-[`docs/plans/scalable_collectives.rst`](../../docs/plans/scalable_collectives.rst)
+[`docs/plans/scalable_collectives/`](../../docs/plans/scalable_collectives/)
 for what it was and why it went. If you are reintroducing one, read that
 first: the framing it needed (an out-of-order op hold, a partial-payload
 gate, a movement id on the wire and a disagreement interlock for the
@@ -145,17 +145,44 @@ always one thing.
 | Field | Meaning |
 |-------|---------|
 | `output` | Verbosity stream. `-1` until the `grpcomm_base_verbose` MCA parameter opens it. The parameter deliberately **keeps its old framework spelling**, because it is in every debugging recipe and in the guides. |
-| `context_id` | The group context-id pool. A construct asking for `PMIX_GROUP_ASSIGN_CONTEXT_ID` gets this value, and it **decrements** — it counts *down* from `UINT32_MAX` so DVM-assigned ids cannot collide with ids assigned from the bottom of the range elsewhere. |
+| `context_id` | The group context-id pool. A construct asking for `PMIX_GROUP_ASSIGN_CONTEXT_ID` gets this value, and it **decrements** — it counts *down* from `UINT32_MAX` so DVM-assigned ids cannot collide with ids assigned from the bottom of the range elsewhere. Spend it only through `prte_grpcomm_assign_context_id()`, which refuses a non-master caller: the group collective is no longer its only consumer (see below), and two doors onto one counter is how two callers end up with one id. |
 | `xcast_ops` | In-flight broadcasts, the `pending_completions` FIFO, and the three op-id sequence counters. |
-| `fence_ops` | List of `prte_grpcomm_fence_t`. |
+| `fence_ops` | List of `prte_grpcomm_fence_t`. A tracker is found here by its signature alone, so it must come **off** this list before its result is delivered — see *Retire before you deliver* below. |
 | `group_ops` | List of `prte_grpcomm_group_t`. |
 | `completed_group_ops` | Bounded memo of already-released group ops (see below). |
-| `recovery_epoch` | The collective recovery epoch, shared by fence and group: one failure, one restart, one epoch. |
+| `recovery_epoch` | The collective recovery epoch, shared by fence and group: one failure, one restart, one epoch. Issued by the master, absolute on the wire, adopted by highest value seen — see "The epoch" below. |
 
 Note the verbosity variable that backs the MCA parameter is at **file
 scope** in `grpcomm.c`, not a local: the MCA layer keeps the pointer it is
 handed and writes through it whenever the variable is set, so a stack slot
 would be a dangling write the moment registration returns.
+
+### Retire before you deliver
+
+**A fence tracker comes off `fence_ops` before its completion callback runs,
+not after.** The fence is over the moment its result is in hand; everything
+after that is delivery, and delivery is precisely when the next fence can
+start.
+
+The reason is that a fence signature is *only its participant list*. It
+carries nothing to distinguish one fence over a set of procs from the next
+fence over that same set. So when `fence_release()` runs the callback, the
+local clients' `PMIx_Fence` completes, and any of them may call `PMIx_Fence`
+again over the same participants immediately — and that lookup would find the
+tracker that has just been answered and is about to be released, joining a
+collective that is already finished.
+
+Both completion paths honor this, by different means:
+
+- `fence_release()` unlinks the tracker first, then delivers. It still holds
+  the reference that keeps the object alive across the callback.
+- the entry point's failure path leaves the tracker in place deliberately (a
+  later release from the controller still has to find it) and instead clears
+  `cbfunc`/`cbdata` so the participants cannot be completed twice.
+
+Do not "tidy" the unlink back down next to `PMIX_RELEASE(coll)`. It reads like
+teardown belonging together and it is not: one of those two is the end of the
+collective and the other is just freeing memory.
 
 ---
 
@@ -228,7 +255,7 @@ copy of the reliability machinery.
 The cost of the tree is `d*r*M*beta`: a daemon with `r` children puts `r` full
 copies of the payload on its outbound link at every level. That is the term a
 lateral movement was built to remove, and
-[`docs/plans/scalable_collectives.rst`](../../docs/plans/scalable_collectives.rst)
+[`docs/plans/scalable_collectives/`](../../docs/plans/scalable_collectives/)
 records both the attempt and why it was withdrawn.
 
 ### Compression, and why the threshold is not a size
@@ -431,6 +458,39 @@ The in-file comments are the real spec — read them. The load-bearing ideas:
   assuming its *newly-acquired* subtree finished ops it completed before
   promotion.
 
+### The forward is shared, and that changes what a send completion means
+
+`tree_whole_forward()` packs the forward **once** and hands the same
+`prte_rml_payload_t` to every child, because the bytes do not depend on the
+destination. Two consequences are easy to get wrong:
+
+- **A send takes its own reference, and only once it has accepted the
+  message.** `prte_rml_send_payload_cb_nb()` retains after every early
+  return, so a *refused* send leaves the caller's count exactly as it found
+  it — which is why `forward_payload_to()` has nothing to unwind on failure
+  and `tree_whole_forward()` drops exactly one reference of its own after
+  the loop.
+- **The completion callback is handed a NULL buffer.** For an ordinary
+  buffer send the callback owns the buffer; for a shared payload the buffer
+  belongs to the payload and the other destinations may still be
+  transmitting it, so `PRTE_RML_SEND_COMPLETE` passes NULL instead. That is
+  what lets `forward_lost()` pass its arguments straight through to
+  `prte_rml_send_callback()` without freeing a buffer `k-1` other sends are
+  still using.
+
+**A forward that fails synchronously ends the DVM; one that fails
+asynchronously only costs the op that subtree.** `forward_payload_to()`
+force-exits on a non-success return, while `forward_lost()` deliberately
+just drops `nexpected` — the same event, opposite reactions. What makes
+that safe is an invariant that lives in `src/rml`: `update_descendants()`
+replaces any child found in `failed_dmns` with its next living descendant,
+and it runs *after* `prte_rml_repair_routing_tree()` has marked the new
+failures — so a rank in `prte_rml_base.children` is never one
+`prte_rml_is_node_up()` calls down, and `PRTE_ERR_NODE_DOWN` is not a
+return this loop can actually see. A change on either side of that (a
+child set that can hold a failed rank, or a marking that moves after the
+repair) turns an ordinary daemon loss into a DVM teardown.
+
 ### Completion callbacks (the `pending_completions` FIFO)
 
 The op the master ends up *tracking* is a fresh one built on receipt, not
@@ -499,6 +559,34 @@ Nothing else is watching: the PMIx server library arms a timeout while it
 gathers the *local* contributions, then deletes it the instant the request
 is handed to the host — deliberately, so a late host answer cannot reach a
 tracker it already released.
+
+**A contribution can outlive the release that ended its fence, and nothing
+here can tell that from the next round.**  A fence signature is only its
+participant list — no round, no sequence number, nothing on the wire that
+distinguishes one fence over a set of procs from the next.  In the normal
+flow that costs nothing, because a daemon converges only when everything it
+expects has arrived, so nothing *can* arrive afterwards.  But
+`abort_fence_op()` ends a fence early — on a `PMIX_TIMEOUT`, and on a
+participant lost to a failed daemon — and a contribution still climbing the
+tree then reaches a daemon whose tracker the release already retired.
+`fence_recv()` builds a new tracker for it, and the next fence over those
+same participants *finds* that tracker, inherits its `nreported` and its
+bucket, and can converge early carrying the previous round's data.
+
+**Do not fix this by copying `completed_group_ops`.**  The group memo works
+because a group is keyed by `groupID` + operation and `group()` drops the
+memo entry when a local client starts one.  A daemon relaying a fence for
+its subtree has no local client and would never drop the entry, so the next
+fence's legitimate contribution would be discarded — a hang, which is worse
+than the wrong answer it was meant to prevent.  On a pure relay a straggler
+and a new round are genuinely the same message, and a fence has no
+originator to stamp a round id: this is the same "every participant must
+reach the same answer independently" problem the withdrawn lateral fence
+ran into.  What would work is a per-signature *release count* — each daemon
+counts releases seen for a signature, stamps contributions with it, drops
+anything stamped lower — which is the recovery epoch's mechanism scoped to a
+signature.  That is a wire change and needs the dockerswarm harness; see
+[`docs/todo.rst`](../../docs/todo.rst).
 
 **A release with no local callback still has data to free.** A daemon
 holding a tracker only because it relayed for its subtree has no `cbfunc`
@@ -604,6 +692,31 @@ Three things about the shape are load-bearing:
 status; the normal non-success path then completes each daemon's local
 participants and deletes the tracker — so a cancel/abort tears down the
 collective **without tearing down the DVM**, which is the whole point.
+Only the controller may call it — it is the sole xcast source — and every
+caller sits behind a `PRTE_PROC_IS_MASTER` test for that reason.
+
+**The entry point owes the participant an answer on every path.**
+`prte_grpcomm_group()` has already returned `PMIX_SUCCESS` to the PMIx
+server by the time `group()` runs, so nothing upstream will fail the
+client if the handler bails out: a silent `return` leaves it blocked in
+`PMIx_Group_construct` with no collective in flight to release it. Every
+failure therefore leaves by the `error:` label. That label does two things
+and both are load-bearing — it invokes `cd->cbfunc` with the reason, and it
+first clears `coll->cbfunc`/`coll->cbdata`, because the tracker itself
+*stays* (a release from the controller, which can still abort the
+operation, has to find it) and a release arriving later would otherwise
+complete the same client a second time with the same `cbdata`. This is the
+same rule the fence entry point follows — see *Retire before you deliver*.
+
+**A controller that cannot build the release must abort, not return.** By
+the time `check_complete()` starts packing, `converged` is latched, so
+nothing will drive that tracker again — and on the controller the recovery
+restart deliberately skips a converged tracker, because its release is
+supposed to be on the wire already. A bare `return` out of the packing
+therefore hangs *every* participant in the DVM, permanently. The `failed:`
+label instead falls back to `abort_group_op()`, whose message is only a
+signature plus a status and so is by far the smallest thing still worth
+trying to build.
 
 **`ft_collective` means "some *surviving* participant asked for it."** It
 is accumulated by sticky-OR as contributions merge, so a participant that
@@ -630,6 +743,39 @@ collectives, stamped on every `PRTE_RML_TAG_GROUP` and
 `PRTE_RML_TAG_FENCE` message as `[epoch][body]`. A contribution stamped
 older than the receiver's epoch belongs to a round that no longer exists
 and is dropped before it is merged.
+
+**The value is the master's, and absolute.** The DVM master issues it —
+`prte_grpcomm_issue_epoch()`, called once per global failure notice it
+emits — and packs it into that notice; every daemon adopts what it is
+given (`prte_grpcomm_advance_epoch(status->epoch)`), taking the highest
+value it has seen. Each daemon counting the notices *it* received would be
+simpler and is wrong: the number would then be a function of delivery, so
+a daemon that missed one broadcast is a step behind for the rest of the
+DVM's life, with every contribution it offers dropped as stale and every
+collective over a job placed on it hung. That is not a hypothetical — a
+daemon launched by an elastic grow has missed **all** of them: the routing
+tree holds its vpid from the moment the grow records it, so a broadcast
+sent while its launch is in flight is addressed to a daemon with no
+contact info and is dropped by design (`prte_oob_base_send_nb`).
+
+An absolute value is also what makes the epoch **tellable**, which is the
+other half of the same problem. The `PRTE_RML_TAG_WIREUP` broadcast — sent
+once every expected daemon has reported in, and the first message that can
+reach a daemon which has just joined — carries `prte_grpcomm_current_epoch()`,
+and `process_wireup()` adopts it. Because adoption is by highest value
+seen, the seed and any notice still in flight commute: a daemon already at
+or past that epoch is unaffected, and a late wireup cannot walk anyone
+back. The issued counter is deliberately separate from the applied one:
+the master's own epoch does not move until its broadcast is relayed back
+to it, and a second failure inside that window would otherwise reissue the
+number the first notice is already carrying, collapsing two restarts into
+one — a hang, not a wrong answer.
+
+A daemon that joins a **bootstrapped** DVM, with no HNP-built wireup
+behind it, still starts at zero. `rml_base_dead_dmns` and the vpid holes
+the nidmap encodes carry the same limitation, and for the same reason:
+everything that repairs a late joiner's view of the DVM is something the
+HNP sends it.
 
 **Why a per-link round does not work here, and why one epoch does.** The
 obvious model is xcast's — `ack_id_down` chosen by the parent, echoed by
@@ -737,10 +883,46 @@ previous one of that name is over.
   field is packed and unpacked unguarded, so every daemon in a DVM agrees
   on the message layout no matter what its PMIx advertised. Guard the
   *behaviour*, never the bytes.
+- **The trackers' `pmix_bitmap_init(&reported_slots, 1)` is deliberately
+  unchecked.** `pmix_bitmap_set_bit()` grows the bitmap on demand, and an
+  `init` that fails leaves `array_size` at zero behind a NULL pointer, so the
+  first slot recorded allocates and every accessor before that reads zero -
+  which is the right answer for a tracker nothing has reported to. A
+  constructor cannot fail anyway; do not add an abort here.
 - **One allocator per array.** The proc arrays on a signature are built
   with `PMIX_PROC_CREATE` and freed with `PMIX_PROC_FREE` everywhere —
   those allocate and free *inside the PMIx library*, so a plain `free()`
   crosses the library boundary.
+- **Never call `PMIx_Info_list_convert()` and reach for the array without
+  reading the status.** An empty list — the ordinary case for a construct
+  carrying no `PMIX_GROUP_INFO` and no endpoints — answers
+  `PMIX_ERR_EMPTY`, and on that early return PMIx is under no obligation to
+  have touched the `pmix_data_array_t` you handed it. Callers here pass an
+  *uninitialised stack* variable, so an unchecked call reads whatever was on
+  the stack for `.array`/`.size`, packs that many `pmix_info_t` from that
+  pointer, and then hands the same pointer to `PMIX_DATA_ARRAY_DESTRUCT`.
+  Current PMIx master initialises the argument before its first failure
+  return, but no *released* PMIx in the supported range does, and depending
+  on that is depending on the callee to clean up after the caller. Go
+  through `convert_info_list()` in `grpcomm_group.c`, which initialises the
+  array itself and answers an empty one on any failure, so what comes back
+  is always safe to pack from and to destruct.
+- **Three numbering schemes meet in `grpcomm_xcast.c`, and the mixture is
+  deliberate.** The `DIRECT_XCAST_PACK`/`_UNPACK` packers hand back
+  `PMIx_Data_pack`'s status, so `pack_sig`, `pack_msg`, `pack_relay_msg` and
+  `pack_forward_msg` answer in **PMIx** statuses; every `PRTE_RML_SEND*`
+  answers in **PRTE** codes. A function that does both — `send_ack_msg()`
+  is the clearest — needs two checks logged through two decoders, and
+  collapsing them into one "tidier" test logs half its failures against the
+  wrong table. `process_wireup()` looks worst of all, testing
+  `prte_util_decode_nidmap()` against `PMIX_SUCCESS` and
+  `prte_util_decode_job_catchup()` against `PRTE_SUCCESS` two lines apart:
+  both are right, because those two functions genuinely answer in different
+  numbering. Check the callee before making them agree.
+  The entry points themselves answer in **PRTE** codes, as the API table
+  above says — callers log them with `PRTE_ERROR_LOG` and at least one
+  (`pmix_server_monitor.c`) runs the result back through
+  `prte_pmix_convert_rc()`, which mistranslates a PMIx status.
 - Standard PRRTE rules: `prte_config.h` first, constant-on-left, braces
   everywhere, `PMIX_ERROR_LOG`/`PRTE_ERROR_LOG`, no new warnings.
 
@@ -760,6 +942,25 @@ live DVM) but it guards the invariants that hold with no DVM:
 - `prte_grpcomm_globals.context_id` starts at `UINT32_MAX`, and every
   signature/tracker/caddy class constructs with the documented defaults
   and destructs without leaking or crashing.
+
+### The pool has a second consumer, and it is not in this directory
+
+A group formed by `PMIx_Group_invite` runs **no collective at all** — it is
+realized entirely through PMIx event notification, so nothing ever reaches
+`prte_grpcomm_group()` and there is no signature to carry an `assignID`. Its
+leader asks for a context id through `PMIx_Job_control` instead, which lands
+on whichever daemon hosts that leader; see `assign_group_ctxid()` in
+[`src/prted/pmix/pmix_server_job_ctrl.c`](../prted/pmix/pmix_server_job_ctrl.c)
+and the `PRTE_PMIX_GROUP_CTXID` relay beside it.
+
+That is why the pool is now reached through `prte_grpcomm_assign_context_id()`
+rather than touched directly: the two paths spend from one counter, and the
+accessor is where "only the master may mint" is enforced once instead of at
+each caller. A leader is an application process and sits wherever it was
+mapped, so the job-control path is usually *not* on the master and has to
+relay — which is the half a single-host run cannot reach.
+`contrib/dockerswarm/groupinv.c` makes the highest rank the leader for exactly
+that reason.
 - **Building a fence tracker**: what a signature naming the daemon job, a
   signature naming nobody, and an unresolvable signature each produce —
   the last of which must leave *nothing* on the tracker list.

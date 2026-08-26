@@ -168,7 +168,7 @@ static void spawn(int sd, short args, void *cbdata)
     }
 
     /* pack the jdata object */
-    rc = prte_job_pack(buf, req->jdata);
+    rc = prte_job_pack(buf, req->jdata, PRTE_JOB_PACK_ALL);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
         pmix_pointer_array_set_item(&prte_pmix_server_globals.local_reqs, req->local_index, NULL);
@@ -315,6 +315,25 @@ int prte_pmix_xfer_job_info(prte_job_t *jdata,
                                    PRTE_ATTR_GLOBAL, tstr, PMIX_STRING);
                 free(tstr);
             }
+#endif
+
+#if defined(PMIX_SPAWN_ALLOC)
+            /***   ALLOCATION TO OBTAIN FIRST   ***/
+        } else if (PMIX_CHECK_KEY(info, PMIX_SPAWN_ALLOC)) {
+            /* An entire allocation request, to be served before this job is
+             * launched. It is carried through to the HNP unexamined - the HNP
+             * is where ras lives, and the only thing to be decided here is
+             * that the value is the shape the attribute calls for. Stored
+             * GLOBAL so the generic job-attribute pack loop forwards it. */
+            if (PMIX_DATA_ARRAY != info->value.type ||
+                NULL == info->value.data.darray ||
+                PMIX_INFO != info->value.data.darray->type ||
+                0 == info->value.data.darray->size) {
+                return PRTE_ERR_BAD_PARAM;
+            }
+            prte_set_attribute(&jdata->attributes, PRTE_JOB_SPAWN_ALLOC,
+                               PRTE_ATTR_GLOBAL, info->value.data.darray,
+                               PMIX_DATA_ARRAY);
 #endif
 
             /***   DISPLAY MAP   ***/
@@ -682,37 +701,40 @@ int prte_pmix_xfer_job_info(prte_job_t *jdata,
             prte_set_attribute(&jdata->attributes, PRTE_JOB_DEBUG_DAEMONS_PER_PROC,
                                PRTE_ATTR_GLOBAL, &info->value.data.uint16, PMIX_UINT16);
 
-            /* there can be multiple of these, so we add them to the attribute list */
         } else if (PMIX_CHECK_KEY(info, PMIX_ENVARS_HARVESTED)) {
             prte_set_attribute(&jdata->attributes, PRTE_JOB_ENVARS_HARVESTED,
                                PRTE_ATTR_GLOBAL, NULL, PMIX_BOOL);
+
+            /* envar directives are multi-valued, so append: prte_pmix_xfer_app()
+             * has already put app_idx 0's directives on this list under these
+             * keys, and prte_set_attribute() would overwrite the first one */
         } else if (PMIX_CHECK_KEY(info, PMIX_SET_ENVAR)) {
             envar.envar = info->value.data.envar.envar;
             envar.value = info->value.data.envar.value;
             envar.separator = info->value.data.envar.separator;
-            prte_set_attribute(&jdata->attributes, PRTE_JOB_SET_ENVAR,
-                               PRTE_ATTR_GLOBAL, &envar, PMIX_ENVAR);
+            prte_append_attribute(&jdata->attributes, PRTE_JOB_SET_ENVAR,
+                                  PRTE_ATTR_GLOBAL, &envar, PMIX_ENVAR);
         } else if (PMIX_CHECK_KEY(info, PMIX_ADD_ENVAR)) {
             envar.envar = info->value.data.envar.envar;
             envar.value = info->value.data.envar.value;
             envar.separator = info->value.data.envar.separator;
-            prte_set_attribute(&jdata->attributes, PRTE_JOB_ADD_ENVAR,
-                               PRTE_ATTR_GLOBAL, &envar, PMIX_ENVAR);
+            prte_append_attribute(&jdata->attributes, PRTE_JOB_ADD_ENVAR,
+                                  PRTE_ATTR_GLOBAL, &envar, PMIX_ENVAR);
         } else if (PMIX_CHECK_KEY(info, PMIX_UNSET_ENVAR)) {
-            prte_set_attribute(&jdata->attributes, PRTE_JOB_UNSET_ENVAR,
-                               PRTE_ATTR_GLOBAL, info->value.data.string, PMIX_STRING);
+            prte_append_attribute(&jdata->attributes, PRTE_JOB_UNSET_ENVAR,
+                                  PRTE_ATTR_GLOBAL, info->value.data.string, PMIX_STRING);
         } else if (PMIX_CHECK_KEY(info, PMIX_PREPEND_ENVAR)) {
             envar.envar = info->value.data.envar.envar;
             envar.value = info->value.data.envar.value;
             envar.separator = info->value.data.envar.separator;
-            prte_set_attribute(&jdata->attributes, PRTE_JOB_PREPEND_ENVAR,
-                               PRTE_ATTR_GLOBAL, &envar, PMIX_ENVAR);
+            prte_append_attribute(&jdata->attributes, PRTE_JOB_PREPEND_ENVAR,
+                                  PRTE_ATTR_GLOBAL, &envar, PMIX_ENVAR);
         } else if (PMIX_CHECK_KEY(info, PMIX_APPEND_ENVAR)) {
             envar.envar = info->value.data.envar.envar;
             envar.value = info->value.data.envar.value;
             envar.separator = info->value.data.envar.separator;
-            prte_set_attribute(&jdata->attributes, PRTE_JOB_APPEND_ENVAR,
-                               PRTE_ATTR_GLOBAL, &envar, PMIX_ENVAR);
+            prte_append_attribute(&jdata->attributes, PRTE_JOB_APPEND_ENVAR,
+                                  PRTE_ATTR_GLOBAL, &envar, PMIX_ENVAR);
 
         } else if (PMIX_CHECK_KEY(info, PMIX_SPAWN_TOOL)) {
             PRTE_FLAG_SET(jdata, PRTE_JOB_FLAG_TOOL);
@@ -831,6 +853,10 @@ int prte_pmix_xfer_app(prte_job_t *jdata, pmix_app_t *papp)
 
             } else if (PMIX_CHECK_KEY(info, PMIX_ADD_HOST)) {
                 prte_set_attribute(&app->attributes, PRTE_APP_ADD_HOST, PRTE_ATTR_GLOBAL,
+                                   info->value.data.string, PMIX_STRING);
+
+            } else if (PMIX_CHECK_KEY(info, PRTE_ACTIVATE_HOSTS)) {
+                prte_set_attribute(&app->attributes, PRTE_APP_ACTIVATE_HOSTS, PRTE_ATTR_GLOBAL,
                                    info->value.data.string, PMIX_STRING);
 
             } else if (PMIX_CHECK_KEY(info, PMIX_PREFIX)) {
@@ -1298,6 +1324,11 @@ static void connect_release(pmix_status_t status,
     }
 
 release:
+    /* the assemblage exists only if the collective that formed it succeeded */
+    if (PMIX_SUCCESS == status) {
+        prte_pmix_server_connection_report(md->procs, md->nprocs);
+    }
+
     /* now release the connect call */
     if (NULL != md->opcbfunc) {
         md->opcbfunc(rc, md->cbdata);
@@ -1315,6 +1346,7 @@ pmix_status_t pmix_server_connect_fn(const pmix_proc_t procs[], size_t nprocs,
                                      pmix_op_cbfunc_t cbfunc, void *cbdata)
 {
     prte_pmix_server_req_t *cd;
+    pmix_byte_object_t bo;
     size_t n;
     pmix_status_t rc;
 
@@ -1332,6 +1364,12 @@ pmix_status_t pmix_server_connect_fn(const pmix_proc_t procs[], size_t nprocs,
      * for "remote" scope */
 
     cd = PMIX_NEW(prte_pmix_server_req_t);
+    /* keep the membership: once the fence says the connect completed, the DVM
+     * master has to be told who is now connected to whom, since it is the one
+     * that owes them an event if a member departs without disconnecting */
+    cd->nprocs = nprocs;
+    PMIX_PROC_CREATE(cd->procs, cd->nprocs);
+    memcpy(cd->procs, procs, nprocs * sizeof(pmix_proc_t));
     for (n=0; n < ninfo; n++) {
         if (PMIX_CHECK_KEY(&info[n], PMIX_PROC_INFO_ARRAY) ||
             PMIX_CHECK_KEY(&info[n], PMIX_JOB_INFO_ARRAY)) {
@@ -1345,10 +1383,31 @@ pmix_status_t pmix_server_connect_fn(const pmix_proc_t procs[], size_t nprocs,
     cd->opcbfunc = cbfunc;
     cd->cbdata = cbdata;
 
+    /* prte_grpcomm_fence() takes OWNERSHIP of the blob it is handed - the
+     * fence caddy's destructor frees it, which is right for its other
+     * caller, where the blob is the modex bucket PMIx transferred to us on
+     * the fence_nb up-call. So this one must hand its bytes over rather
+     * than lend them: passing cd->msg's own pointer left the buffer still
+     * owning them, and rqdes destructed it after the fence caddy had
+     * already freed it. Unloading empties the buffer, so the destruct
+     * becomes the no-op it needs to be. An empty buffer unloads to
+     * (NULL, 0), which is what a connect carrying no endpoint data
+     * passed before. */
+    PMIX_BYTE_OBJECT_CONSTRUCT(&bo);
+    rc = PMIx_Data_unload(&cd->msg, &bo);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_RELEASE(cd);
+        return rc;
+    }
+
     rc = prte_grpcomm_fence(procs, nprocs, info, ninfo,
-                            cd->msg.unpack_ptr, cd->msg.bytes_used,
+                            bo.bytes, bo.size,
                             connect_release, cd);
     if (PRTE_SUCCESS != rc) {
+        /* it refused before taking the blob, so it is still ours */
+        if (NULL != bo.bytes) {
+            free(bo.bytes);
+        }
         /* the release callback will never fire */
         PMIX_RELEASE(cd);
         /* grpcomm answers in PRTE codes, our caller reads PMIx ones */
@@ -1365,6 +1424,15 @@ static void mdxcbfunc(pmix_status_t status,
     PRTE_HIDE_UNUSED_PARAMS(data, ndata, relcbfunc, relcbdata);
 
     PMIX_ACQUIRE_OBJECT(cd);
+    /* these procs have left the assemblage in the sanctioned way, so the
+     * promise made when they connected is discharged */
+    if (PMIX_SUCCESS == status && NULL != cd->procs) {
+        prte_pmix_server_connection_report_drop(cd->procs, cd->nprocs);
+    }
+    if (NULL != cd->procs) {
+        PMIX_PROC_FREE(cd->procs, cd->nprocs);
+        cd->procs = NULL;
+    }
     /* ack the call */
     if (NULL != cd->cbfunc) {
         cd->cbfunc(status, cd->cbdata);
@@ -1382,18 +1450,28 @@ pmix_status_t pmix_server_disconnect_fn(const pmix_proc_t procs[], size_t nprocs
     pmix_output_verbose(2, prte_pmix_server_globals.output, "%s disconnect called",
                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME));
 
-    /* at some point, we need to add bookeeping to track which
-     * procs are "connected" so we know who to notify upon
-     * termination or failure. For now, just execute a fence
-     * Note that we do not need to thread-shift here as the
-     * fence function will do it for us */
+    /* Execute a fence across the participants, and - once it says they all
+     * arrived - tell the DVM master to forget the assemblage they formed.
+     * Leaving it this way is what discharges the connect's promise: a member
+     * that departs afterwards owes nobody an event.
+     * Note that we do not need to thread-shift here as the fence function
+     * will do it for us */
     cd = PMIX_NEW(prte_pmix_server_op_caddy_t);
     cd->cbfunc = cbfunc;
     cd->cbdata = cbdata;
+    if (NULL != procs && 0 < nprocs) {
+        cd->nprocs = nprocs;
+        PMIX_PROC_CREATE(cd->procs, cd->nprocs);
+        memcpy(cd->procs, procs, nprocs * sizeof(pmix_proc_t));
+    }
 
     rc = pmix_server_fencenb_fn(procs, nprocs, info, ninfo, NULL, 0, mdxcbfunc, cd);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
+        if (NULL != cd->procs) {
+            PMIX_PROC_FREE(cd->procs, cd->nprocs);
+            cd->procs = NULL;
+        }
         PMIX_RELEASE(cd);
     }
 
