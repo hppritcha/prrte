@@ -205,6 +205,58 @@ uninitialized memory.
 
 ---
 
+## Duplicate keys: same key, same *set of processes*
+
+`ds_publish` refuses a key that is already published on the range being
+published to, with `PMIX_ERR_DUPLICATE_KEY` and nothing stored. The Standard
+requires that, and the alternative is worse than it sounds: `ds_lookup`
+answers a key from the **first match it finds**, so a stored duplicate is
+unreachable — a write that reported success and did nothing.
+
+Nor is the loser reliably the newcomer. The store is a
+`pmix_pointer_array_t` and `pmix_pointer_array_add()` fills the **lowest
+free slot**, so a duplicate landing in a slot that some earlier unpublish
+freed sits *ahead* of the original and displaces it instead. Which value a
+lookup resolves to was a function of unrelated publish/unpublish history.
+
+**"Same range" is a set of processes, not the `pmix_data_range_t` word.**
+`PMIX_RANGE_NAMESPACE` published by two processes of different namespaces
+names two disjoint sets; refusing the second would refuse a publish the
+Standard permits. So `same_data_range()` tests the range word **and** asks
+whether the new publisher could itself have looked the stored item up
+(`prte_data_server_check_access` then `prte_data_server_check_range`) —
+which for `NAMESPACE`, `LOCAL` and `PROC_LOCAL` is exactly set equality, is
+trivially true for `SESSION`, `GLOBAL` and `RM`, and separates two users'
+identically-keyed items because neither can see the other's.
+
+The scan runs in two passes and the order is the point: `count_duplicates()`
+decides, `drop_prior()` acts. A publish that is going to be refused must
+leave the store exactly as it found it.
+
+The consequence worth knowing before you field a bug report: two *concurrent*
+publishers of one name no longer both appear to succeed. The second is
+refused, and since removal is a question of ownership, only the first can let
+the name go. Sequential generations of a job are unaffected — the previous
+one's `PERSIST_APP` data goes when it ends (see below) — but overlapping ones
+must now handle `PMIX_ERR_DUPLICATE_KEY` where they used to get a write that
+quietly went nowhere.
+
+`PRTE_PUBLISH_REPLACE` (`"prte.pub.replace"`, in `prte_data_server.h`) lets
+a publisher take back its **own** prior publication of those keys instead of
+failing — otherwise updating a value you published yourself needs an
+intervening `PMIx_Unpublish`. It is deliberately owner-scoped: if any
+colliding item belongs to somebody else the publish is refused whether or
+not the directive was given, so it is a republish and never a way to take a
+live name away. Only the republished keys go; an object holding others keeps
+them.
+
+Everything those checks read — the owner (which `PMIX_REQUESTOR` may have
+replaced), the range, the uid and gid — is final only *after* the directive
+scan, so the gate has to sit between that scan and
+`pmix_pointer_array_add()`.
+
+---
+
 ## Persistence and parked requests
 
 `PMIX_PERSIST_FIRST_READ` removes an item from `data->info` as soon as it is
@@ -227,9 +279,102 @@ timer, so every path is covered by `PMIX_RELEASE`. Without the timer a wait
 for a key nobody publishes never returned: the timeout reached the daemon's
 caddy (`req->timeout` in `pmix_server_pub.c`) and went no further.
 
-`ds_purge` drops both the departing process's published items *and* any
-lookup it left parked; a request that outlives its requestor would otherwise
-have a later publish trying to reply to a process that no longer exists.
+**`PMIX_PERSISTENCE` is enforced by `ds_purge`, and only because the state
+machine tells it a lifetime ended.** The purge command carries the horizon
+that was reached as a `PMIX_PERSISTENCE` directive, and `expires_by()`
+decides what that takes: `FIRST_READ` and `PROC` at any horizon, `APP` at
+`APP` or `SESSION`, `INDEF` never. The values are *not* a numeric ladder —
+`PMIX_PERSIST_INDEF` is 0 and outlives all of them — so the ordering is
+spelled out rather than compared.
+
+A purge with **no** horizon (`PMIX_PERSIST_INVALID`) means an explicit
+`PMIx_Unpublish(NULL, ...)`: a live publisher taking back everything it
+published, regardless of persistence. That case must *not* drop the
+requestor's parked lookups — cancelling the lookups a process is waiting on
+is no part of taking its published data back.
+
+**There is a store on every daemon, not just the master.**
+`pmix_server_start()` calls `prte_data_server_init()` unconditionally, and it
+runs in `ess/hnp` and `ess/base/ess_base_std_prted` alike. What decides which
+store a request reaches is the RANGE, in `execute()`
+(`src/prted/pmix/pmix_server_pub.c`) — one routing decision, no local-first
+search and no fallback:
+
+| Range | Target |
+|-------|--------|
+| `PMIX_RANGE_SESSION` | the global server (`prte_pmix_server_globals.server`; the HNP relays when it is external) |
+| `PMIX_RANGE_LOCAL` | `PRTE_PROC_MY_NAME` — **this daemon's own store** |
+| everything else | `PRTE_PROC_MY_HNP` |
+
+So a prted's store holds *only* local-range items published by its own local
+procs, and a lookup that misses gets `PMIX_ERR_NOT_FOUND` rather than trying
+somewhere else. On the master the two stores are the same object, which is
+why a single-node run cannot tell them apart — and why the purge going only
+to the global store left local-range data unreclaimed until it also went to
+`PRTE_PROC_MY_NAME`.
+
+`prte_state_base_notify_data_server()` is what sends the lifecycle purge,
+with `PMIX_PERSIST_APP`, when a job's procs have all terminated. All three
+call sites used to be gated on `NULL != prte_data_server_uri`, so the
+**built-in** data server — the usual case — was never told a job had ended;
+nothing was ever reclaimed from it short of the DVM shutting down, and
+`PERSIST_APP` and `PERSIST_PROC` both behaved as `PERSIST_INDEF`. The
+function itself had always routed correctly for the built-in case; its own
+callers were what gated it out.
+
+`PMIX_PERSIST_PROC` is therefore reclaimed at **job** granularity rather
+than when its individual publisher exits. That is later than the Standard's
+"until the publishing process terminates", and it is deliberate: a message
+to the store for every terminating process is not a cost the termination
+path can carry at scale.
+
+The object's default is `PMIX_PERSIST_APP`, which is the Standard's default.
+PMIx adds none of its own before handing a publish to the host, so the value
+in `ds_main.c`'s constructor is the one that governs.
+
+A lifecycle purge drops both the departing process's published items *and*
+any lookup it left parked; a request that outlives its requestor would
+otherwise have a later publish trying to reply to a process that no longer
+exists.
+
+---
+
+## The external server: attach, and answer
+
+Two things about the relay path are easy to get wrong, and both were.
+
+**A local-range request must not be relayed.** `prte_data_server()` used to
+hand *everything* to `prte_ds_relay()` whenever `prte_data_server_uri` was set.
+But `PMIX_RANGE_LOCAL` data belongs to the store of the daemon that relayed
+it, so forwarding it stored a publish where its own publisher could never look
+it up, and answered a local-range lookup out of a store that cannot hold
+local-range data. By the time the dispatch runs, the range is buried in a
+payload whose shape depends on the command — so the *sender* says which store
+it means by choosing the tag, `PRTE_RML_TAG_DATA_SERVER_LOCAL` rather than
+`PRTE_RML_TAG_DATA_SERVER`. `execute()` picks it for a local range, the
+lifecycle purge picks it for our own store, and the receive is registered for
+both.
+
+**The master must attach even when nothing local asks it to.** The attach
+(`init_server()`, now behind `prte_pmix_server_init_pubsub()`) used to happen
+only inside `execute()` in `pmix_server_pub.c` — that is, only when a **local
+client of that daemon** published or looked something up. But relaying is the
+*master's* job: every other daemon sends its request to the master, which is
+the only one holding the tool connection to the far end. A master with no
+publishing client of its own therefore never attached, and every relayed
+request failed `PMIX_ERR_UNREACH`. Nothing noticed for as long as each job's
+nspace registration also published — that went through `execute()` and
+attached as a side effect. Remove the accidental attach and the feature stops
+working, which is exactly what happened. `prte_ds_relay()` now forces it.
+
+**A relay that cannot take the request must still answer.** The dispatch in
+`prte_data_server()` used to log a relay failure and `return`, sending
+nothing. The daemon that asked stayed parked on its room number, and the
+process behind it hung for good. An unreachable data server is something a
+caller can be told about; a hang is not. The relay branch now falls into the
+same error reply every other failure uses, and the contract is unchanged:
+`prte_ds_relay()` returning `PMIX_SUCCESS` means it owns the request and will
+answer — including when it has already sent a failure.
 
 ---
 
@@ -249,9 +394,21 @@ have a later publish trying to reply to a process that no longer exists.
 - **An access rule is not an ownership rule.** See the section above: what
   may be read and what may be removed are different questions, and the
   answer to the first one refused owners their own data.
+- **Decide before you remove.** The duplicate scan is two passes for a
+  reason: a refused publish must leave the store untouched, so nothing may
+  be dropped until every collision has been found and attributed.
+- **A range word is not a range.** Two publications can carry the same
+  `pmix_data_range_t` and still name disjoint sets of processes. Never
+  compare `data->range` alone and call it "the same range".
 - **A parked request can own an armed timer.** Remove it from `pending` and
   `PMIX_RELEASE` it; never `free` around it, and never leave the list
   holding one you have released.
+- **Every exit from the dispatch must answer somebody.** A caller is parked
+  on a room number; a path that returns silently is a hang, not an error.
+  See the section above.
+- **`rc` in `prte_data_server()` is a `pmix_status_t`.** Format it with
+  `PMIx_Error_string()`; `PRTE_ERROR_NAME()` knows only PRRTE's codes and
+  renders every PMIx status as "Unknown error".
 - **No locking, and none is wanted.** Everything here runs inside the RML
   receive on the progress thread.
 - **`prte_data_store.output` is `-1` until a verbosity is registered**, so
@@ -290,8 +447,11 @@ by a publish in the other, that an ended job's data is purged from the server
 and that the purge takes *only* that job's data — plus the control, that a
 DVM which was not given the URI sees none of it.
 
-**Not covered:** `PMIX_PERSIST_FIRST_READ` end-to-end, and `ds_purge` (which
-is driven by process termination rather than by a client call). Access
+**Not covered:** `PMIX_PERSIST_FIRST_READ` end-to-end, the duplicate-key and
+`PRTE_PUBLISH_REPLACE` paths, and the lifecycle side of `ds_purge` (which is
+driven by job termination rather than by a client call) — in particular that
+a `PERSIST_APP` item is gone once its job ends while a `PERSIST_SESSION` one
+is not, which needs two jobs under one persistent DVM. Access
 permissions are covered only with the harness running as a single user, so
 what the swarm proves is that a list naming *somebody else* keeps us out —
 not that a genuinely different uid gets in.

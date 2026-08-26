@@ -29,24 +29,31 @@
 
 #include "prte_config.h"
 
-#ifdef HAVE_UNISTD_H
-#    include <unistd.h>
-#endif
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
 
 #include "src/pmix/pmix-internal.h"
-#include "src/util/pmix_argv.h"
 #include "src/util/pmix_output.h"
 
 #include "src/mca/errmgr/errmgr.h"
 #include "src/rml/rml.h"
 #include "src/runtime/data_server/prte_data_server.h"
 #include "src/runtime/prte_globals.h"
-#include "src/threads/pmix_threads.h"
 #include "src/util/name_fns.h"
-#include "src/util/pmix_show_help.h"
 #include "src/util/prte_show_help.h"
 
 #include "src/prted/pmix/pmix_server_internal.h"
+
+/* The outcome of the one attach attempt.  init_server() marks itself done
+ * before it does any work, so it runs exactly once whether it succeeds or
+ * fails - and the failure has to be remembered.  Without the connection a
+ * later request is not refused, it is sent to this daemon's own data server
+ * instead: not where the caller asked for it to go, and not where the other
+ * DVM will look for it.  One error message followed by publishes that
+ * silently go nowhere useful is worse than a request that fails. */
+static int server_init_rc = PRTE_SUCCESS;
 
 /* Attach to the data server named by prte_data_server_uri.
  *
@@ -62,10 +69,43 @@
  * RML exactly as it does for a data server hosted here, so a DVM holds one
  * connection to the external server however many daemons it has.
  */
+static int init_server(void);
+
+/* Attach to the external data server if we have not already.
+ *
+ * This used to happen only inside execute() below - that is, only when a
+ * LOCAL client of this daemon published or looked something up.  The master
+ * needs the connection for a different reason: every other daemon relays its
+ * requests to the master, and the master is the only one that holds the tool
+ * connection to the far end.  A master with no publishing client of its own
+ * therefore never attached, and the relay failed PMIX_ERR_UNREACH for every
+ * request the DVM made.  Nothing noticed, because a job's nspace
+ * registration used to publish through execute() and attach as a side
+ * effect. */
+int prte_pmix_server_init_pubsub(void)
+{
+    if (prte_pmix_server_globals.pubsub_init) {
+        /* Answer with what the one attempt actually did.  Returning success
+         * here because the attempt has been MADE is the trap described on
+         * server_init_rc above: only the request that provoked the attach
+         * learned that it failed, and every later one carried on into this
+         * daemon's own data server - not where the caller asked for it to
+         * go, and not where the other DVM will look. */
+        return server_init_rc;
+    }
+    server_init_rc = init_server();
+    if (PRTE_SUCCESS != server_init_rc) {
+        prte_show_help("help-prted.txt", "noserver", true,
+                       (NULL == prte_data_server_uri) ? "NULL" : prte_data_server_uri);
+    }
+    return server_init_rc;
+}
+
 static int init_server(void)
 {
     char *server;
     char input[1024], *filename;
+    size_t len;
     FILE *fp;
     pmix_status_t ret;
     pmix_info_t info[2];
@@ -116,7 +156,15 @@ static int init_server(void)
                 return PRTE_ERR_BAD_PARAM;
             }
             fclose(fp);
-            input[strlen(input) - 1] = '\0'; /* remove newline */
+            /* strip the line ending if there is one.  A file written by
+             * PMIx's own report-uri ends in a newline, but this file is
+             * whatever the user pointed us at - and chopping the last
+             * character unconditionally takes a character of the URI off a
+             * file that has none. */
+            len = strlen(input);
+            while (0 < len && ('\n' == input[len - 1] || '\r' == input[len - 1])) {
+                input[--len] = '\0';
+            }
             server = strdup(input);
         } else {
             server = strdup(prte_data_server_uri);
@@ -161,24 +209,57 @@ static int init_server(void)
     return PRTE_SUCCESS;
 }
 
+/* Pull the range and timeout out of a publish/lookup/unpublish directive
+ * array.  The array is the requesting client's own - PMIx forwards it to the
+ * host without inspecting what any entry holds - so a value's type has to be
+ * checked before the matching member of the union is read.  Neither of these
+ * is a pointer, so the cost of getting it wrong is not a fault: it is that
+ * the range decides where the request is *sent*, so a value read out of the
+ * wrong union member routes a publish to this daemon instead of the data
+ * server, and the data is quietly put where no lookup will find it. */
+static void scan_directives(prte_pmix_server_req_t *req,
+                            const pmix_info_t info[], size_t ninfo)
+{
+    size_t n;
+    pmix_status_t rc;
+    int tmo;
+
+    for (n = 0; n < ninfo; n++) {
+        if (PMIX_CHECK_KEY(&info[n], PMIX_RANGE)) {
+            if (PMIX_DATA_RANGE == info[n].value.type) {
+                req->range = info[n].value.data.range;
+            }
+        } else if (PMIX_CHECK_KEY(&info[n], PMIX_TIMEOUT)) {
+            /* the data server is what honors this - it is recorded here only
+             * so that a timer on this side would have it */
+            rc = PMIx_Value_get_number(&info[n].value, &tmo, PMIX_INT);
+            if (PMIX_SUCCESS == rc) {
+                req->timeout = tmo;
+            }
+        }
+    }
+}
+
 static void execute(int sd, short args, void *cbdata)
 {
     prte_pmix_server_req_t *req = (prte_pmix_server_req_t *) cbdata;
     int rc;
+    pmix_status_t ret;
     pmix_data_buffer_t *xfer;
     pmix_proc_t *target;
+    /* the DVM's store unless the range says otherwise */
+    prte_rml_tag_t dstag = PRTE_RML_TAG_DATA_SERVER;
     bool stored = false;
     PRTE_HIDE_UNUSED_PARAMS(sd, args);
 
     PMIX_ACQUIRE_OBJECT(req);
 
-    if (!prte_pmix_server_globals.pubsub_init) {
-        /* we need to initialize our connection to the server */
-        if (PRTE_SUCCESS != (rc = init_server())) {
-            prte_show_help("help-prted.txt", "noserver", true,
-                           (NULL == prte_data_server_uri) ? "NULL" : prte_data_server_uri);
-            goto callback;
-        }
+    /* we need our connection to the server, and every request needs it: a
+     * failed attach is remembered and re-reported rather than skipped */
+    if (PRTE_SUCCESS != (rc = prte_pmix_server_init_pubsub())) {
+        /* rc is a PRRTE code and what we hand back goes to a client */
+        ret = prte_pmix_convert_rc(rc);
+        goto callback;
     }
 
     /* add this request to our tracker array */
@@ -189,15 +270,15 @@ static void execute(int sd, short args, void *cbdata)
     PMIX_DATA_BUFFER_CREATE(xfer);
 
     /* pack the room number */
-    rc = PMIx_Data_pack(NULL, xfer, &req->local_index, 1, PMIX_INT);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
+    ret = PMIx_Data_pack(NULL, xfer, &req->local_index, 1, PMIX_INT);
+    if (PMIX_SUCCESS != ret) {
+        PMIX_ERROR_LOG(ret);
         PMIX_DATA_BUFFER_RELEASE(xfer);
         goto callback;
     }
-    rc = PMIx_Data_copy_payload(xfer, &req->msg);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
+    ret = PMIx_Data_copy_payload(xfer, &req->msg);
+    if (PMIX_SUCCESS != ret) {
+        PMIX_ERROR_LOG(ret);
         PMIX_DATA_BUFFER_RELEASE(xfer);
         goto callback;
     }
@@ -215,10 +296,13 @@ static void execute(int sd, short args, void *cbdata)
         target = (NULL == prte_data_server_uri) ? &prte_pmix_server_globals.server
                                                 : PRTE_PROC_MY_HNP;
     } else if (PMIX_RANGE_LOCAL == req->range) {
-        /* if the range is local, send it to myself */
+        /* if the range is local, send it to myself - and say so with the
+         * tag, so that a DVM pointed at an external data server serves this
+         * out of its own store instead of relaying it away */
         pmix_output_verbose(1, prte_pmix_server_globals.output, "%s orted:pmix:server range LOCAL",
                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME));
         target = PRTE_PROC_MY_NAME;
+        dstag = PRTE_RML_TAG_DATA_SERVER_LOCAL;
     } else {
         pmix_output_verbose(1, prte_pmix_server_globals.output, "%s orted:pmix:server range GLOBAL",
                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME));
@@ -226,19 +310,22 @@ static void execute(int sd, short args, void *cbdata)
     }
 
     /* send the request to the target */
-    PRTE_RML_RELIABLE_SEND(rc, target->rank, xfer, PRTE_RML_TAG_DATA_SERVER);
+    PRTE_RML_RELIABLE_SEND(rc, target->rank, xfer, dstag);
     if (PRTE_SUCCESS == rc) {
         return;
     }
     PRTE_ERROR_LOG(rc);
-    rc = prte_pmix_convert_rc(rc);
+    /* the RML takes the buffer only by succeeding - on an error return it is
+     * still ours, emptied or not (src/rml/relm/AGENTS.md) */
+    PMIX_DATA_BUFFER_RELEASE(xfer);
+    ret = prte_pmix_convert_rc(rc);
 
 callback:
     /* execute the callback to avoid having the client hang */
     if (NULL != req->opcbfunc) {
-        req->opcbfunc(rc, req->cbdata);
+        req->opcbfunc(ret, req->cbdata);
     } else if (NULL != req->lkcbfunc) {
-        req->lkcbfunc(rc, NULL, 0, req->cbdata);
+        req->lkcbfunc(ret, NULL, 0, req->cbdata);
     }
     if (stored) {
         pmix_pointer_array_set_item(&prte_pmix_server_globals.local_reqs, req->local_index, NULL);
@@ -251,9 +338,7 @@ pmix_status_t pmix_server_publish_fn(const pmix_proc_t *proc, const pmix_info_t 
 {
     prte_pmix_server_req_t *req;
     pmix_status_t rc;
-    int ret;
     uint8_t cmd = PRTE_PMIX_PUBLISH_CMD;
-    size_t n;
 
     pmix_output_verbose(1, prte_pmix_server_globals.output, "%s orted:pmix:server PUBLISH",
                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME));
@@ -265,21 +350,14 @@ pmix_status_t pmix_server_publish_fn(const pmix_proc_t *proc, const pmix_info_t 
     req->cbdata = cbdata;
 
     /* load the command */
-    ret = PMIx_Data_pack(NULL, &req->msg, &cmd, 1, PMIX_UINT8);
-    if (PMIX_SUCCESS != ret) {
-        PMIX_ERROR_LOG(ret);
+    rc = PMIx_Data_pack(NULL, &req->msg, &cmd, 1, PMIX_UINT8);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
         PMIX_RELEASE(req);
         return PMIX_ERR_PACK_FAILURE;
     }
 
-    /* no help for it - need to search for range/persistence */
-    for (n = 0; n < ninfo; n++) {
-        if (0 == strncmp(info[n].key, PMIX_RANGE, PMIX_MAX_KEYLEN)) {
-            req->range = info[n].value.data.range;
-        } else if (0 == strncmp(info[n].key, PMIX_TIMEOUT, PMIX_MAX_KEYLEN)) {
-            req->timeout = info[n].value.data.integer;
-        }
-    }
+    scan_directives(req, info, ninfo);
 
     /* pack the name of the publisher */
     if (PMIX_SUCCESS
@@ -309,14 +387,13 @@ pmix_status_t pmix_server_publish_fn(const pmix_proc_t *proc, const pmix_info_t 
     PMIX_POST_OBJECT(req);
     prte_event_active(&(req->ev), PRTE_EV_WRITE, 1);
 
-    return PRTE_SUCCESS;
+    return PMIX_SUCCESS;
 }
 
 pmix_status_t pmix_server_lookup_fn(const pmix_proc_t *proc, char **keys, const pmix_info_t info[],
                                     size_t ninfo, pmix_lookup_cbfunc_t cbfunc, void *cbdata)
 {
     prte_pmix_server_req_t *req;
-    int ret;
     uint8_t cmd = PRTE_PMIX_LOOKUP_CMD;
     size_t m, n;
     pmix_status_t rc;
@@ -332,20 +409,14 @@ pmix_status_t pmix_server_lookup_fn(const pmix_proc_t *proc, char **keys, const 
     req->cbdata = cbdata;
 
     /* load the command */
-    if (PRTE_SUCCESS != (ret = PMIx_Data_pack(NULL, &req->msg, &cmd, 1, PMIX_UINT8))) {
-        PRTE_ERROR_LOG(ret);
+    rc = PMIx_Data_pack(NULL, &req->msg, &cmd, 1, PMIX_UINT8);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
         PMIX_RELEASE(req);
         return PMIX_ERR_PACK_FAILURE;
     }
 
-    /* no help for it - need to search for range and timeout */
-    for (n = 0; n < ninfo; n++) {
-        if (0 == strncmp(info[n].key, PMIX_RANGE, PMIX_MAX_KEYLEN)) {
-            req->range = info[n].value.data.range;
-        } else if (0 == strncmp(info[n].key, PMIX_TIMEOUT, PMIX_MAX_KEYLEN)) {
-            req->timeout = info[n].value.data.integer;
-        }
-    }
+    scan_directives(req, info, ninfo);
 
     /* pack the name of the requestor */
     if (PMIX_SUCCESS
@@ -393,7 +464,7 @@ pmix_status_t pmix_server_lookup_fn(const pmix_proc_t *proc, char **keys, const 
     PMIX_POST_OBJECT(req);
     prte_event_active(&(req->ev), PRTE_EV_WRITE, 1);
 
-    return PRTE_SUCCESS;
+    return PMIX_SUCCESS;
 }
 
 pmix_status_t pmix_server_unpublish_fn(const pmix_proc_t *proc, char **keys,
@@ -401,7 +472,6 @@ pmix_status_t pmix_server_unpublish_fn(const pmix_proc_t *proc, char **keys,
                                        pmix_op_cbfunc_t cbfunc, void *cbdata)
 {
     prte_pmix_server_req_t *req;
-    int ret;
     uint8_t cmd;
     size_t m, n;
     pmix_status_t rc;
@@ -416,8 +486,9 @@ pmix_status_t pmix_server_unpublish_fn(const pmix_proc_t *proc, char **keys,
 
         /* load the command */
         cmd = PRTE_PMIX_PURGE_PROC_CMD;
-        if (PRTE_SUCCESS != (ret = PMIx_Data_pack(NULL, &req->msg, &cmd, 1, PMIX_UINT8))) {
-            PRTE_ERROR_LOG(ret);
+        rc = PMIx_Data_pack(NULL, &req->msg, &cmd, 1, PMIX_UINT8);
+        if (PMIX_SUCCESS != rc) {
+            PMIX_ERROR_LOG(rc);
             PMIX_RELEASE(req);
             return PMIX_ERR_PACK_FAILURE;
         }
@@ -454,7 +525,7 @@ pmix_status_t pmix_server_unpublish_fn(const pmix_proc_t *proc, char **keys,
         PMIX_POST_OBJECT(req);
         prte_event_active(&(req->ev), PRTE_EV_WRITE, 1);
 
-        return PRTE_SUCCESS;
+        return PMIX_SUCCESS;
     }
 
 
@@ -466,20 +537,14 @@ pmix_status_t pmix_server_unpublish_fn(const pmix_proc_t *proc, char **keys,
 
     /* load the command */
     cmd = PRTE_PMIX_UNPUBLISH_CMD;
-    if (PRTE_SUCCESS != (ret = PMIx_Data_pack(NULL, &req->msg, &cmd, 1, PMIX_UINT8))) {
-        PRTE_ERROR_LOG(ret);
+    rc = PMIx_Data_pack(NULL, &req->msg, &cmd, 1, PMIX_UINT8);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
         PMIX_RELEASE(req);
         return PMIX_ERR_PACK_FAILURE;
     }
 
-    /* no help for it - need to search for range and timeout */
-    for (n = 0; n < ninfo; n++) {
-        if (0 == strncmp(info[n].key, PMIX_RANGE, PMIX_MAX_KEYLEN)) {
-            req->range = info[n].value.data.range;
-        } else if (0 == strncmp(info[n].key, PMIX_TIMEOUT, PMIX_MAX_KEYLEN)) {
-            req->timeout = info[n].value.data.integer;
-        }
-    }
+    scan_directives(req, info, ninfo);
 
     /* pack the name of the requestor */
     if (PMIX_SUCCESS
@@ -527,7 +592,7 @@ pmix_status_t pmix_server_unpublish_fn(const pmix_proc_t *proc, char **keys,
     PMIX_POST_OBJECT(req);
     prte_event_active(&(req->ev), PRTE_EV_WRITE, 1);
 
-    return PRTE_SUCCESS;
+    return PMIX_SUCCESS;
 }
 
 void pmix_server_keyval_client(int status, pmix_proc_t *sender,
@@ -535,7 +600,8 @@ void pmix_server_keyval_client(int status, pmix_proc_t *sender,
                                prte_rml_tag_t tg, void *cbdata)
 {
     uint8_t command;
-    int rc, room_num = -1;
+    pmix_status_t rc;
+    int room_num = -1;
     int32_t cnt;
     prte_pmix_server_req_t *req = NULL;
     pmix_byte_object_t bo;
@@ -554,17 +620,24 @@ void pmix_server_keyval_client(int status, pmix_proc_t *sender,
     cnt = 1;
     rc = PMIx_Data_unpack(NULL, buffer, &room_num, &cnt, PMIX_INT);
     if (PMIX_SUCCESS != rc) {
-        PRTE_ERROR_LOG(rc);
-        ret = PMIX_ERR_UNPACK_FAILURE;
-        goto release;
+        PMIX_ERROR_LOG(rc);
+        /* nothing to answer and nobody to answer it to - the room number is
+         * how a reply finds the request that is waiting for it */
+        return;
     }
 
     /* unpack the command */
     cnt = 1;
     rc = PMIx_Data_unpack(NULL, buffer, &command, &cnt, PMIX_UINT8);
     if (PMIX_SUCCESS != rc) {
-        PRTE_ERROR_LOG(rc);
-        return;
+        PMIX_ERROR_LOG(rc);
+        /* the room number came out, so there is somebody to answer - and
+         * they are a client parked in PMIx_Publish or PMIx_Lookup with
+         * nothing else in the DVM that will ever take them out of it.
+         * Returning here left the request in local_reqs and that client
+         * waiting for the life of the DVM */
+        ret = PMIX_ERR_UNPACK_FAILURE;
+        goto release;
     }
 
     /* unpack the return status */
@@ -632,6 +705,7 @@ void pmix_server_keyval_client(int status, pmix_proc_t *sender,
             rc = PMIx_Data_unpack(NULL, &pbkt, &pdata[n].proc, &cnt, PMIX_PROC);
             if (PMIX_SUCCESS != rc) {
                 PMIX_ERROR_LOG(rc);
+                PMIX_INFO_DESTRUCT(&info);
                 PMIX_DATA_BUFFER_DESTRUCT(&pbkt);
                 ret = rc;
                 goto release;
@@ -640,6 +714,7 @@ void pmix_server_keyval_client(int status, pmix_proc_t *sender,
             rc = PMIx_Data_unpack(NULL, &pbkt, &info, &cnt, PMIX_INFO);
             if (PMIX_SUCCESS != rc) {
                 PMIX_ERROR_LOG(rc);
+                PMIX_INFO_DESTRUCT(&info);
                 PMIX_DATA_BUFFER_DESTRUCT(&pbkt);
                 ret = rc;
                 goto release;
@@ -648,6 +723,7 @@ void pmix_server_keyval_client(int status, pmix_proc_t *sender,
             PMIX_VALUE_XFER_DIRECT(rc, &pdata[n].value, &info.value);
             if (PMIX_SUCCESS != rc) {
                 PMIX_ERROR_LOG(rc);
+                PMIX_INFO_DESTRUCT(&info);
                 PMIX_DATA_BUFFER_DESTRUCT(&pbkt);
                 ret = rc;
                 goto release;
@@ -655,6 +731,10 @@ void pmix_server_keyval_client(int status, pmix_proc_t *sender,
             PMIX_INFO_DESTRUCT(&info);
         }
     }
+    /* the payload was loaded into this buffer, which owns it from that point
+     * on - every error arm above lets it go and the way out did not, so a
+     * whole lookup response leaked on each one that worked */
+    PMIX_DATA_BUFFER_DESTRUCT(&pbkt);
 
 release:
     if (0 <= room_num) {

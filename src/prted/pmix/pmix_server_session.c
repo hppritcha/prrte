@@ -27,6 +27,7 @@
 #include "prte_config.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <signal.h>
 #include <string.h>
 
@@ -63,7 +64,11 @@ typedef enum {
 /* The parsed form of one request. Every pointer in here is BORROWED from the
  * caller's directive array, which PMIx keeps alive until we answer - with the
  * single exception of the nodelist/nspaces argv arrays, which we build and
- * which sessctrl_destruct frees. */
+ * which sessctrl_destruct frees.
+ *
+ * Borrowed from THAT array, and set_response() frees it: which is why
+ * set_response() may run only once per parsed request, and why nothing may
+ * read one of these pointers after it has. */
 typedef struct {
     prte_sessctrl_op_t op;
     int nops;                   /* number of operations named - >1 is an error */
@@ -109,6 +114,38 @@ static void sessctrl_destruct(prte_sessctrl_t *ctl)
         PMIx_Argv_free(ctl->nspaces);
         ctl->nspaces = NULL;
     }
+}
+
+/* Read a string out of one directive.
+ *
+ * Every value in this request came from the caller's own info array: PMIx
+ * hands what a process passed to PMIx_Session_control straight up to the host
+ * without inspecting what any entry holds, and this upcall is reachable by
+ * any application process or tool attached to any daemon.  So reading a fixed
+ * member of the value union reads whatever eight bytes the caller chose to
+ * put there - and every string taken here goes on to a strdup, a strlen or a
+ * parser, which is the fault version of the rule rather than the quiet one.
+ *
+ * Refuse a mistyped or absent value rather than treating it as not given:
+ * "not given" has a meaning for all of these and it is a different answer,
+ * not an error. */
+static pmix_status_t get_string_directive(pmix_info_t *info, char **out)
+{
+    /* Define the out-parameter before anything can fail, the way
+     * prte_ras_base_parse_node_list() does.  A caller has no business
+     * reading it without checking the status, but leaving it untouched on
+     * the refusal path makes that a garbage pointer rather than a NULL -
+     * and leaves the compiler unable to prove the caller's variable is ever
+     * written, which is what GCC's -Wmaybe-uninitialized was saying. */
+    *out = NULL;
+    if (PMIX_STRING != info->value.type || NULL == info->value.data.string) {
+        pmix_output_verbose(2, prte_pmix_server_globals.output,
+                            "%s session ctrl: directive %s carries no string",
+                            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), info->key);
+        return PMIX_ERR_BAD_PARAM;
+    }
+    *out = info->value.data.string;
+    return PMIX_SUCCESS;
 }
 
 /*****   DIRECTIVE PARSING   *****/
@@ -170,6 +207,14 @@ long prte_pmix_server_parse_session_time(const char *str)
             PMIx_Argv_free(fields);
             return -1;
         }
+        /* strtol reports only its OWN overflow; the multiply and the sum are
+         * ours, and signed overflow is undefined rather than merely wrong.
+         * "3555555555555:0:0:0:0" is inside strtol's range and outside this
+         * one. */
+        if (val > (LONG_MAX - total) / mult[n]) {
+            PMIx_Argv_free(fields);
+            return -1;
+        }
         total += val * mult[n];
     }
     PMIx_Argv_free(fields);
@@ -196,7 +241,7 @@ static pmix_status_t scan_resources(prte_sessctrl_t *ctl,
 {
     size_t n;
     pmix_status_t rc;
-    char *ndstring;
+    char *ndstring, *tstr = NULL;
 
     for (n = 0; n < ninfo; n++) {
         if (PMIX_CHECK_KEY(&info[n], PMIX_ALLOC_NODE_LIST)) {
@@ -208,20 +253,34 @@ static pmix_status_t scan_resources(prte_sessctrl_t *ctl,
             free(ndstring);
 
         } else if (PMIX_CHECK_KEY(&info[n], PMIX_ALLOC_ID)) {
-            ctl->alloc_refid = info[n].value.data.string;
+            rc = get_string_directive(&info[n], &ctl->alloc_refid);
+            if (PMIX_SUCCESS != rc) {
+                return rc;
+            }
 
         } else if (PMIX_CHECK_KEY(&info[n], PMIX_ALLOC_REQ_ID)) {
-            ctl->user_refid = info[n].value.data.string;
+            rc = get_string_directive(&info[n], &ctl->user_refid);
+            if (PMIX_SUCCESS != rc) {
+                return rc;
+            }
 
         } else if (PMIX_CHECK_KEY(&info[n], PMIX_ALLOC_TIME)) {
-            ctl->timelimit = prte_pmix_server_parse_session_time(info[n].value.data.string);
+            rc = get_string_directive(&info[n], &tstr);
+            if (PMIX_SUCCESS != rc) {
+                return rc;
+            }
+            ctl->timelimit = prte_pmix_server_parse_session_time(tstr);
             if (0 > ctl->timelimit) {
                 return PMIX_ERR_BAD_PARAM;
             }
 
 #if defined(PMIX_ALLOC_INHERITANCE)
         } else if (PMIX_CHECK_KEY(&info[n], PMIX_ALLOC_INHERITANCE)) {
-            ctl->inheritance = info[n].value.data.uint8;
+            rc = PMIx_Value_get_number(&info[n].value, &ctl->inheritance,
+                                       PMIX_ALLOC_INHERIT);
+            if (PMIX_SUCCESS != rc) {
+                return PMIX_ERR_BAD_PARAM;
+            }
             ctl->have_inheritance = true;
 #endif
 
@@ -254,7 +313,7 @@ static pmix_status_t parse_directives(prte_pmix_server_req_t *req,
 {
     size_t n;
     pmix_status_t rc;
-    char *ndstring;
+    char *ndstring, *tstr = NULL;
     pmix_data_array_t *darray;
 
     /* the caller is the requestor unless a relaying daemon named the original */
@@ -264,7 +323,10 @@ static pmix_status_t parse_directives(prte_pmix_server_req_t *req,
         pmix_info_t *info = &req->info[n];
 
         if (PMIX_CHECK_KEY(info, PMIX_SESSION_CTRL_ID)) {
-            ctl->ctrl_id = info->value.data.string;
+            rc = get_string_directive(info, &ctl->ctrl_id);
+            if (PMIX_SUCCESS != rc) {
+                return rc;
+            }
 
         } else if (PMIX_CHECK_KEY(info, PMIX_REQUESTOR)) {
             if (PMIX_PROC != info->value.type || NULL == info->value.data.proc) {
@@ -312,13 +374,23 @@ static pmix_status_t parse_directives(prte_pmix_server_req_t *req,
             return PMIX_ERR_NOT_SUPPORTED;
 
         } else if (PMIX_CHECK_KEY(info, PMIX_PERSONALITY)) {
+            /* checked here rather than where it is read: build_session_job()
+             * splits it and hands it to the schizo proxy detector */
+            rc = get_string_directive(info, &tstr);
+            if (PMIX_SUCCESS != rc) {
+                return rc;
+            }
             ctl->personality = info;
 
         } else if (PMIX_CHECK_KEY(info, PMIX_USERID)) {
-            PMIX_VALUE_GET_NUMBER(rc, &info->value, ctl->uid, uid_t);
+            uint32_t uid;
+            /* PMIx has no data type for uid_t, so read it as the unsigned
+             * 32-bit quantity every platform PRRTE builds on makes it */
+            rc = PMIx_Value_get_number(&info->value, &uid, PMIX_UINT32);
             if (PMIX_SUCCESS != rc) {
                 return PMIX_ERR_BAD_PARAM;
             }
+            ctl->uid = (uid_t) uid;
             ctl->have_uid = true;
 
         } else if (PMIX_CHECK_KEY(info, PMIX_GRPID)) {
@@ -338,13 +410,23 @@ static pmix_status_t parse_directives(prte_pmix_server_req_t *req,
             free(ndstring);
 
         } else if (PMIX_CHECK_KEY(info, PMIX_ALLOC_ID)) {
-            ctl->alloc_refid = info->value.data.string;
+            rc = get_string_directive(info, &ctl->alloc_refid);
+            if (PMIX_SUCCESS != rc) {
+                return rc;
+            }
 
         } else if (PMIX_CHECK_KEY(info, PMIX_ALLOC_REQ_ID)) {
-            ctl->user_refid = info->value.data.string;
+            rc = get_string_directive(info, &ctl->user_refid);
+            if (PMIX_SUCCESS != rc) {
+                return rc;
+            }
 
         } else if (PMIX_CHECK_KEY(info, PMIX_ALLOC_TIME)) {
-            ctl->timelimit = prte_pmix_server_parse_session_time(info->value.data.string);
+            rc = get_string_directive(info, &tstr);
+            if (PMIX_SUCCESS != rc) {
+                return rc;
+            }
+            ctl->timelimit = prte_pmix_server_parse_session_time(tstr);
             if (0 > ctl->timelimit) {
                 return PMIX_ERR_BAD_PARAM;
             }
@@ -353,8 +435,16 @@ static pmix_status_t parse_directives(prte_pmix_server_req_t *req,
         } else if (PMIX_CHECK_KEY(info, PMIX_ALLOC_INHERITANCE)) {
             /* governs what becomes of the session's nodes when it is reclaimed:
              * handed back to the scheduler, or returned to the DVM's general
-             * pool. See returns_to_scheduler(). */
-            ctl->inheritance = info->value.data.uint8;
+             * pool. See returns_to_scheduler().  Named as the attribute's own
+             * type rather than read off a fixed union member: the destructive
+             * disposition must be the one the caller asked for, not one a type
+             * confusion produced.  PMIx takes the same value sent as a plain
+             * integer of any width that can hold it. */
+            rc = PMIx_Value_get_number(&info->value, &ctl->inheritance,
+                                       PMIX_ALLOC_INHERIT);
+            if (PMIX_SUCCESS != rc) {
+                return PMIX_ERR_BAD_PARAM;
+            }
             ctl->have_inheritance = true;
 #endif
 
@@ -387,7 +477,7 @@ static pmix_status_t parse_directives(prte_pmix_server_req_t *req,
             set_op(ctl, PRTE_SESSCTRL_EXTEND, PMIX_INFO_TRUE(info));
 
         } else if (PMIX_CHECK_KEY(info, PMIX_SESSION_SIGNAL)) {
-            PMIX_VALUE_GET_NUMBER(rc, &info->value, ctl->sigvalue, int);
+            rc = PMIx_Value_get_number(&info->value, &ctl->sigvalue, PMIX_INT);
             if (PMIX_SUCCESS != rc || 0 >= ctl->sigvalue) {
                 return PMIX_ERR_BAD_PARAM;
             }
@@ -399,14 +489,33 @@ static pmix_status_t parse_directives(prte_pmix_server_req_t *req,
 
             /***   QUALIFIERS   ***/
         } else if (PMIX_CHECK_KEY(info, PMIX_NSPACE)) {
-            /* names a job within the session - preempt/restore target these */
-            PMIx_Argv_append_nosize(&ctl->nspaces, info->value.data.string);
-
-        } else if (PMIX_CHECK_KEY(info, PMIX_TIMEOUT)) {
-            PMIX_VALUE_GET_NUMBER(rc, &info->value, ctl->timelimit, long);
-            if (PMIX_SUCCESS != rc || 0 > ctl->timelimit) {
+            /* Names a job within the session - preempt/restore/signal target
+             * these.  It has to name one: nspace_named() matches with
+             * PMIX_CHECK_NSPACE, which counts an EMPTY nspace as matching
+             * anything, so an empty string here does not select no job, it
+             * selects every job in the session - and then reports success
+             * rather than the PMIX_ERR_NOT_FOUND a caller who named nothing
+             * real is owed. */
+            rc = get_string_directive(info, &tstr);
+            if (PMIX_SUCCESS != rc) {
+                return rc;
+            }
+            if ('\0' == tstr[0]) {
                 return PMIX_ERR_BAD_PARAM;
             }
+            PMIx_Argv_append_nosize(&ctl->nspaces, tstr);
+
+        } else if (PMIX_CHECK_KEY(info, PMIX_TIMEOUT)) {
+            int64_t tl;
+            /* PMIx has no data type for long, so read the widest signed
+             * quantity it does have and refuse what a long cannot hold -
+             * writing an int64_t through a long* would overrun the field
+             * wherever long is 32 bits */
+            rc = PMIx_Value_get_number(&info->value, &tl, PMIX_INT64);
+            if (PMIX_SUCCESS != rc || 0 > tl || (int64_t) LONG_MAX < tl) {
+                return PMIX_ERR_BAD_PARAM;
+            }
+            ctl->timelimit = (long) tl;
         }
         /* an unrecognized directive is not an error: the request may be
          * addressed at more than one RTE, and refusing on a key we simply
@@ -656,13 +765,26 @@ static pmix_status_t session_extend(prte_session_t *session, prte_sessctrl_t *ct
     bool grew = false;
 
     if (NULL != ctl->nodelists) {
+        pmix_status_t prc = PMIX_SUCCESS;
         for (i = 0; NULL != ctl->nodelists[i]; i++) {
             ret = prte_ras_base_insert_node_string(ctl->nodelists[i], session);
             if (PRTE_SUCCESS != ret) {
                 PRTE_ERROR_LOG(ret);
-                return prte_pmix_convert_rc(ret);
+                prc = prte_pmix_convert_rc(ret);
+                break;
             }
             grew = true;
+        }
+        if (PMIX_SUCCESS != prc) {
+            /* Whatever was added is in the node pool and held by this session
+             * already, so grow onto it before reporting the failure: unlike
+             * an instantiation, there is no half-built session to unwind
+             * here, and returning without the grow strands those nodes -
+             * withheld from general use, with no daemon, usable by nobody. */
+            if (grew) {
+                prte_ras_base_activate_dvm_grow();
+            }
+            return prc;
         }
     }
     if (0 <= ctl->timelimit) {
@@ -819,15 +941,18 @@ static void set_response(prte_pmix_server_req_t *req, prte_sessctrl_t *ctl,
     if (NULL != nspace && !PMIX_NSPACE_INVALID(nspace)) {
         nresp++;
     }
-    if (0 == nresp) {
-        return;
-    }
 
     PMIX_INFO_CREATE(rinfo, nresp);
-    if (NULL != ctl->ctrl_id) {
+    if (0 < nresp && NULL == rinfo) {
+        /* nothing can be said, but the request must not be left holding the
+         * caller's directives as its answer either - fall through with the
+         * empty response the tail below installs */
+        nresp = 0;
+    }
+    if (0 < nresp && NULL != ctl->ctrl_id) {
         PMIX_INFO_LOAD(&rinfo[n++], PMIX_SESSION_CTRL_ID, ctl->ctrl_id, PMIX_STRING);
     }
-    if (NULL != session) {
+    if (0 < nresp && NULL != session) {
         PMIX_INFO_LOAD(&rinfo[n++], PMIX_SESSION_ID, &session->session_id, PMIX_UINT32);
         if (NULL != session->alloc_refid) {
             PMIX_INFO_LOAD(&rinfo[n++], PMIX_ALLOC_ID, session->alloc_refid, PMIX_STRING);
@@ -836,19 +961,27 @@ static void set_response(prte_pmix_server_req_t *req, prte_sessctrl_t *ctl,
             PMIX_INFO_LOAD(&rinfo[n++], PMIX_ALLOC_REQ_ID, session->user_refid, PMIX_STRING);
         }
     }
-    if (NULL != nspace && !PMIX_NSPACE_INVALID(nspace)) {
+    if (0 < nresp && NULL != nspace && !PMIX_NSPACE_INVALID(nspace)) {
         PMIX_INFO_LOAD(&rinfo[n++], PMIX_NSPACE, (void *) nspace, PMIX_STRING);
     }
 
-    /* the request's own array is normally borrowed from the PMIx caller and
+    /* The request's own array is normally borrowed from the PMIx caller and
      * needs no action, but one relayed from a peer owns its copy and would be
-     * stranded here */
+     * stranded here.
+     *
+     * That free is why this may run only ONCE per parsed request: every
+     * string ctl holds - ctrl_id above all - points into that array, so a
+     * second call would read the copy this one released.  It is also why the
+     * replacement happens even when there is nothing to say: leaving the old
+     * array in place answers the caller with its own directives echoed back
+     * as results, and on the relayed path leaves an array we own attached to
+     * a request whose answer has already gone out. */
     if (req->copy && NULL != req->info) {
         PMIX_INFO_FREE(req->info, req->ninfo);
     }
     req->info = rinfo;
     req->ninfo = nresp;
-    req->copy = true;
+    req->copy = (NULL != rinfo);
 }
 
 /* Carries a response array to whatever eventually finishes with it. Plain
@@ -1103,7 +1236,8 @@ error:
  * PMIX_OPERATION_IN_PROGRESS if it has taken over answering the request. */
 static pmix_status_t apply_to_session(prte_pmix_server_req_t *req,
                                       prte_sessctrl_t *ctl,
-                                      prte_session_t *session)
+                                      prte_session_t *session,
+                                      bool respond)
 {
     pmix_status_t rc = PMIX_SUCCESS;
 
@@ -1189,7 +1323,7 @@ static pmix_status_t apply_to_session(prte_pmix_server_req_t *req,
         break;
     }
 
-    if (PMIX_SUCCESS == rc) {
+    if (respond && PMIX_SUCCESS == rc) {
         set_response(req, ctl, session, NULL);
     }
     return rc;
@@ -1208,8 +1342,10 @@ static pmix_status_t apply_to_all(prte_pmix_server_req_t *req,
     if (NULL == prte_sessions) {
         return PMIX_ERR_NOT_FOUND;
     }
-    /* snapshot the size: terminating a session can remove it from the array,
-     * and can do so from under the walk */
+    /* Terminating a session can remove it from the array from under this
+     * walk.  That is safe as written: removal only NULLs the slot (the object
+     * itself survives for as long as we hold it), and the array never
+     * shrinks, so re-reading ->size each time is correct. */
     for (i = 0; i < prte_sessions->size; i++) {
         session = (prte_session_t *) pmix_pointer_array_get_item(prte_sessions, i);
         if (NULL == session || session == prte_default_session) {
@@ -1218,7 +1354,13 @@ static pmix_status_t apply_to_all(prte_pmix_server_req_t *req,
         if (!AUTHORIZED(session, &ctl->requestor)) {
             continue;
         }
-        rc = apply_to_session(req, ctl, session);
+        /* Do NOT let the per-session call build the answer.  It may run many
+         * times here, and set_response() may run only once per parsed
+         * request: it frees the array ctl's strings point into, so a second
+         * call reads the copy the first released - and the answer it would
+         * leave behind names whichever session happened to be served last,
+         * which is not what a request addressed to all of them asked about. */
+        rc = apply_to_session(req, ctl, session, false);
         if (PMIX_OPERATION_IN_PROGRESS == rc) {
             /* nothing in the all-sessions set can defer its answer: only an
              * instantiation does that, and instantiate is rejected above */
@@ -1230,6 +1372,10 @@ static pmix_status_t apply_to_all(prte_pmix_server_req_t *req,
         } else if (PMIX_ERR_NOT_FOUND == ret) {
             ret = PMIX_SUCCESS; /* at least one session was served */
         }
+    }
+    if (PMIX_SUCCESS == ret) {
+        /* no session is named: the request was about all of them */
+        set_response(req, ctl, NULL, NULL);
     }
     return ret;
 }
@@ -1289,10 +1435,23 @@ static pmix_status_t process_directive(prte_pmix_server_req_t *req)
         goto done;
     }
 
-    rc = apply_to_session(req, &ctl, session);
+    rc = apply_to_session(req, &ctl, session, true);
 
 done:
     sessctrl_destruct(&ctl);
+    if (PMIX_SUCCESS != rc && PMIX_OPERATION_IN_PROGRESS != rc) {
+        /* Nothing to report but the status, and what the request is still
+         * carrying is the array it arrived with - the caller's own
+         * directives, which must not go back looking like results.  (An
+         * in-progress request keeps it: the deferred half replaces it when
+         * it builds the real answer.) */
+        if (req->copy && NULL != req->info) {
+            PMIX_INFO_FREE(req->info, req->ninfo);
+        }
+        req->info = NULL;
+        req->ninfo = 0;
+        req->copy = false;
+    }
     return rc;
 }
 
@@ -1364,6 +1523,10 @@ void prte_pmix_server_session_complete(prte_session_t *session)
      * allocation id if the session carries one */
     ninfo = 2 + nresults + ((NULL == session->alloc_refid) ? 0 : 1);
     PMIX_INFO_CREATE(info, ninfo);
+    if (NULL == info) {
+        PMIX_ERROR_LOG(PMIX_ERR_NOMEM);
+        return;
+    }
     PMIX_INFO_LOAD(&info[0], PMIX_SESSION_COMPLETE, NULL, PMIX_BOOL);
     PMIX_INFO_LOAD(&info[1], PMIX_SESSION_ID, &session->session_id, PMIX_UINT32);
     n = 2;
@@ -1577,7 +1740,7 @@ static void pass_request(int sd, short args, void *cbdata)
                             "%s session ctrl: relaying to the master as local req %d",
                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), req->local_index);
         rc = prte_server_send_request(PRTE_PMIX_SESSION_CTRL, req);
-        if (PRTE_SUCCESS != rc) {
+        if (PMIX_SUCCESS != rc) {
             goto callback;
         }
         return;
@@ -1655,5 +1818,5 @@ pmix_status_t pmix_server_session_ctrl_fn(const pmix_proc_t *requestor,
     prte_event_set(prte_event_base, &req->ev, -1, PRTE_EV_WRITE, pass_request, req);
     PMIX_POST_OBJECT(req);
     prte_event_active(&req->ev, PRTE_EV_WRITE, 1);
-    return PRTE_SUCCESS;
+    return PMIX_SUCCESS;
 }

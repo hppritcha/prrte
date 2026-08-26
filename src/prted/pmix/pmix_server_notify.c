@@ -30,31 +30,19 @@
 
 #include "prte_config.h"
 
-#ifdef HAVE_UNISTD_H
-#    include <unistd.h>
-#endif
+#include <string.h>
 
-#include "src/hwloc/hwloc-internal.h"
 #include "src/pmix/pmix-internal.h"
-#include "src/util/pmix_argv.h"
 #include "src/util/pmix_output.h"
 
-#include "src/mca/errmgr/errmgr.h"
 #include "src/grpcomm/grpcomm.h"
-#include "src/mca/iof/base/base.h"
-#include "src/mca/iof/iof.h"
-#include "src/mca/plm/base/plm_private.h"
-#include "src/mca/plm/plm.h"
-#include "src/mca/plm/base/plm_private.h"
-#include "src/mca/rmaps/rmaps_types.h"
-#include "src/rml/rml.h"
-#include "src/mca/schizo/schizo.h"
+#include "src/mca/errmgr/errmgr.h"
 #include "src/mca/state/state.h"
+#include "src/rml/rml.h"
 #include "src/runtime/prte_globals.h"
 #include "src/runtime/prte_locks.h"
 #include "src/threads/pmix_threads.h"
 #include "src/util/name_fns.h"
-#include "src/util/pmix_show_help.h"
 
 #include "src/prted/pmix/pmix_server_internal.h"
 
@@ -65,10 +53,14 @@ static void _register_events(int sd, short args, void *cbdata)
 
     PMIX_ACQUIRE_OBJECT(cd);
 
-    /* need to implement this */
+    /* deliberately empty: every notification a daemon originates is xcast to
+     * the whole DVM and handed to each daemon's own PMIx server, which
+     * filters it against its clients' registrations there - so there is
+     * nothing for the host to record. See docs/todo.rst, "event registration
+     * is accepted and discarded", for what acting on these would buy */
 
     if (NULL != cd->cbfunc) {
-        cd->cbfunc(PRTE_SUCCESS, cd->cbdata);
+        cd->cbfunc(PMIX_SUCCESS, cd->cbdata);
     }
     PMIX_RELEASE(cd);
 }
@@ -104,9 +96,9 @@ static void _deregister_events(int sd, short args, void *cbdata)
 
     PMIX_ACQUIRE_OBJECT(cd);
 
-    /* need to implement this */
+    /* deliberately empty - see _register_events above */
     if (NULL != cd->cbfunc) {
-        cd->cbfunc(PRTE_SUCCESS, cd->cbdata);
+        cd->cbfunc(PMIX_SUCCESS, cd->cbdata);
     }
     PMIX_RELEASE(cd);
 }
@@ -127,7 +119,7 @@ pmix_status_t pmix_server_deregister_events_fn(pmix_status_t *codes, size_t ncod
     prte_event_set(prte_event_base, &(cd->ev), -1, PRTE_EV_WRITE, _deregister_events, cd);
     PMIX_POST_OBJECT(cd);
     prte_event_active(&(cd->ev), PRTE_EV_WRITE, 1);
-    return PRTE_SUCCESS;
+    return PMIX_SUCCESS;
 }
 
 static void _notify_release(int status, void *cbdata)
@@ -152,9 +144,10 @@ static void _notify_release(int status, void *cbdata)
  * against its own copy of prte_pmix_server_globals.groups - keeping the
  * registry consistent across the DVM. This must run on the PRRTE event base
  * (the same context that creates/queries the registry); it is called from the
- * broadcast receiver below. */
-static void group_member_left(pmix_status_t code, const pmix_proc_t *source,
-                              pmix_info_t *info, size_t ninfo)
+ * broadcast receiver below. It is not static only so that test_group_left in
+ * test/unit/prted can pin the input validation. */
+void prte_pmix_server_group_member_left(pmix_status_t code, const pmix_proc_t *source,
+                                        pmix_info_t *info, size_t ninfo)
 {
     char *grpid = NULL;
     pmix_proc_t *affected = NULL;
@@ -164,11 +157,24 @@ static void group_member_left(pmix_status_t code, const pmix_proc_t *source,
     if (PMIX_GROUP_LEFT != code) {
         return;
     }
+    /* this array is the generating process's own: PMIx hands what a client
+     * passed to PMIx_Notify_event straight to the host without inspecting
+     * what any entry holds, and we then broadcast it to the whole DVM. So a
+     * value's type must be checked before the matching member of its union
+     * is read - a PMIX_GROUP_ID carrying, say, a PMIX_SIZE would otherwise
+     * hand strcmp() whatever eight bytes the caller chose, on every daemon
+     * at once. A PMIX_STRING that carries no string is the same trap in its
+     * quieter form: the packer writes a zero length and the unpacker hands
+     * back NULL */
     for (n = 0; n < ninfo; n++) {
         if (PMIX_CHECK_KEY(&info[n], PMIX_GROUP_ID)) {
-            grpid = info[n].value.data.string;
+            if (PMIX_STRING == info[n].value.type) {
+                grpid = info[n].value.data.string;
+            }
         } else if (PMIX_CHECK_KEY(&info[n], PMIX_EVENT_AFFECTED_PROC)) {
-            affected = info[n].value.data.proc;
+            if (PMIX_PROC == info[n].value.type) {
+                affected = info[n].value.data.proc;
+            }
         }
     }
     /* the event source is the departing proc if it wasn't called out explicitly */
@@ -176,6 +182,13 @@ static void group_member_left(pmix_status_t code, const pmix_proc_t *source,
         affected = (pmix_proc_t *) source;
     }
     if (NULL == grpid || NULL == affected) {
+        return;
+    }
+    /* PMIX_CHECK_PROCID counts an empty nspace and a wildcard rank as
+     * matching anything, so a departure that does not name a concrete
+     * identity would drop whichever member happens to sit first in the
+     * array. Procs leave a group one at a time; insist on being told which */
+    if (PMIX_NSPACE_INVALID(affected->nspace) || !PMIX_RANK_IS_VALID(affected->rank)) {
         return;
     }
     PMIX_LIST_FOREACH(ps, &prte_pmix_server_globals.groups, prte_pmix_server_pset_t) {
@@ -203,7 +216,7 @@ void pmix_server_notify(int status, pmix_proc_t *sender, pmix_data_buffer_t *buf
                         prte_rml_tag_t tg, void *cbdata)
 {
     prte_pmix_server_op_caddy_t *cd;
-    int cnt, rc;
+    int cnt;
     pmix_proc_t source;
     pmix_data_range_t range = PMIX_RANGE_SESSION;
     pmix_status_t code, ret;
@@ -214,9 +227,9 @@ void pmix_server_notify(int status, pmix_proc_t *sender, pmix_data_buffer_t *buf
 
     /* unpack the daemon who broadcast the event */
     cnt = 1;
-    rc = PMIx_Data_unpack(NULL, buffer, &vpid, &cnt, PMIX_PROC_RANK);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
+    ret = PMIx_Data_unpack(NULL, buffer, &vpid, &cnt, PMIX_PROC_RANK);
+    if (PMIX_SUCCESS != ret) {
+        PMIX_ERROR_LOG(ret);
         return;
     }
 
@@ -285,7 +298,7 @@ void pmix_server_notify(int status, pmix_proc_t *sender, pmix_data_buffer_t *buf
 
     /* keep our group membership registry consistent with any voluntary
      * departure - every daemon does this, including the originator */
-    group_member_left(code, &cd->proc, cd->info, realninfo);
+    prte_pmix_server_group_member_left(code, &cd->proc, cd->info, realninfo);
 
     /* if I am the one who broadcast it, my local clients have already been
      * notified - just release and return now that the registry is updated */
@@ -381,7 +394,10 @@ static void _notify_event(int sd, short args, void *cbdata)
 
     if (PRTE_SUCCESS != (rc = prte_grpcomm_xcast(PRTE_RML_TAG_NOTIFICATION, &pbkt))) {
         PRTE_ERROR_LOG(rc);
-        ret = PMIX_ERROR;
+        /* rc is a PRRTE code and cd->cbfunc hands what we put here straight
+         * to a client - convert rather than flattening every failure to
+         * PMIX_ERROR, which tells the caller nothing it can act on */
+        ret = prte_pmix_convert_rc(rc);
     }
     PMIX_DATA_BUFFER_DESTRUCT(&pbkt);
 
@@ -415,7 +431,7 @@ pmix_status_t pmix_server_notify_event(pmix_status_t code, const pmix_proc_t *so
 
     /* check to see if this is one we sent down */
     for (n = 0; n < ninfo; n++) {
-        if (0 == strcmp(info[n].key, "prte.notify.donotloop")) {
+        if (PMIX_CHECK_KEY(&info[n], "prte.notify.donotloop")) {
             /* yep - do not process */
             return PMIX_OPERATION_SUCCEEDED;
         }

@@ -164,6 +164,15 @@ static void dmodex_req(int sd, short args, void *cbdata)
         if (NULL == r) {
             continue;
         }
+        /* ...and only against an entry that names one at all.  An operation
+         * with no target proc carries the {"", PMIX_RANK_INVALID} sentinel,
+         * and an empty nspace matches everything - so a job-level fetch
+         * (rank=WILDCARD) would pair with the first monitor or publish
+         * request in the array and be parked behind an answer that is never
+         * coming. */
+        if (PMIX_NSPACE_INVALID(r->tproc.nspace)) {
+            continue;
+        }
         if (PMIX_CHECK_PROCID(&r->tproc, &req->tproc)) {
             /* save the request in the array until the
              * data is returned */
@@ -362,14 +371,14 @@ static void dmodex_req(int sd, short args, void *cbdata)
         goto callback;
     }
     /* add any qualifiers */
-    if (PRTE_SUCCESS != (prc = PMIx_Data_pack(NULL, buf, &req->ninfo, 1, PMIX_SIZE))) {
+    if (PMIX_SUCCESS != (prc = PMIx_Data_pack(NULL, buf, &req->ninfo, 1, PMIX_SIZE))) {
         PMIX_ERROR_LOG(prc);
         pmix_pointer_array_set_item(&prte_pmix_server_globals.local_reqs, req->local_index, NULL);
         PMIX_DATA_BUFFER_RELEASE(buf);
         goto callback;
     }
     if (0 < req->ninfo) {
-        if (PRTE_SUCCESS != (prc = PMIx_Data_pack(NULL, buf, req->info, req->ninfo, PMIX_INFO))) {
+        if (PMIX_SUCCESS != (prc = PMIx_Data_pack(NULL, buf, req->info, req->ninfo, PMIX_INFO))) {
             PMIX_ERROR_LOG(prc);
             pmix_pointer_array_set_item(&prte_pmix_server_globals.local_reqs, req->local_index, NULL);
             PMIX_DATA_BUFFER_RELEASE(buf);

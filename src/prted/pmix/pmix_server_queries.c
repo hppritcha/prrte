@@ -34,31 +34,37 @@
 
 #include "prte_config.h"
 
-#ifdef HAVE_UNISTD_H
-#    include <unistd.h>
-#endif
+#include <stdlib.h>
+#include <string.h>
 
 #include "src/hwloc/hwloc-internal.h"
 #include "src/pmix/pmix-internal.h"
-#include "src/util/pmix_argv.h"
 #include "src/util/pmix_os_path.h"
-#include "src/util/pmix_path.h"
 #include "src/util/pmix_output.h"
+#include "src/util/pmix_path.h"
 
 #include "src/mca/errmgr/errmgr.h"
-#include "src/mca/iof/iof.h"
-#include "src/mca/plm/base/plm_private.h"
-#include "src/mca/plm/plm.h"
 #include "src/mca/rmaps/rmaps_types.h"
-#include "src/rml/rml.h"
-#include "src/mca/schizo/schizo.h"
-#include "src/mca/state/state.h"
 #include "src/runtime/prte_globals.h"
-#include "src/threads/pmix_threads.h"
 #include "src/util/name_fns.h"
-#include "src/util/pmix_show_help.h"
 
 #include "src/prted/pmix/pmix_server_internal.h"
+
+/* A query's qualifiers are the requesting client's own: PMIx forwards the
+ * array to the host without inspecting what any entry holds, so reading a
+ * fixed member of the value union is reading whatever eight bytes the caller
+ * chose to put there.  Every qualifier this function acts on other than the
+ * two numeric ones is a string that it then hands to strlen(), strcmp() or
+ * PMIx_Check_nspace(), so a mistyped one is a fault - which any process or
+ * tool attached to a daemon could produce with a single PMIx_Query_info. */
+static bool qual_string(const pmix_info_t *qual, char **str)
+{
+    if (PMIX_STRING != qual->value.type) {
+        return false;
+    }
+    *str = qual->value.data.string;
+    return true;
+}
 
 static void qrel(void *cbdata)
 {
@@ -77,7 +83,6 @@ static void _query(int sd, short args, void *cbdata)
     pmix_status_t ret = PMIX_SUCCESS;
     void *results, *plist, *stack, *cache;
     pmix_pointer_array_t *alloc_nodes;
-    prte_info_item_t *kv;
     pmix_nspace_t jobid;
     prte_job_t *jdata;
     prte_node_t *node, *ndptr;
@@ -91,12 +96,17 @@ static void _query(int sd, short args, void *cbdata)
         const char *allocprop;
 #endif
     char **ans, *tmp;
+    size_t nkeys = 0;
     char *psetname;
     prte_app_context_t *app;
     prte_session_t *session;
     int matched;
     pmix_proc_info_t *procinfo;
-    pmix_data_array_t dry;
+    /* PMIx initializes this before anything in PMIx_Info_list_convert() can
+     * fail, but every path to the done: label depends on that and the early
+     * ones reach it having never touched this - so initialize it here rather
+     * than rely on the callee to initialize its caller's stack */
+    pmix_data_array_t dry = PMIX_DATA_ARRAY_STATIC_INIT;
     prte_proc_t *proct;
     pmix_proc_t *proc;
     size_t sz;
@@ -133,10 +143,14 @@ static void _query(int sd, short args, void *cbdata)
                                          : "(not a string)"));
 
                 if (PMIX_CHECK_KEY(&q->qualifiers[n], PMIX_NSPACE)) {
+                    char *nsq;
+                    if (!qual_string(&q->qualifiers[n], &nsq)) {
+                        ret = PMIX_ERR_BAD_PARAM;
+                        goto done;
+                    }
                     // the nspace could be NULL, indicating that this is a
                     // wildcard request - if so, then ignore it here
-                    if (NULL == q->qualifiers[n].value.data.string ||
-                        0 == strlen(q->qualifiers[n].value.data.string)) {
+                    if (NULL == nsq || 0 == strlen(nsq)) {
                         PMIX_LOAD_NSPACE(jobid, NULL);
                         continue;
                     }
@@ -149,7 +163,7 @@ static void _query(int sd, short args, void *cbdata)
                     for (k = 0; k < prte_job_data->size; k++) {
                         jdata = (prte_job_t *) pmix_pointer_array_get_item(prte_job_data, k);
                         if (NULL != jdata) {
-                            if (PMIX_CHECK_NSPACE(q->qualifiers[n].value.data.string, jdata->nspace)) {
+                            if (PMIX_CHECK_NSPACE(nsq, jdata->nspace)) {
                                 matched = 1;
                                 break;
                             }
@@ -159,7 +173,7 @@ static void _query(int sd, short args, void *cbdata)
                         pmix_output_verbose(2, prte_pmix_server_globals.output,
                                             "%s qualifier key \"%s\" : value \"%s\" is an unknown namespace",
                                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), q->qualifiers[n].key,
-                                            q->qualifiers[n].value.data.string);
+                                            nsq);
                         ret = PMIX_ERR_BAD_PARAM;
                         goto done;
                     }
@@ -171,16 +185,21 @@ static void _query(int sd, short args, void *cbdata)
                     }
 
                 } else if (PMIX_CHECK_KEY(&q->qualifiers[n], PMIX_GROUP_ID)) {
+                    char *grpq;
+                    prte_pmix_server_pset_t *ps;
                     /* Never trust the group string that is provided.
                      * First check to see if we know about this group. If
                      * not then return an error. If so then continue on.
                      */
+                    if (!qual_string(&q->qualifiers[n], &grpq) || NULL == grpq) {
+                        ret = PMIX_ERR_BAD_PARAM;
+                        goto done;
+                    }
                     /* Make sure the qualifier group exists */
                     matched = 0;
-                    prte_pmix_server_pset_t *ps;
                     PMIX_LIST_FOREACH(ps, &prte_pmix_server_globals.groups, prte_pmix_server_pset_t)
                     {
-                        if (PMIX_CHECK_NSPACE(q->qualifiers[n].value.data.string, ps->name)) {
+                        if (NULL != ps->name && PMIX_CHECK_NSPACE(grpq, ps->name)) {
                             matched = 1;
                             break;
                         }
@@ -189,40 +208,61 @@ static void _query(int sd, short args, void *cbdata)
                         pmix_output_verbose(2, prte_pmix_server_globals.output,
                                             "%s qualifier key \"%s\" : value \"%s\" is an unknown group",
                                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), q->qualifiers[n].key,
-                                            q->qualifiers[n].value.data.string);
+                                            grpq);
                         ret = PMIX_ERR_BAD_PARAM;
                         goto done;
                     }
-                    PMIX_LOAD_NSPACE(jobid, q->qualifiers[n].value.data.string);
+                    PMIX_LOAD_NSPACE(jobid, grpq);
                     if (PMIX_NSPACE_INVALID(jobid)) {
                         ret = PMIX_ERR_BAD_PARAM;
                         goto done;
                     }
 
                 } else if (PMIX_CHECK_KEY(&q->qualifiers[n], PMIX_HOSTNAME)) {
-                    hostname = q->qualifiers[n].value.data.string;
+                    if (!qual_string(&q->qualifiers[n], &hostname)) {
+                        ret = PMIX_ERR_BAD_PARAM;
+                        goto done;
+                    }
 
                 } else if (PMIX_CHECK_KEY(&q->qualifiers[n], PMIX_NODEID)) {
-                    PMIX_VALUE_GET_NUMBER(rc, &q->qualifiers[n].value, nodeid, uint32_t);
+                    rc = PMIx_Value_get_number(&q->qualifiers[n].value, &nodeid, PMIX_UINT32);
+                    if (PMIX_SUCCESS != rc) {
+                        ret = PMIX_ERR_BAD_PARAM;
+                        goto done;
+                    }
 
                 } else if (PMIX_CHECK_KEY(&q->qualifiers[n], PMIX_PSET_NAME)) {
-                    psetname = q->qualifiers[n].value.data.string;
+                    if (!qual_string(&q->qualifiers[n], &psetname)) {
+                        ret = PMIX_ERR_BAD_PARAM;
+                        goto done;
+                    }
 
                 } else if (PMIX_CHECK_KEY(&q->qualifiers[n], PMIX_SESSION_ID)) {
-                    PMIX_VALUE_GET_NUMBER(rc, &q->qualifiers[n].value, sessionid, uint32_t);
+                    rc = PMIx_Value_get_number(&q->qualifiers[n].value, &sessionid, PMIX_UINT32);
+                    if (PMIX_SUCCESS != rc) {
+                        ret = PMIX_ERR_BAD_PARAM;
+                        goto done;
+                    }
 
                 } else if (PMIX_CHECK_KEY(&q->qualifiers[n], PMIX_ALLOC_ID)) {
-                    allocid = q->qualifiers[n].value.data.string;
+                    if (!qual_string(&q->qualifiers[n], (char **) &allocid)) {
+                        ret = PMIX_ERR_BAD_PARAM;
+                        goto done;
+                    }
 
 #ifdef PMIX_ALLOC_PROPERTY
                 } else if (PMIX_CHECK_KEY(&q->qualifiers[n], PMIX_ALLOC_PROPERTY)) {
-                    allocprop = q->qualifiers[n].value.data.string;
+                    if (!qual_string(&q->qualifiers[n], (char **) &allocprop)) {
+                        ret = PMIX_ERR_BAD_PARAM;
+                        goto done;
+                    }
 #endif
                 }
 
             }
         }
         for (n = 0; NULL != q->keys[n]; n++) {
+            ++nkeys;
             pmix_output_verbose(2, prte_pmix_server_globals.output,
                                 "%s processing key %s",
                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), q->keys[n]);
@@ -258,8 +298,12 @@ static void _query(int sd, short args, void *cbdata)
                     if (NULL == jdata) {
                         continue;
                     }
-                    // if the session ID was given, then ignore jobs not from that session
-                    if (UINT32_MAX != sessionid && jdata->session->session_id != sessionid) {
+                    // if the session ID was given, then ignore jobs not from that session.
+                    // A job's session pointer is optional - the launch path falls back to
+                    // prte_default_session where it finds none - so a job that has none
+                    // belongs to no session the caller can have named
+                    if (UINT32_MAX != sessionid &&
+                        (NULL == jdata->session || jdata->session->session_id != sessionid)) {
                         continue;
                     }
                     PMIX_INFO_LIST_START(stack);
@@ -268,12 +312,15 @@ static void _query(int sd, short args, void *cbdata)
                     if (PMIX_SUCCESS != rc) {
                         PMIX_ERROR_LOG(rc);
                         PMIX_INFO_LIST_RELEASE(stack);
+                        PMIX_INFO_LIST_RELEASE(cache);
                         goto done;
                     }
                     /* add the cmd line */
                     app = (prte_app_context_t *) pmix_pointer_array_get_item(jdata->apps, 0);
                     if (NULL == app) {
                         ret = PMIX_ERR_NOT_FOUND;
+                        PMIX_INFO_LIST_RELEASE(stack);
+                        PMIX_INFO_LIST_RELEASE(cache);
                         goto done;
                     }
                     cmdline = PMIx_Argv_join(app->argv, ' ');
@@ -284,6 +331,7 @@ static void _query(int sd, short args, void *cbdata)
                     if (PMIX_SUCCESS != rc) {
                         PMIX_ERROR_LOG(rc);
                         PMIX_INFO_LIST_RELEASE(stack);
+                        PMIX_INFO_LIST_RELEASE(cache);
                         goto done;
                     }
                     /* construct info on each process in the job */
@@ -299,15 +347,23 @@ static void _query(int sd, short args, void *cbdata)
                             PMIX_ERROR_LOG(rc);
                             PMIX_INFO_LIST_RELEASE(stack);
                             PMIX_INFO_LIST_RELEASE(plist);
+                            PMIX_INFO_LIST_RELEASE(cache);
                             goto done;
                         }
-                        /* add the proc's hostname */
-                        PMIX_INFO_LIST_ADD(rc, plist, PMIX_HOSTNAME, proct->node->name, PMIX_STRING);
-                        if (PMIX_SUCCESS != rc) {
-                            PMIX_ERROR_LOG(rc);
-                            PMIX_INFO_LIST_RELEASE(stack);
-                            PMIX_INFO_LIST_RELEASE(plist);
-                            goto done;
+                        /* add the proc's hostname.  A proc has no node until the
+                         * mapper places it, and this loop walks every job in the
+                         * array including one still being mapped - the proc table
+                         * below makes the same check and this did not */
+                        if (NULL != proct->node && NULL != proct->node->name) {
+                            PMIX_INFO_LIST_ADD(rc, plist, PMIX_HOSTNAME, proct->node->name,
+                                               PMIX_STRING);
+                            if (PMIX_SUCCESS != rc) {
+                                PMIX_ERROR_LOG(rc);
+                                PMIX_INFO_LIST_RELEASE(stack);
+                                PMIX_INFO_LIST_RELEASE(plist);
+                                PMIX_INFO_LIST_RELEASE(cache);
+                                goto done;
+                            }
                         }
                         /* add the proc's local rank */
                         PMIX_INFO_LIST_ADD(rc, plist, PMIX_LOCAL_RANK, &proct->local_rank, PMIX_UINT16);
@@ -315,6 +371,7 @@ static void _query(int sd, short args, void *cbdata)
                             PMIX_ERROR_LOG(rc);
                             PMIX_INFO_LIST_RELEASE(stack);
                             PMIX_INFO_LIST_RELEASE(plist);
+                            PMIX_INFO_LIST_RELEASE(cache);
                             goto done;
                         }
                         /* add to the stack */
@@ -323,6 +380,7 @@ static void _query(int sd, short args, void *cbdata)
                             PMIX_ERROR_LOG(rc);
                             PMIX_INFO_LIST_RELEASE(stack);
                             PMIX_INFO_LIST_RELEASE(plist);
+                            PMIX_INFO_LIST_RELEASE(cache);
                             goto done;
                         }
                         PMIX_INFO_LIST_RELEASE(plist);
@@ -334,6 +392,7 @@ static void _query(int sd, short args, void *cbdata)
                     if (PMIX_SUCCESS != rc) {
                         PMIX_ERROR_LOG(rc);
                         PMIX_INFO_LIST_RELEASE(stack);
+                        PMIX_INFO_LIST_RELEASE(cache);
                         goto done;
                     }
                     PMIX_INFO_LIST_RELEASE(stack);
@@ -409,11 +468,9 @@ static void _query(int sd, short args, void *cbdata)
                 if (NULL != prte_hwloc_topology) {
                     char *xmlbuffer = NULL;
                     int len;
-                    kv = PMIX_NEW(prte_info_item_t);
                     /* get it from the v2 API */
                     if (0 != hwloc_topology_export_xmlbuffer(prte_hwloc_topology, &xmlbuffer, &len,
                                                              HWLOC_TOPOLOGY_EXPORT_XML_FLAG_V1)) {
-                        PMIX_RELEASE(kv);
                         continue;
                     }
                     PMIX_INFO_LIST_ADD(rc, results, PMIX_HWLOC_XML_V1, xmlbuffer, PMIX_STRING);
@@ -428,9 +485,7 @@ static void _query(int sd, short args, void *cbdata)
                 if (NULL != prte_hwloc_topology) {
                     char *xmlbuffer = NULL;
                     int len;
-                    kv = PMIX_NEW(prte_info_item_t);
                     if (0 != hwloc_topology_export_xmlbuffer(prte_hwloc_topology, &xmlbuffer, &len, 0)) {
-                        PMIX_RELEASE(kv);
                         continue;
                     }
                     PMIX_INFO_LIST_ADD(rc, results, PMIX_HWLOC_XML_V2, xmlbuffer, PMIX_STRING);
@@ -494,6 +549,10 @@ static void _query(int sd, short args, void *cbdata)
                 } else {
                     /* send them ours */
                     proct = prte_get_proc_object(PRTE_PROC_MY_NAME);
+                    if (NULL == proct) {
+                        ret = PMIX_ERR_NOT_FOUND;
+                        goto done;
+                    }
                 }
                 /* get the server uri value - we can block here as we are in
                  * an PRTE progress thread */
@@ -942,7 +1001,7 @@ static void _query(int sd, short args, void *cbdata)
                  * there way thru the state machine for mapping, and more jobs may
                  * be submitted at any moment.
                  */
-                p = 0;
+                nslots = 0;
                 for (k=0; k < prte_node_pool->size; k++) {
                     node = (prte_node_t*)pmix_pointer_array_get_item(prte_node_pool, k);
                     if (NULL == node) {
@@ -968,9 +1027,12 @@ static void _query(int sd, short args, void *cbdata)
                     if (node->slots <= node->slots_inuse) {
                         continue;
                     }
-                    p += node->slots - node->slots_inuse;
+                    nslots += (uint32_t)(node->slots - node->slots_inuse);
                 }
-                PMIX_INFO_LIST_ADD(rc, results, PMIX_QUERY_AVAILABLE_SLOTS, &p, PMIX_UINT32);
+                /* the count is handed to PMIx by address, so it has to be the
+                 * width PMIx is told it is - a size_t read as a PMIX_UINT32
+                 * takes the correct four bytes only on a little-endian machine */
+                PMIX_INFO_LIST_ADD(rc, results, PMIX_QUERY_AVAILABLE_SLOTS, &nslots, PMIX_UINT32);
                 if (PMIX_SUCCESS != rc) {
                     PMIX_ERROR_LOG(rc);
                     goto done;
@@ -1111,6 +1173,13 @@ static void _query(int sd, short args, void *cbdata)
                 nodelist = PMIx_Argv_join(nodes, ',');
                 PMIx_Argv_free(nodes);
                 PMIX_INFO_LIST_ADD(rc, results, PMIX_QUERY_RESOLVE_NODE, nodelist, PMIX_STRING);
+                if (NULL != nodelist) {
+                    free(nodelist);
+                }
+                if (PMIX_SUCCESS != rc) {
+                    PMIX_ERROR_LOG(rc);
+                    goto done;
+                }
 
             } else if (PMIx_Check_key(q->keys[n], PMIX_QUERY_PROC_RESOURCE_USAGE)) {
 
@@ -1136,19 +1205,24 @@ done:
         ret = rc;
     }
     PMIX_INFO_LIST_RELEASE(results);
-    if (PMIX_ERR_NOT_SUPPORTED != ret) {
-        if (PMIX_ERR_EMPTY == rc) {
+    /* only decide the status here if no arm has already decided it.  An error
+     * an arm set is what actually happened - a malformed qualifier, a job we
+     * do not know - and reporting "not found" in its place tells the caller
+     * the DVM looked.  PMIX_ERR_NOT_SUPPORTED used to be the one error
+     * protected from this, which is how the shape of it is visible: every
+     * other error an arm could set was being thrown away with an empty
+     * result list, which is exactly what an arm that failed leaves behind */
+    if (PMIX_SUCCESS == ret) {
+        if (PMIX_ERR_EMPTY == rc || 0 == dry.size) {
             ret = PMIX_ERR_NOT_FOUND;
-        } else if (PMIX_SUCCESS == ret) {
-            if (0 == dry.size) {
-                ret = PMIX_ERR_NOT_FOUND;
-            } else {
-                if (dry.size < cd->ninfo) {
-                    ret = PMIX_QUERY_PARTIAL_SUCCESS;
-                } else {
-                    ret = PMIX_SUCCESS;
-                }
-            }
+        } else if (dry.size < nkeys) {
+            /* against cd->ninfo, which a query caddy never sets, this compared
+             * with zero and PMIX_QUERY_PARTIAL_SUCCESS could not be reached.
+             * The count that means something here is the number of keys that
+             * were asked for: fewer results than that is what partial success
+             * is for, and a caller has no other way to learn that one of its
+             * keys went unanswered */
+            ret = PMIX_QUERY_PARTIAL_SUCCESS;
         }
     }
     rcd->ninfo = dry.size;

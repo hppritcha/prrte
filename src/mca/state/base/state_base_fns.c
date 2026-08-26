@@ -385,17 +385,26 @@ void prte_state_base_report_progress(int fd, short argc, void *cbdata)
     PMIX_RELEASE(caddy);
 }
 
-void prte_state_base_notify_data_server(pmix_proc_t *target)
+/* Tell the data server that a job has ended, so it can drop the published
+ * data that was not to outlive it.
+ *
+ * The lifetime that ended is named in the message: PMIX_PERSIST_APP, since
+ * the target is a whole namespace.  Without it the server cannot tell this
+ * from an explicit "remove everything I published" and would take data the
+ * publisher asked to keep for the session.
+ *
+ * PMIX_PERSIST_PROC data is therefore reclaimed at job granularity rather
+ * than when its individual publisher exits - later than the Standard's
+ * "until the publishing process terminates", but a message per terminating
+ * process is not a cost this path can carry at scale. */
+static void send_purge(pmix_rank_t dest, prte_rml_tag_t tag, pmix_proc_t *target)
 {
     pmix_data_buffer_t *buf;
+    pmix_info_t horizon;
+    pmix_persistence_t persist = PMIX_PERSIST_APP;
     int rc, room = -1;
     uint8_t cmd = PRTE_PMIX_PURGE_PROC_CMD;
     size_t ninfo;
-
-    /* if nobody local to us published anything, then we can ignore this */
-    if (PMIX_NSPACE_INVALID(prte_pmix_server_globals.server.nspace)) {
-        return;
-    }
 
     PMIX_DATA_BUFFER_CREATE(buf);
 
@@ -423,25 +432,59 @@ void prte_state_base_notify_data_server(pmix_proc_t *target)
         return;
     }
 
-    /* no directives of our own - the count still has to be there, as the
-     * command carries one and the reader unpacks it unconditionally */
-    ninfo = 0;
+    /* one directive: the lifetime that just ended */
+    ninfo = 1;
     rc = PMIx_Data_pack(NULL, buf, &ninfo, 1, PMIX_SIZE);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
         PMIX_DATA_BUFFER_RELEASE(buf);
         return;
     }
+    PMIX_INFO_LOAD(&horizon, PMIX_PERSISTENCE, &persist, PMIX_PERSIST);
+    rc = PMIx_Data_pack(NULL, buf, &horizon, 1, PMIX_INFO);
+    PMIX_INFO_DESTRUCT(&horizon);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        PMIX_DATA_BUFFER_RELEASE(buf);
+        return;
+    }
 
-    /* Send the request to the server.  An external data server is not
-     * addressable over the RML - only the master holds the PMIx connection
-     * to it - so the request goes to the master, which relays it. */
-    PRTE_RML_RELIABLE_SEND(rc, (NULL == prte_data_server_uri)
-                                   ? prte_pmix_server_globals.server.rank
-                                   : PRTE_PROC_MY_HNP->rank,
-                  buf, PRTE_RML_TAG_DATA_SERVER);
+    PRTE_RML_RELIABLE_SEND(rc, dest, buf, tag);
     if (PRTE_SUCCESS != rc) {
         PMIX_DATA_BUFFER_RELEASE(buf);
+    }
+}
+
+void prte_state_base_notify_data_server(pmix_proc_t *target)
+{
+    pmix_rank_t global;
+
+    /* if nobody local to us published anything, then we can ignore this */
+    if (PMIX_NSPACE_INVALID(prte_pmix_server_globals.server.nspace)) {
+        return;
+    }
+
+    /* The global store.  An external data server is not addressable over
+     * the RML - only the master holds the PMIx connection to it - so the
+     * request goes to the master, which relays it. */
+    global = (NULL == prte_data_server_uri) ? prte_pmix_server_globals.server.rank
+                                            : PRTE_PROC_MY_HNP->rank;
+    send_purge(global, PRTE_RML_TAG_DATA_SERVER, target);
+
+    /* ...and OUR OWN store, which is a different one on every daemon but
+     * the master.  A PMIX_RANGE_LOCAL publish never leaves the daemon that
+     * relayed it - pmix_server_pub.c routes it to PRTE_PROC_MY_NAME - and
+     * every daemon runs prte_data_server_init(), so what a local-range
+     * publish leaves behind is reclaimable only from here.  Purging just
+     * the global store reclaimed everything EXCEPT local-range data, which
+     * a single-node run cannot show: there the two stores are one object.
+     *
+     * The tag is what keeps this one at home: a daemon pointed at an
+     * external data server relays what arrives on the ordinary tag, so a
+     * purge of our own store addressed to ourselves would be forwarded to
+     * a DVM that does not hold the data and cannot act on it. */
+    if (global != PRTE_PROC_MY_NAME->rank) {
+        send_purge(PRTE_PROC_MY_NAME->rank, PRTE_RML_TAG_DATA_SERVER_LOCAL, target);
     }
 }
 
@@ -744,12 +787,14 @@ void prte_state_base_track_procs(int fd, short argc, void *cbdata)
             if (prte_state_base.run_fdcheck) {
                 prte_state_base_check_fds(jdata);
             }
-            /* if ompi-server is around, then notify it to purge
-             * any session-related info */
-            if (NULL != prte_data_server_uri) {
-                PMIX_LOAD_PROCID(&target, jdata->nspace, PMIX_RANK_WILDCARD);
-                prte_state_base_notify_data_server(&target);
-            }
+            /* tell the data server the job is over, so it can drop what
+             * this namespace published that was not to outlive it.  This
+             * used to be done only when an external data server was
+             * configured, which left the built-in one - the usual case -
+             * never told a job had ended, so nothing was ever reclaimed
+             * from it short of the DVM shutting down */
+            PMIX_LOAD_PROCID(&target, jdata->nspace, PMIX_RANK_WILDCARD);
+            prte_state_base_notify_data_server(&target);
             PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_TERMINATED);
         }
     }

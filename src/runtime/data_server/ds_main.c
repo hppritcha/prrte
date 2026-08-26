@@ -92,6 +92,9 @@ int prte_data_server_init(void)
 
     PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_DATA_SERVER,
                   PRTE_RML_PERSISTENT, prte_data_server, NULL);
+    /* requests that are about our own store, whatever else is configured */
+    PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_DATA_SERVER_LOCAL,
+                  PRTE_RML_PERSISTENT, prte_data_server, NULL);
 
     return PRTE_SUCCESS;
 }
@@ -125,7 +128,7 @@ void prte_data_server(int status, pmix_proc_t *sender,
     pmix_data_buffer_t *answer;
     pmix_status_t rc;
     int room_number;
-    PRTE_HIDE_UNUSED_PARAMS(status, tag, cbdata);
+    PRTE_HIDE_UNUSED_PARAMS(status, cbdata);
 
     pmix_output_verbose(1, prte_data_store.output,
                         "%s data server got message from %s",
@@ -148,19 +151,6 @@ void prte_data_server(int status, pmix_proc_t *sender,
         return;
     }
 
-    /* When an external data server is configured, this DVM stores nothing:
-     * the request is reissued to that server over our PMIx tool connection
-     * to it, and the relay answers this sender when it replies.  Only the
-     * master holds that connection, which is why every daemon addressed
-     * its request here (pmix_server_pub.c, execute). */
-    if (NULL != prte_data_server_uri) {
-        rc = prte_ds_relay(sender, room_number, command, buffer);
-        if (PMIX_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
-        }
-        return;
-    }
-
     PMIX_DATA_BUFFER_CREATE(answer);
     /* pack the room number as this must lead any response */
     rc = PMIx_Data_pack(NULL, answer, &room_number, 1, PMIX_INT);
@@ -175,6 +165,37 @@ void prte_data_server(int status, pmix_proc_t *sender,
         PMIX_ERROR_LOG(rc);
         PMIX_DATA_BUFFER_RELEASE(answer);
         return;
+    }
+
+    /* When an external data server is configured, this DVM stores nothing
+     * that is not local to it: the request is reissued to that server over
+     * our PMIx tool connection, and the relay answers this sender when it
+     * replies.  Only the master holds that connection, which is why every
+     * daemon addressed its request here (pmix_server_pub.c, execute).
+     *
+     * "Not local to it" is the whole of the exception, and the tag is what
+     * carries it.  A PMIX_RANGE_LOCAL item never leaves the daemon that
+     * relayed it - execute() routes it to PRTE_PROC_MY_NAME - so sending it
+     * on to another DVM would store it where its own publisher could never
+     * look it up, and would answer a local-range lookup out of a store that
+     * cannot hold local-range data.  By the time we get here the range is
+     * buried in a payload whose shape depends on the command, so the sender
+     * says which store it means by choosing the tag.
+     *
+     * A relay that could NOT take the request on has to be reported like any
+     * other failure.  This used to log the error and return, answering
+     * nobody - so the daemon that asked stayed parked on its room number and
+     * the process behind it hung for good.  An unreachable data server is
+     * something a caller can be told about; a hang is not. */
+    if (NULL != prte_data_server_uri && PRTE_RML_TAG_DATA_SERVER_LOCAL != tag) {
+        rc = prte_ds_relay(sender, room_number, command, buffer);
+        if (PMIX_SUCCESS == rc) {
+            /* the relay owns the request now and answers from a reply of
+             * its own, so ours is surplus */
+            PMIX_DATA_BUFFER_RELEASE(answer);
+            return;
+        }
+        goto report;
     }
 
     /* From here on the handlers own "answer": each of them either sends it
@@ -208,13 +229,17 @@ void prte_data_server(int status, pmix_proc_t *sender,
             break;
     }
 
+report:
     if (PMIX_SUCCESS != rc) {
         pmix_status_t ret;
 
+        /* rc is a pmix_status_t here, so it takes the PMIx formatter -
+         * PRTE_ERROR_NAME knows only PRRTE's codes and rendered every
+         * status this reports as "Unknown error" */
         pmix_output_verbose(1, prte_data_store.output,
                             "%s data server: sending error %s",
                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                            PRTE_ERROR_NAME(rc));
+                            PMIx_Error_string(rc));
         /* pack the error code. Keep the pack status in its own variable:
          * overwriting rc with it lost the very code we were reporting, and
          * a failed pack then went out as a "successful" empty answer. */
@@ -444,7 +469,10 @@ static void construct(prte_data_object_t *ptr)
     ptr->agids = NULL;
     ptr->nagids = 0;
     ptr->range = PMIX_RANGE_SESSION;
-    ptr->persistence = PMIX_PERSIST_SESSION;
+    /* the Standard's default is PMIX_PERSIST_APP - "retain until the
+     * application terminates".  PMIx adds no default of its own before
+     * handing a publish to the host, so this is the one that governs */
+    ptr->persistence = PMIX_PERSIST_APP;
     PMIX_CONSTRUCT(&ptr->info, pmix_list_t);
 }
 

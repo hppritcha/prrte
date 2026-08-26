@@ -57,6 +57,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 #include "constants.h"
 #include "src/event/event-internal.h"
@@ -65,12 +66,14 @@
 #include "src/runtime/prte_globals.h"
 #include "src/runtime/runtime.h"
 #include "src/util/proc_info.h"
+#include "src/util/pmix_environ.h"
 
 #include "src/mca/rmaps/base/base.h"
 #include "src/mca/rmaps/rmaps_types.h"
 #include "src/mca/schizo/base/base.h"
 #include "src/mca/state/base/base.h"
 #include "src/prted/prted.h"
+#include "src/util/prte_cmd_line.h"
 #include "src/prted/pmix/pmix_server.h"
 #include "src/prted/pmix/pmix_server_internal.h"
 
@@ -180,6 +183,112 @@ static int test_singleton_id(void)
           PRTE_SUCCESS != prte_parse_singleton_id("myapp.0", nspace, NULL));
     CHECK("singleton/empty",
           PRTE_SUCCESS != prte_parse_singleton_id("", nspace, &rank));
+
+    return failures;
+}
+
+/*
+ * prte_parse_appfile() -- the "--app <file>" reader.
+ *
+ * Each line of the file becomes one app context, and the lines are joined
+ * with the ":" delimiter the command-line parser expects.  A blank line
+ * splits to no tokens at all, which PMIx_Argv_split reports by returning
+ * NULL rather than an empty array; indexing that unconditionally segfaulted
+ * the tool, and a blank line in an appfile is entirely ordinary.
+ */
+static int write_appfile(const char *path, const char *contents)
+{
+    FILE *fp = fopen(path, "w");
+
+    if (NULL == fp) {
+        return -1;
+    }
+    fputs(contents, fp);
+    fclose(fp);
+    return 0;
+}
+
+static int test_appfile(void)
+{
+    int failures = 0;
+    char path[PRTE_PATH_MAX];
+    char **argv;
+    int argc;
+
+    snprintf(path, sizeof(path), "%s/prte_test_appfile.%lu",
+             pmix_tmp_directory(), (unsigned long) getpid());
+
+    /* two app contexts become two segments joined by ":" */
+    if (0 != write_appfile(path, "-n 2 ./alpha\n-n 4 ./beta\n")) {
+        fprintf(stderr, "appfile: could not write %s\n", path);
+        return 1;
+    }
+    argv = NULL;
+    argc = 0;
+    CHECK("appfile/rc", PRTE_SUCCESS == prte_parse_appfile(path, &argv, &argc));
+    CHECK("appfile/count", 7 == argc);
+    CHECK("appfile/count-matches", argc == (int) PMIx_Argv_count(argv));
+    CHECK("appfile/first", NULL != argv && 0 == strcmp(argv[0], "-n"));
+    CHECK("appfile/exec1", NULL != argv && 0 == strcmp(argv[2], "./alpha"));
+    CHECK("appfile/delim", NULL != argv && 0 == strcmp(argv[3], ":"));
+    CHECK("appfile/exec2", NULL != argv && 0 == strcmp(argv[6], "./beta"));
+    PMIx_Argv_free(argv);
+
+    /* Blank lines - leading, interior, trailing - and whitespace-only lines
+     * are skipped entirely.  They must not crash, and must not contribute a
+     * delimiter either, which would produce an empty app context. */
+    if (0 != write_appfile(path, "\n-n 2 ./alpha\n\n   \n-n 4 ./beta\n\n")) {
+        fprintf(stderr, "appfile: could not write %s\n", path);
+        return 1;
+    }
+    argv = NULL;
+    argc = 0;
+    CHECK("appfile/blank-rc", PRTE_SUCCESS == prte_parse_appfile(path, &argv, &argc));
+    CHECK("appfile/blank-count", 7 == argc);
+    CHECK("appfile/blank-exec1", NULL != argv && 0 == strcmp(argv[2], "./alpha"));
+    CHECK("appfile/blank-delim", NULL != argv && 0 == strcmp(argv[3], ":"));
+    CHECK("appfile/blank-exec2", NULL != argv && 0 == strcmp(argv[6], "./beta"));
+    PMIx_Argv_free(argv);
+
+    /* a file of nothing but blank lines yields nothing at all */
+    if (0 != write_appfile(path, "\n\n  \n\n")) {
+        fprintf(stderr, "appfile: could not write %s\n", path);
+        return 1;
+    }
+    argv = NULL;
+    argc = 0;
+    CHECK("appfile/allblank-rc", PRTE_SUCCESS == prte_parse_appfile(path, &argv, &argc));
+    CHECK("appfile/allblank-count", 0 == argc);
+    CHECK("appfile/allblank-argv", NULL == argv);
+
+    /* the caller's existing argv is appended to, not replaced */
+    if (0 != write_appfile(path, "./gamma\n")) {
+        fprintf(stderr, "appfile: could not write %s\n", path);
+        return 1;
+    }
+    argv = NULL;
+    argc = 0;
+    PMIx_Argv_append_nosize(&argv, "prterun");
+    argc = 1;
+    CHECK("appfile/append-rc", PRTE_SUCCESS == prte_parse_appfile(path, &argv, &argc));
+    CHECK("appfile/append-count", 2 == argc);
+    CHECK("appfile/append-kept", NULL != argv && 0 == strcmp(argv[0], "prterun"));
+    CHECK("appfile/append-added", NULL != argv && 0 == strcmp(argv[1], "./gamma"));
+    PMIx_Argv_free(argv);
+
+    unlink(path);
+
+    /* degenerate inputs */
+    argv = NULL;
+    argc = 0;
+    CHECK("appfile/missing",
+          PRTE_SUCCESS != prte_parse_appfile(path, &argv, &argc));
+    CHECK("appfile/null-path",
+          PRTE_SUCCESS != prte_parse_appfile(NULL, &argv, &argc));
+    CHECK("appfile/null-argv",
+          PRTE_SUCCESS != prte_parse_appfile("/dev/null", NULL, &argc));
+    CHECK("appfile/null-argc",
+          PRTE_SUCCESS != prte_parse_appfile("/dev/null", &argv, NULL));
 
     return failures;
 }
@@ -319,6 +428,45 @@ static int test_xfer_job_info(void)
     CHECK("xfer/empty", PRTE_SUCCESS == prte_pmix_xfer_job_info(jdata, NULL, 0));
     PMIX_RELEASE(jdata);
 
+    /* A directive whose value is a PMIX_STRING carrying no string is what
+     * PMIX_INFO_LOAD produces from a NULL - an ordinary thing for an
+     * application to hand PMIx_Spawn, and something PMIx itself treats as
+     * legal.  The branches that parse such a value rather than pass it on
+     * to a NULL-tolerant callee used to dereference it, so a client could
+     * segfault the daemon it was attached to with one spawn request.  Each
+     * of these must come back as a refusal, and must come back at all. */
+    jdata = fresh_job();
+    PMIX_INFO_LOAD(&info[0], PMIX_STDIN_TGT, NULL, PMIX_STRING);
+    CHECK("xfer/null-stdin-tgt", PRTE_SUCCESS != prte_pmix_xfer_job_info(jdata, info, 1));
+    PMIX_INFO_DESTRUCT(&info[0]);
+    PMIX_RELEASE(jdata);
+
+    jdata = fresh_job();
+    PMIX_INFO_LOAD(&info[0], PMIX_SPAWN_TIMEOUT, NULL, PMIX_STRING);
+    CHECK("xfer/null-spawn-timeout", PRTE_SUCCESS != prte_pmix_xfer_job_info(jdata, info, 1));
+    PMIX_INFO_DESTRUCT(&info[0]);
+    PMIX_RELEASE(jdata);
+
+    jdata = fresh_job();
+    PMIX_INFO_LOAD(&info[0], PMIX_JOB_TIMEOUT, NULL, PMIX_STRING);
+    CHECK("xfer/null-job-timeout", PRTE_SUCCESS != prte_pmix_xfer_job_info(jdata, info, 1));
+    PMIX_INFO_DESTRUCT(&info[0]);
+    PMIX_RELEASE(jdata);
+
+    jdata = fresh_job();
+    PMIX_INFO_LOAD(&info[0], PMIX_PARENT_ID, NULL, PMIX_PROC);
+    CHECK("xfer/null-parent-id", PRTE_SUCCESS != prte_pmix_xfer_job_info(jdata, info, 1));
+    PMIX_INFO_DESTRUCT(&info[0]);
+    PMIX_RELEASE(jdata);
+
+    /* ...and a key whose value we only ever hand onward stays a no-op: the
+     * guard above must not have turned every empty value into a refusal */
+    jdata = fresh_job();
+    PMIX_INFO_LOAD(&info[0], PMIX_ALLOC_ID, NULL, PMIX_STRING);
+    CHECK("xfer/null-passthrough", PRTE_SUCCESS == prte_pmix_xfer_job_info(jdata, info, 1));
+    PMIX_INFO_DESTRUCT(&info[0]);
+    PMIX_RELEASE(jdata);
+
     return failures;
 }
 
@@ -394,6 +542,35 @@ static int test_xfer_app(void)
     app = (prte_app_context_t *) pmix_pointer_array_get_item(jdata->apps, 1);
     CHECK("app/multi-idx", NULL != app && 1 == app->idx);
     CHECK("app/multi-cmd", NULL != app && 0 == strcmp(app->app, "b"));
+    PMIX_APP_DESTRUCT(&papp);
+    PMIX_RELEASE(jdata);
+
+    /* PMIX_WDIR overrides whatever pmix_app_t.cwd already gave us, so the
+     * earlier value has to be let go rather than stranded - and a WDIR
+     * carrying no string at all must be refused rather than dereferenced */
+    jdata = fresh_job();
+    PMIX_APP_CONSTRUCT(&papp);
+    papp.cmd = strdup("c");
+    papp.cwd = strdup("/tmp");
+    papp.maxprocs = 1;
+    PMIX_INFO_CREATE(papp.info, 1);
+    papp.ninfo = 1;
+    PMIX_INFO_LOAD(&papp.info[0], PMIX_WDIR, "/usr", PMIX_STRING);
+    CHECK("app/wdir-rc", PRTE_SUCCESS == prte_pmix_xfer_app(jdata, &papp));
+    app = (prte_app_context_t *) pmix_pointer_array_get_item(jdata->apps, 0);
+    CHECK("app/wdir-override", NULL != app && NULL != app->cwd
+                               && 0 == strcmp(app->cwd, "/usr"));
+    PMIX_APP_DESTRUCT(&papp);
+    PMIX_RELEASE(jdata);
+
+    jdata = fresh_job();
+    PMIX_APP_CONSTRUCT(&papp);
+    papp.cmd = strdup("d");
+    papp.maxprocs = 1;
+    PMIX_INFO_CREATE(papp.info, 1);
+    papp.ninfo = 1;
+    PMIX_INFO_LOAD(&papp.info[0], PMIX_WDIR, NULL, PMIX_STRING);
+    CHECK("app/wdir-null", PRTE_SUCCESS != prte_pmix_xfer_app(jdata, &papp));
     PMIX_APP_DESTRUCT(&papp);
     PMIX_RELEASE(jdata);
 
@@ -860,6 +1037,147 @@ static int check_envar_app(const char *desc, prte_pmix_app_t *app,
     return failures;
 }
 
+/*
+ * The --prefix / --pmix-prefix / --app-prefix conflict checks in
+ * create_app(), driven through prte_parse_locals().
+ *
+ * The pmix-prefix check counted instances of PRTE_CLI_PREFIX while walking
+ * PRTE_CLI_PMIX_PREFIX's values.  That both skipped the check whenever no
+ * --prefix was given - so conflicting --pmix-prefix values were silently
+ * accepted and the first one used - and walked the value array past its
+ * NULL terminator whenever more --prefix values were given than
+ * --pmix-prefix ones, which segfaulted the tool.
+ */
+typedef struct {
+    const char *desc;
+    const char *argv[12];
+    bool accept;
+    const char *prte_prefix;  /* expected PRTE_PREFIX in jobdata, or NULL */
+    const char *pmix_prefix;  /* expected PMIX_PREFIX in jobdata, or NULL */
+} prefix_case_t;
+
+static prefix_case_t prefix_cases[] = {
+    {"prefix/two-prte-one-pmix",
+     {"prterun", "--prefix", "/opt/x", "--prefix", "/opt/x",
+      "--pmix-prefix", "/opt/y", "hostname", NULL},
+     true, "/opt/x", "/opt/y"},
+    {"prefix/pmix-conflict",
+     {"prterun", "--pmix-prefix", "/opt/a", "--pmix-prefix", "/opt/b",
+      "hostname", NULL},
+     false, NULL, NULL},
+    {"prefix/pmix-repeat-agrees",
+     {"prterun", "--pmix-prefix", "/opt/a", "--pmix-prefix", "/opt/a",
+      "hostname", NULL},
+     true, NULL, "/opt/a"},
+    {"prefix/prte-conflict",
+     {"prterun", "--prefix", "/opt/a", "--prefix", "/opt/b",
+      "hostname", NULL},
+     false, NULL, NULL},
+    {"prefix/prte-repeat-agrees",
+     {"prterun", "--prefix", "/opt/a", "--prefix", "/opt/a",
+      "hostname", NULL},
+     true, "/opt/a", NULL},
+    {NULL, {NULL}, false, NULL, NULL}
+};
+
+static const char *find_jobdata(pmix_list_t *jobdata, const char *key)
+{
+    prte_info_item_t *item;
+
+    PMIX_LIST_FOREACH(item, jobdata, prte_info_item_t) {
+        if (PMIx_Check_key(item->info.key, key)) {
+            return item->info.value.data.string;
+        }
+    }
+    return NULL;
+}
+
+static int test_prefix_conflicts(void)
+{
+    prte_schizo_base_module_t *schizo;
+    prefix_case_t *c;
+    pmix_list_t apps, jobdata;
+    const char *got;
+    int failures = 0, rc;
+    char buf[128];
+
+    schizo = envar_test_schizo();
+    if (NULL == schizo) {
+        return 1;
+    }
+
+    for (c = prefix_cases; NULL != c->desc; c++) {
+        PMIX_CONSTRUCT(&apps, pmix_list_t);
+        PMIX_CONSTRUCT(&jobdata, pmix_list_t);
+        rc = prte_parse_locals(schizo, &apps, (char **) c->argv,
+                               NULL, NULL, &jobdata, NULL);
+        snprintf(buf, sizeof(buf), "%s/rc", c->desc);
+        CHECK(buf, c->accept == (PRTE_SUCCESS == rc));
+        if (c->accept && PRTE_SUCCESS == rc) {
+            got = find_jobdata(&jobdata, "PRTE_PREFIX");
+            snprintf(buf, sizeof(buf), "%s/prte-prefix", c->desc);
+            CHECK(buf, (NULL == c->prte_prefix)
+                           ? (NULL == got)
+                           : (NULL != got && 0 == strcmp(got, c->prte_prefix)));
+            got = find_jobdata(&jobdata, PMIX_PREFIX);
+            snprintf(buf, sizeof(buf), "%s/pmix-prefix", c->desc);
+            CHECK(buf, (NULL == c->pmix_prefix)
+                           ? (NULL == got)
+                           : (NULL != got && 0 == strcmp(got, c->pmix_prefix)));
+        }
+        PMIX_LIST_DESTRUCT(&jobdata);
+        PMIX_LIST_DESTRUCT(&apps);
+    }
+
+    return failures;
+}
+
+/*
+ * "-n <value>" has to be a number that fits an int.  Anything else read as
+ * 0 through strtol, which is the spelling of "let the mapping policy decide"
+ * - so a misspelled count silently launched some other number of processes.
+ */
+static int test_nprocs(void)
+{
+    prte_schizo_base_module_t *schizo;
+    pmix_list_t apps;
+    prte_pmix_app_t *app;
+    int failures = 0, rc;
+    size_t n;
+    const char *bad[] = {"four", "", "2x", " 2", "-1", "4294967297", NULL};
+    const char *good_argv[] = {"prterun", "-n", "6", "hostname", NULL};
+
+    schizo = envar_test_schizo();
+    if (NULL == schizo) {
+        return 1;
+    }
+
+    for (n = 0; NULL != bad[n]; n++) {
+        const char *argv[] = {"prterun", "-n", bad[n], "hostname", NULL};
+        char buf[96];
+
+        PMIX_CONSTRUCT(&apps, pmix_list_t);
+        rc = prte_parse_locals(schizo, &apps, (char **) argv,
+                               NULL, NULL, NULL, NULL);
+        snprintf(buf, sizeof(buf), "nprocs/reject-\"%s\"", bad[n]);
+        CHECK(buf, PRTE_SUCCESS != rc);
+        PMIX_LIST_DESTRUCT(&apps);
+    }
+
+    PMIX_CONSTRUCT(&apps, pmix_list_t);
+    rc = prte_parse_locals(schizo, &apps, (char **) good_argv,
+                           NULL, NULL, NULL, NULL);
+    CHECK("nprocs/accept-rc", PRTE_SUCCESS == rc);
+    CHECK("nprocs/accept-count", 1 == pmix_list_get_size(&apps));
+    if (1 == pmix_list_get_size(&apps)) {
+        app = (prte_pmix_app_t *) pmix_list_get_first(&apps);
+        CHECK("nprocs/accept-value", 6 == app->app.maxprocs);
+    }
+    PMIX_LIST_DESTRUCT(&apps);
+
+    return failures;
+}
+
 static int test_envar_order(int *nskipped)
 {
     prte_schizo_base_module_t *schizo;
@@ -1266,6 +1584,15 @@ static const struct {
     {"-5",                     -1},
     {"5s",                     -1},
     {"1:2:3:4:5:6",            -1},   /* one field too many */
+    /* Inside strtol's range and outside the accumulator's.  strtol reports
+     * only its own overflow, so a month count this large used to be
+     * multiplied by 2592000 and summed as signed - undefined, and in
+     * practice a plausible-looking duration for a session that would then
+     * be reclaimed at the wrong moment. */
+    {"3558399705577:0:0:0:0",  -1},
+    {"3558399705576:0:0:0:0",  3558399705576L * 2592000L},  /* the largest that fits */
+    {"9223372036854775807",    9223372036854775807L},  /* LONG_MAX: seconds, x1 */
+    {"9223372036854775808",    -1},   /* past LONG_MAX: strtol's own overflow */
 };
 
 static int test_session_time(void)
@@ -1294,6 +1621,213 @@ static int test_session_time(void)
  * remembers what it was told and that it stays bounded - a persistent DVM
  * runs jobs without end.
  */
+/*
+ * prte_pmix_server_req_t's constructor.
+ *
+ * PMIX_NEW mallocs and does not zero, so a field the constructor forgets
+ * holds whatever the previous occupant of that memory left behind.  The
+ * field that matters most is tproc: the loops that decide which request an
+ * arriving answer belongs to match on it, and an operation that names no
+ * target proc at all - monitor, publish/lookup, spawn, tool connection -
+ * never writes it.  Those loops screen such a request by testing its
+ * nspace for PMIx's "invalid", which only works because the constructor
+ * puts the sentinel there.
+ *
+ * The recycling half of this test is the part that catches the bug: it
+ * releases a request that DID name a target before allocating another,
+ * which the allocator satisfies from the same block - so a constructor
+ * that leaves tproc alone hands the new request the dead one's identity.
+ */
+static int test_request_tracker(void)
+{
+    int failures = 0;
+    prte_pmix_server_req_t *req;
+    pmix_proc_t real, wild;
+
+    PMIX_LOAD_PROCID(&real, "unit-test-tracker", 3);
+    PMIX_LOAD_PROCID(&wild, "unit-test-tracker", PMIX_RANK_WILDCARD);
+
+    req = PMIX_NEW(prte_pmix_server_req_t);
+    CHECK("a new request names no target proc", PMIX_NSPACE_INVALID(req->tproc.nspace));
+    CHECK("...with an invalid rank", PMIX_RANK_INVALID == req->tproc.rank);
+    CHECK("...so it matches no real proc", !PMIX_CHECK_PROCID(&req->tproc, &real));
+    CHECK("...it is on neither request array",
+          -1 == req->local_index && -1 == req->remote_index);
+    CHECK("...and it owns no info array", !req->copy && NULL == req->info);
+    /* the sentinel is not sufficient on its own, which is why the matching
+     * loops screen for it: an empty nspace matches every namespace, so a
+     * job-level fetch (rank=WILDCARD) does pair with an untargeted request */
+    CHECK("a job-level fetch would match it", PMIX_CHECK_PROCID(&req->tproc, &wild));
+
+    /* mdxcbfunc is the other field the matching loops key on, and it carries
+     * more weight than tproc does: pmix_server_dmdx_resp() uses it to tell a
+     * direct-modex request from everything else sharing local_reqs - the
+     * scheduler relays record a REAL requestor in tproc, so the sentinel
+     * check above does not screen them - and having decided, it CALLS it.
+     * A stale one left in a recycled block is therefore not a mismatch but a
+     * jump through a dangling function pointer. */
+    CHECK("a new request carries no modex callback", NULL == req->mdxcbfunc);
+
+    /* leave a real identity in the allocator, then take the block back */
+    PMIX_XFER_PROCID(&req->tproc, &real);
+    req->mdxcbfunc = (pmix_modex_cbfunc_t) 0x1;
+    PMIX_RELEASE(req);
+    req = PMIX_NEW(prte_pmix_server_req_t);
+    CHECK("a recycled request does not inherit the last one's target",
+          PMIX_NSPACE_INVALID(req->tproc.nspace) && PMIX_RANK_INVALID == req->tproc.rank);
+    CHECK("...nor the last one's modex callback", NULL == req->mdxcbfunc);
+    PMIX_RELEASE(req);
+
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_request_tracker\n");
+    }
+    return failures;
+}
+
+/* The monitor collective's accounting for a daemon that dies mid-flight.
+ *
+ * The request fans out with an xcast and then counts direct replies, so
+ * nothing in it is keyed on the routing tree and nothing repairs it when the
+ * tree changes - a daemon that dies simply never answers.  What closes that
+ * is prte_pmix_server_fault_handler(), and the two things it has to get right
+ * are both invisible in a single-shot test: the routing tree calls it TWICE
+ * for one death (LOCAL scope, then GLOBAL), and it must not account a rank
+ * this particular request was never waiting on.
+ *
+ * The recovery status is filled in by hand rather than constructed, because
+ * its constructor reads the live routing tree, which no unit test has. */
+static pmix_status_t mon_status;
+static int mon_calls;
+
+static void mon_cbfunc(pmix_status_t status, pmix_info_t *info, size_t ninfo,
+                       void *cbdata, pmix_release_cbfunc_t release_fn,
+                       void *release_cbdata)
+{
+    PRTE_HIDE_UNUSED_PARAMS(info, ninfo, cbdata, release_fn, release_cbdata);
+    /* deliberately does NOT invoke release_fn: that thread-shifts onto an
+     * event base nothing is driving here.  The test owns the request. */
+    mon_status = status;
+    ++mon_calls;
+}
+
+static prte_pmix_server_req_t *mon_req(pmix_info_t *monitor, pmix_rank_t nexpect)
+{
+    prte_pmix_server_req_t *req;
+    pmix_rank_t r;
+
+    req = PMIX_NEW(prte_pmix_server_req_t);
+    req->monitor = monitor;      /* moncopy stays false - we own it */
+    req->infocbfunc = mon_cbfunc;
+    for (r = 1; r <= nexpect; r++) {
+        pmix_bitmap_set_bit(&req->expected_dmns, (int) r);
+    }
+    req->ndaemons = nexpect;
+    req->local_index = pmix_pointer_array_add(&prte_pmix_server_globals.local_reqs, req);
+    return req;
+}
+
+static void mon_reported(prte_pmix_server_req_t *req, pmix_rank_t r, bool ok)
+{
+    pmix_bitmap_set_bit(&req->reported_dmns, (int) r);
+    ++req->nreported;
+    if (ok) {
+        ++req->nsuccess;
+    }
+}
+
+static void mon_drop(prte_pmix_server_req_t *req)
+{
+    pmix_pointer_array_set_item(&prte_pmix_server_globals.local_reqs,
+                                req->local_index, NULL);
+    PMIX_RELEASE(req);
+}
+
+static int test_monitor_accounting(void)
+{
+    int failures = 0;
+    prte_pmix_server_req_t *req;
+    prte_rml_recovery_status_t st;
+    pmix_rank_t failed[2];
+    pmix_info_t monitor;
+    uint32_t nrep;
+
+    PMIX_CONSTRUCT(&prte_pmix_server_globals.local_reqs, pmix_pointer_array_t);
+    pmix_pointer_array_init(&prte_pmix_server_globals.local_reqs, 8, INT32_MAX, 8);
+    PMIX_INFO_LOAD(&monitor, PMIX_MONITOR_HEARTBEAT, NULL, PMIX_BOOL);
+
+    memset(&st, 0, sizeof(st));
+    st.failed_ranks.array = failed;
+    st.failed_ranks.type = PMIX_PROC_RANK;
+
+    /* one of three answered, the other two died: the caller is holding a
+     * sample of part of the DVM and has to be told so */
+    req = mon_req(&monitor, 3);
+    mon_reported(req, 1, true);
+    mon_calls = 0;
+    mon_status = PMIX_SUCCESS;
+    failed[0] = 2;
+    failed[1] = 3;
+    st.failed_ranks.size = 2;
+    prte_pmix_server_fault_handler(&st);
+    CHECK("losing the last outstanding daemons completes the request", 1 == mon_calls);
+    CHECK("...with partial success", PMIX_ERR_PARTIAL_SUCCESS == mon_status);
+
+    /* the tree reports every death twice - LOCAL scope then GLOBAL - and the
+     * request is still on the array when the second call arrives, because the
+     * release it was handed thread-shifts.  A second completion here would
+     * answer the client twice and release the request under it. */
+    nrep = req->nreported;
+    prte_pmix_server_fault_handler(&st);
+    CHECK("the second notice for the same death is a no-op", 1 == mon_calls);
+    /* assert the accounting directly, not just that it did not complete
+     * twice: an over-count sails past the equality test in the completion
+     * check and would leave this looking clean while the request could
+     * never again be completed by anything */
+    CHECK("...and does not count the same death twice", nrep == req->nreported);
+    mon_drop(req);
+
+    /* nobody answered at all - "partial" would be a lie, so the status says
+     * why instead */
+    req = mon_req(&monitor, 2);
+    mon_calls = 0;
+    failed[0] = 1;
+    failed[1] = 2;
+    st.failed_ranks.size = 2;
+    prte_pmix_server_fault_handler(&st);
+    CHECK("losing every daemon completes the request", 1 == mon_calls);
+    CHECK("...and does not call that a partial success",
+          PMIX_SUCCESS != mon_status && PMIX_ERR_PARTIAL_SUCCESS != mon_status);
+    mon_drop(req);
+
+    /* a death this request was never waiting on must not be counted: doing so
+     * completes it early, before the daemons it IS waiting on have answered */
+    req = mon_req(&monitor, 1);
+    mon_calls = 0;
+    failed[0] = 7;
+    st.failed_ranks.size = 1;
+    prte_pmix_server_fault_handler(&st);
+    CHECK("an unrelated daemon's death is not accounted", 0 == mon_calls);
+    CHECK("...and leaves the request waiting", 0 == req->nreported);
+    mon_drop(req);
+
+    /* a request that never fanned out has no expected set to consult */
+    req = mon_req(&monitor, 0);
+    mon_calls = 0;
+    failed[0] = 1;
+    st.failed_ranks.size = 1;
+    prte_pmix_server_fault_handler(&st);
+    CHECK("a request that never fanned out is left alone", 0 == mon_calls);
+    mon_drop(req);
+
+    PMIX_INFO_DESTRUCT(&monitor);
+    PMIX_DESTRUCT(&prte_pmix_server_globals.local_reqs);
+
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_monitor_accounting\n");
+    }
+    return failures;
+}
+
 static int test_departed_jobs(void)
 {
     int failures = 0;
@@ -1358,6 +1892,330 @@ static int test_departed_jobs(void)
  * wildcard member covers, and that a record is neither leaked nor dropped
  * while somebody named in it still exists.  Sending the event needs daemons.
  */
+/*
+ * PMIX_GROUP_LEFT arrives as an ordinary event notification, which means its
+ * info array is whatever the generating client passed to PMIx_Notify_event:
+ * PMIx forwards it to the host without inspecting what any entry holds, and
+ * the host then xcasts it to every daemon in the DVM.  So every value has to
+ * have its type checked before the matching member of its union is read, and
+ * the departing proc has to name a concrete identity - PMIX_CHECK_PROCID
+ * counts an empty nspace and a wildcard rank as matching anything, so a
+ * departure that names neither would drop whichever member sits first.
+ *
+ * Both mistakes were live, and both are reachable by any process attached to
+ * any daemon: a PMIX_GROUP_ID carrying a PMIX_SIZE handed strcmp() eight
+ * bytes of the caller's choosing, on every daemon at once.
+ */
+static int test_group_left(void)
+{
+    int failures = 0;
+    prte_pmix_server_pset_t *grp;
+    pmix_info_t info[2];
+    pmix_proc_t source, affected;
+    size_t bogus = 0x41;    /* a value that is a fatal pointer and a fine size */
+
+    PMIX_CONSTRUCT(&prte_pmix_server_globals.groups, pmix_list_t);
+    grp = PMIX_NEW(prte_pmix_server_pset_t);
+    grp->name = strdup("unit-test-group");
+    grp->num_members = 3;
+    PMIX_PROC_CREATE(grp->members, grp->num_members);
+    PMIX_LOAD_PROCID(&grp->members[0], "unit-test-grp@1", 0);
+    PMIX_LOAD_PROCID(&grp->members[1], "unit-test-grp@1", 1);
+    PMIX_LOAD_PROCID(&grp->members[2], "unit-test-grp@1", 2);
+    pmix_list_append(&prte_pmix_server_globals.groups, &grp->super);
+
+    /* a proc that is in no group, so a fall back to the event source cannot
+     * itself remove anything and confuse the cases below */
+    PMIX_LOAD_PROCID(&source, "unit-test-grp@9", 0);
+
+    /* a group id of the wrong type is not a group id */
+    PMIX_INFO_LOAD(&info[0], PMIX_GROUP_ID, &bogus, PMIX_SIZE);
+    PMIX_LOAD_PROCID(&affected, "unit-test-grp@1", 1);
+    PMIX_INFO_LOAD(&info[1], PMIX_EVENT_AFFECTED_PROC, &affected, PMIX_PROC);
+    prte_pmix_server_group_member_left(PMIX_GROUP_LEFT, &source, info, 2);
+    CHECK("a mistyped group id is ignored", 3 == grp->num_members);
+    PMIX_INFO_DESTRUCT(&info[0]);
+    PMIX_INFO_DESTRUCT(&info[1]);
+
+    /* ...and neither is a PMIX_STRING that carries no string, which is what
+     * a string packed with a zero length comes back as */
+    PMIX_INFO_LOAD(&info[0], PMIX_GROUP_ID, NULL, PMIX_STRING);
+    PMIX_INFO_LOAD(&info[1], PMIX_EVENT_AFFECTED_PROC, &affected, PMIX_PROC);
+    prte_pmix_server_group_member_left(PMIX_GROUP_LEFT, &source, info, 2);
+    CHECK("a group id with no string is ignored", 3 == grp->num_members);
+    PMIX_INFO_DESTRUCT(&info[0]);
+    PMIX_INFO_DESTRUCT(&info[1]);
+
+    /* an affected proc of the wrong type is not a proc: the departure falls
+     * back to the event source, which belongs to no group here */
+    PMIX_INFO_LOAD(&info[0], PMIX_GROUP_ID, "unit-test-group", PMIX_STRING);
+    PMIX_INFO_LOAD(&info[1], PMIX_EVENT_AFFECTED_PROC, &bogus, PMIX_SIZE);
+    prte_pmix_server_group_member_left(PMIX_GROUP_LEFT, &source, info, 2);
+    CHECK("a mistyped affected proc is ignored", 3 == grp->num_members);
+    PMIX_INFO_DESTRUCT(&info[1]);
+
+    /* a departure that names no concrete identity must not stand for the
+     * first member it is compared against */
+    PMIX_LOAD_PROCID(&affected, NULL, PMIX_RANK_WILDCARD);
+    PMIX_INFO_LOAD(&info[1], PMIX_EVENT_AFFECTED_PROC, &affected, PMIX_PROC);
+    prte_pmix_server_group_member_left(PMIX_GROUP_LEFT, &source, info, 2);
+    CHECK("a wildcard departure drops nobody", 3 == grp->num_members);
+    PMIX_INFO_DESTRUCT(&info[1]);
+
+    /* an event that is not a departure leaves the registry alone */
+    PMIX_LOAD_PROCID(&affected, "unit-test-grp@1", 1);
+    PMIX_INFO_LOAD(&info[1], PMIX_EVENT_AFFECTED_PROC, &affected, PMIX_PROC);
+    prte_pmix_server_group_member_left(PMIX_ERR_LOST_CONNECTION, &source, info, 2);
+    CHECK("only PMIX_GROUP_LEFT is acted on", 3 == grp->num_members);
+
+    /* and the case all of that guards: rank 1 leaves, rank 2 slides down,
+     * and the members that stay keep their order */
+    prte_pmix_server_group_member_left(PMIX_GROUP_LEFT, &source, info, 2);
+    CHECK("a departing member is dropped", 2 == grp->num_members);
+    CHECK("the members that stay keep their order",
+          0 == grp->members[0].rank && 2 == grp->members[1].rank);
+
+    /* a second notice for a member already gone is a no-op, not an underflow */
+    prte_pmix_server_group_member_left(PMIX_GROUP_LEFT, &source, info, 2);
+    CHECK("a repeated departure is harmless", 2 == grp->num_members);
+    PMIX_INFO_DESTRUCT(&info[1]);
+    PMIX_INFO_DESTRUCT(&info[0]);
+
+    /* a departure from a group we do not hold */
+    PMIX_INFO_LOAD(&info[0], PMIX_GROUP_ID, "unit-test-other", PMIX_STRING);
+    PMIX_INFO_LOAD(&info[1], PMIX_EVENT_AFFECTED_PROC, &affected, PMIX_PROC);
+    prte_pmix_server_group_member_left(PMIX_GROUP_LEFT, &source, info, 2);
+    CHECK("an unknown group is left alone", 2 == grp->num_members);
+    PMIX_INFO_DESTRUCT(&info[0]);
+    PMIX_INFO_DESTRUCT(&info[1]);
+
+    PMIX_LIST_DESTRUCT(&prte_pmix_server_globals.groups);
+
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_group_left\n");
+    }
+    return failures;
+}
+
+/*
+ * A PMIx_Query_info's qualifiers reach the host exactly as the requesting
+ * process wrote them: PMIx forwards the array without inspecting what any
+ * entry holds.  Six of the ones _query() acts on are strings it goes on to
+ * hand to strlen(), strcmp() or PMIx_Check_nspace(), so a qualifier carrying
+ * a value of some other type gave those functions whatever eight bytes the
+ * caller chose as a pointer - which any process or tool attached to any
+ * daemon could send.
+ *
+ * The query is driven through the real upcall rather than through the shifted
+ * handler, because the upcall is what a client reaches and because the answer
+ * this pins is the one the client is given: a malformed qualifier is
+ * PMIX_ERR_BAD_PARAM, not a fault and not the PMIX_ERR_NOT_FOUND that the
+ * status decision at the end of the handler used to overwrite it with.
+ */
+static pmix_status_t qstatus;
+static bool qdone;
+
+static void query_cbfunc(pmix_status_t status, pmix_info_t *info, size_t ninfo,
+                         void *cbdata, pmix_release_cbfunc_t release_fn, void *release_cbdata)
+{
+    PRTE_HIDE_UNUSED_PARAMS(info, ninfo, cbdata);
+    qstatus = status;
+    qdone = true;
+    if (NULL != release_fn) {
+        release_fn(release_cbdata);
+    }
+}
+
+static pmix_status_t run_query(pmix_query_t *q)
+{
+    pmix_proc_t requestor;
+    pmix_status_t rc;
+    int spins = 0;
+
+    PMIX_LOAD_PROCID(&requestor, "unit-test-query", 0);
+    qstatus = PMIX_SUCCESS;
+    qdone = false;
+    rc = pmix_server_query_fn(&requestor, q, 1, query_cbfunc, NULL);
+    if (PMIX_SUCCESS != rc) {
+        return rc;
+    }
+    /* the upcall posts to the event base and this thread is the one that
+     * drives it, so turn it until the handler has answered */
+    while (!qdone && spins < 1000) {
+        prte_event_loop(prte_event_base, PRTE_EVLOOP_ONCE | PRTE_EVLOOP_NONBLOCK);
+        ++spins;
+    }
+    if (!qdone) {
+        return PMIX_ERR_TIMEOUT;
+    }
+    return qstatus;
+}
+
+static int test_query_qualifiers(void)
+{
+    int failures = 0;
+    pmix_query_t q;
+    size_t bogus = 0x41;    /* a fatal pointer and a perfectly good size */
+    bool made_array = false;
+    prte_job_t *jdata = NULL;
+
+    if (NULL == prte_job_data) {
+        prte_job_data = PMIX_NEW(pmix_pointer_array_t);
+        pmix_pointer_array_init(prte_job_data, 8, INT32_MAX, 8);
+        made_array = true;
+    }
+    /* the namespace qualifier is checked against the jobs we know about */
+    jdata = PMIX_NEW(prte_job_t);
+    PMIX_LOAD_NSPACE(jdata->nspace, "unit-test-query@1");
+    if (PRTE_SUCCESS != prte_set_job_data_object(jdata)) {
+        fprintf(stderr, "FAIL [test_query_qualifiers]: could not register a job\n");
+        PMIX_RELEASE(jdata);
+        return 1;
+    }
+
+    /* a mistyped qualifier is refused, not read */
+    PMIX_QUERY_CONSTRUCT(&q);
+    PMIx_Argv_append_nosize(&q.keys, PMIX_QUERY_NAMESPACES);
+    PMIX_INFO_CREATE(q.qualifiers, 1);
+    q.nqual = 1;
+    PMIX_INFO_LOAD(&q.qualifiers[0], PMIX_HOSTNAME, &bogus, PMIX_SIZE);
+    CHECK("a mistyped hostname qualifier is refused", PMIX_ERR_BAD_PARAM == run_query(&q));
+    PMIX_QUERY_DESTRUCT(&q);
+
+    PMIX_QUERY_CONSTRUCT(&q);
+    PMIx_Argv_append_nosize(&q.keys, PMIX_QUERY_NAMESPACES);
+    PMIX_INFO_CREATE(q.qualifiers, 1);
+    q.nqual = 1;
+    PMIX_INFO_LOAD(&q.qualifiers[0], PMIX_NSPACE, &bogus, PMIX_SIZE);
+    CHECK("a mistyped nspace qualifier is refused", PMIX_ERR_BAD_PARAM == run_query(&q));
+    PMIX_QUERY_DESTRUCT(&q);
+
+    PMIX_QUERY_CONSTRUCT(&q);
+    PMIx_Argv_append_nosize(&q.keys, PMIX_QUERY_NAMESPACES);
+    PMIX_INFO_CREATE(q.qualifiers, 1);
+    q.nqual = 1;
+    PMIX_INFO_LOAD(&q.qualifiers[0], PMIX_ALLOC_ID, &bogus, PMIX_SIZE);
+    CHECK("a mistyped allocation id qualifier is refused", PMIX_ERR_BAD_PARAM == run_query(&q));
+    PMIX_QUERY_DESTRUCT(&q);
+
+    /* a numeric qualifier that is not a number is refused too - it used to
+     * leave the id at its "not given" sentinel and be silently ignored */
+    PMIX_QUERY_CONSTRUCT(&q);
+    PMIx_Argv_append_nosize(&q.keys, PMIX_QUERY_NAMESPACES);
+    PMIX_INFO_CREATE(q.qualifiers, 1);
+    q.nqual = 1;
+    PMIX_INFO_LOAD(&q.qualifiers[0], PMIX_NODEID, "not-a-number", PMIX_STRING);
+    CHECK("a non-numeric nodeid qualifier is refused", PMIX_ERR_BAD_PARAM == run_query(&q));
+    PMIX_QUERY_DESTRUCT(&q);
+
+    /* an unknown namespace is a bad parameter and stays one: the status
+     * decision at the end used to replace any error but NOT_SUPPORTED with
+     * NOT_FOUND, because a failed arm leaves an empty result list behind */
+    PMIX_QUERY_CONSTRUCT(&q);
+    PMIx_Argv_append_nosize(&q.keys, PMIX_QUERY_NAMESPACES);
+    PMIX_INFO_CREATE(q.qualifiers, 1);
+    q.nqual = 1;
+    PMIX_INFO_LOAD(&q.qualifiers[0], PMIX_NSPACE, "unit-test-query@nope", PMIX_STRING);
+    CHECK("an unknown namespace is reported as such", PMIX_ERR_BAD_PARAM == run_query(&q));
+    PMIX_QUERY_DESTRUCT(&q);
+
+    /* ...and a key this DVM does not implement still says so */
+    PMIX_QUERY_CONSTRUCT(&q);
+    PMIx_Argv_append_nosize(&q.keys, "prte.unit.test.no.such.key");
+    CHECK("an unrecognized key is not supported", PMIX_ERR_NOT_SUPPORTED == run_query(&q));
+    PMIX_QUERY_DESTRUCT(&q);
+
+    pmix_pointer_array_set_item(prte_job_data, jdata->index, NULL);
+    PMIX_RELEASE(jdata);
+    if (made_array) {
+        PMIX_RELEASE(prte_job_data);
+        prte_job_data = NULL;
+    }
+
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_query_qualifiers\n");
+    }
+    return failures;
+}
+
+/* prte_pmix_server_register_tool() builds the daemon's job object for a
+ * connecting tool out of what that tool sent, which is untrusted input from
+ * the wire.  Everything past the checks below needs a live PMIx server, so
+ * this pins the three decisions it makes before reaching one. */
+static int test_tool_registration(void)
+{
+    int failures = 0;
+    prte_pmix_server_req_t *req;
+    prte_job_t *jdata;
+    bool made_array = false;
+    int rc;
+
+    if (NULL == prte_job_data) {
+        prte_job_data = PMIX_NEW(pmix_pointer_array_t);
+        pmix_pointer_array_init(prte_job_data, 8, INT32_MAX, 8);
+        made_array = true;
+    }
+
+    /* A tool chooses its own rank, and the sentinel ranks are not
+     * subscripts: the proc object is filed in jdata->procs at the tool's
+     * rank, so PMIX_RANK_UNDEF would ask the pointer array to grow to four
+     * billion entries.  Refused before anything is built. */
+    req = PMIX_NEW(prte_pmix_server_req_t);
+    PMIX_LOAD_PROCID(&req->target, "unit-test-tool@1", PMIX_RANK_UNDEF);
+    req->cmdline = strdup("a-tool --with args");
+    rc = prte_pmix_server_register_tool(req, NULL, NULL);
+    CHECK("a sentinel rank is refused", PRTE_ERR_BAD_PARAM == rc);
+    CHECK("...and no job object was left behind",
+          NULL == prte_get_job_data_object(req->target.nspace));
+    PMIX_RELEASE(req);
+
+    /* A tool that sent PMIX_NSPACE carrying no string leaves an empty
+     * namespace here, which PRRTE will not file.  That return used to be
+     * ignored, so the job object was neither in the array nor released and
+     * the namespace registered was one no lookup could reach. */
+    req = PMIX_NEW(prte_pmix_server_req_t);
+    PMIX_LOAD_NSPACE(req->target.nspace, NULL);
+    req->target.rank = 0;
+    rc = prte_pmix_server_register_tool(req, NULL, NULL);
+    CHECK("an empty namespace is refused", PRTE_SUCCESS != rc);
+    PMIX_RELEASE(req);
+
+    /* A namespace we already hold is answered at once - and the caller has
+     * to tolerate the callback firing before the call returns, which is why
+     * this one is passed none. */
+    jdata = PMIX_NEW(prte_job_t);
+    PMIX_LOAD_NSPACE(jdata->nspace, "unit-test-tool@2");
+    if (PRTE_SUCCESS != prte_set_job_data_object(jdata)) {
+        fprintf(stderr, "FAIL [test_tool_registration]: could not register a job\n");
+        PMIX_RELEASE(jdata);
+        if (made_array) {
+            PMIX_RELEASE(prte_job_data);
+            prte_job_data = NULL;
+        }
+        return failures + 1;
+    }
+    req = PMIX_NEW(prte_pmix_server_req_t);
+    PMIX_LOAD_PROCID(&req->target, "unit-test-tool@2", 0);
+    rc = prte_pmix_server_register_tool(req, NULL, NULL);
+    CHECK("a namespace already known is accepted without rebuilding it",
+          PRTE_SUCCESS == rc);
+    CHECK("...and the job object we had is the one still there",
+          jdata == prte_get_job_data_object(req->target.nspace));
+    PMIX_RELEASE(req);
+
+    pmix_pointer_array_set_item(prte_job_data, jdata->index, NULL);
+    PMIX_RELEASE(jdata);
+    if (made_array) {
+        PMIX_RELEASE(prte_job_data);
+        prte_job_data = NULL;
+    }
+
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_tool_registration\n");
+    }
+    return failures;
+}
+
 static int test_connections(void)
 {
     int failures = 0;
@@ -1483,6 +2341,168 @@ static int test_connections(void)
     return failures;
 }
 
+/*
+ * prte_parse_uint_option(): the numeric option values.
+ *
+ * strtoul() reports success and zero for a string with no digits in it, and
+ * zero is meaningful at nearly every place PRRTE asks for a number - "no
+ * timeout", "rank 0", "let the mapping policy decide" - so a misspelled
+ * value did not fail, it quietly meant something else.
+ */
+static int test_uint_option(void)
+{
+    int failures = 0;
+    unsigned long v;
+    size_t n;
+    const char *bad[] = {"four", "", "2x", " 2", "-1", "+2", "0x10", "1 ", NULL};
+
+    for (n = 0; NULL != bad[n]; n++) {
+        v = 12345;
+        CHECK(bad[n][0] ? bad[n] : "<empty>",
+              PRTE_SUCCESS != prte_parse_uint_option(bad[n], UINT32_MAX, &v));
+        CHECK("bad/zeroed", 0 == v);
+    }
+
+    CHECK("good/0", PRTE_SUCCESS == prte_parse_uint_option("0", 100, &v) && 0 == v);
+    CHECK("good/7", PRTE_SUCCESS == prte_parse_uint_option("7", 100, &v) && 7 == v);
+    CHECK("good/limit", PRTE_SUCCESS == prte_parse_uint_option("100", 100, &v) && 100 == v);
+    /* the caller names the field the value has to fit: silently truncating
+     * into it turns the value the user chose into a different one */
+    CHECK("over/limit", PRTE_SUCCESS != prte_parse_uint_option("101", 100, &v));
+    CHECK("over/int", PRTE_SUCCESS != prte_parse_uint_option("4294967297", UINT32_MAX, &v));
+    CHECK("null", PRTE_SUCCESS != prte_parse_uint_option(NULL, 100, &v));
+
+    return failures;
+}
+
+/* is KEY in the converted job info, and is it true? */
+static int jinfo_true(pmix_data_array_t *da, const char *key, bool *found)
+{
+    pmix_info_t *info;
+    size_t n;
+
+    *found = false;
+    if (NULL == da->array) {
+        return 0;
+    }
+    info = (pmix_info_t *) da->array;
+    for (n = 0; n < da->size; n++) {
+        if (PMIx_Check_key(info[n].key, key)) {
+            *found = true;
+            return PMIX_INFO_TRUE(&info[n]) ? 1 : 0;
+        }
+    }
+    return 0;
+}
+
+/*
+ * prte_prun_parse_common_cli(): the job-level directives a tool builds from
+ * its command line, for prun, prterun and prte alike.
+ *
+ *  - --get-stack-traces and --report-state-on-timeout are the bare presence
+ *    of an option, and were handed a "flag" that only the --enable-recovery
+ *    and --continuous blocks above them ever assigned.  On any command line
+ *    that gave neither - which is every command line that asks only for
+ *    stack traces - the DVM was told to take them "false", and the option
+ *    did nothing.  The DVM reads the value, not the key's presence.
+ *
+ *  - a value that has to be a number has to be checked for being one, or
+ *    the option is silently dropped (--timeout) or aimed somewhere else
+ *    (--stdin, which would have gone to rank 0).
+ */
+typedef struct {
+    const char *desc;
+    const char *tool;       /* which tool's option table to parse against */
+    const char *argv[8];
+    bool accept;
+    const char *truekey;    /* directive that must be present AND true */
+} common_cli_case_t;
+
+static common_cli_case_t common_cli_cases[] = {
+    {"stacktraces", "prterun", {"prterun", "--get-stack-traces", "hostname", NULL},
+     true, PMIX_TIMEOUT_STACKTRACES},
+    {"reportstate", "prterun", {"prterun", "--report-state-on-timeout", "hostname", NULL},
+     true, PMIX_TIMEOUT_REPORT_STATE},
+    /* --enable-recovery and --continuous are the only two blocks that ever
+     * wrote the shared "flag", and they exist only in prun's option table -
+     * so for prterun the value read below them was ALWAYS uninitialized.
+     * Check both tools: prun with the writer present, and prun without it. */
+    {"stacktraces/prun", "prun", {"prun", "--get-stack-traces", "hostname", NULL},
+     true, PMIX_TIMEOUT_STACKTRACES},
+    {"stacktraces/prun+recovery", "prun",
+     {"prun", "--enable-recovery", "--get-stack-traces", "hostname", NULL},
+     true, PMIX_TIMEOUT_STACKTRACES},
+    {"timeout/good", "prterun", {"prterun", "--timeout", "10", "hostname", NULL}, true, NULL},
+    {"timeout/word", "prterun", {"prterun", "--timeout", "ten", "hostname", NULL}, false, NULL},
+    {"timeout/empty", "prterun", {"prterun", "--timeout", "", "hostname", NULL}, false, NULL},
+    {"spawn-timeout/word", "prterun",
+     {"prterun", "--spawn-timeout", "soon", "hostname", NULL}, false, NULL},
+    {"stdin/all", "prterun", {"prterun", "--stdin", "all", "hostname", NULL}, true, NULL},
+    {"stdin/none", "prterun", {"prterun", "--stdin", "none", "hostname", NULL}, true, NULL},
+    {"stdin/rank", "prterun", {"prterun", "--stdin", "3", "hostname", NULL}, true, NULL},
+    {"stdin/word", "prterun", {"prterun", "--stdin", "second", "hostname", NULL}, false, NULL},
+    {NULL, NULL, {NULL}, false, NULL}
+};
+
+static int test_common_cli(void)
+{
+    prte_schizo_base_module_t *schizo;
+    common_cli_case_t *c;
+    pmix_cli_result_t results;
+    pmix_list_t apps;
+    pmix_data_array_t darray;
+    pmix_status_t prc;
+    int failures = 0, rc;
+    bool found, istrue;
+    char buf[128];
+    char *saved_actual;
+
+    schizo = envar_test_schizo();
+    if (NULL == schizo) {
+        return 1;
+    }
+    /* parse_cli picks its option table off prte_tool_actual, and the two
+     * tools do not offer the same options */
+    saved_actual = prte_tool_actual;
+
+    for (c = common_cli_cases; NULL != c->desc; c++) {
+        void *jinfo;
+
+        prte_tool_actual = (char *) c->tool;
+        PMIX_CONSTRUCT(&results, pmix_cli_result_t);
+        rc = schizo->parse_cli((char **) c->argv, &results, PMIX_CLI_SILENT);
+        snprintf(buf, sizeof(buf), "%s/parse", c->desc);
+        CHECK(buf, PRTE_SUCCESS == rc);
+        if (PRTE_SUCCESS != rc) {
+            PMIX_DESTRUCT(&results);
+            continue;
+        }
+
+        PMIX_CONSTRUCT(&apps, pmix_list_t);
+        PMIX_INFO_LIST_START(jinfo);
+        rc = prte_prun_parse_common_cli(jinfo, &results, schizo, &apps);
+        snprintf(buf, sizeof(buf), "%s/rc", c->desc);
+        CHECK(buf, c->accept == (PRTE_SUCCESS == rc));
+
+        if (c->accept && PRTE_SUCCESS == rc && NULL != c->truekey) {
+            PMIX_INFO_LIST_CONVERT(prc, jinfo, &darray);
+            istrue = jinfo_true(&darray, c->truekey, &found);
+            snprintf(buf, sizeof(buf), "%s/present", c->desc);
+            CHECK(buf, PMIX_SUCCESS == prc && found);
+            snprintf(buf, sizeof(buf), "%s/true", c->desc);
+            CHECK(buf, istrue);
+            PMIX_DATA_ARRAY_DESTRUCT(&darray);
+        }
+
+        PMIX_INFO_LIST_RELEASE(jinfo);
+        PMIX_LIST_DESTRUCT(&apps);
+        PMIX_DESTRUCT(&results);
+    }
+    prte_tool_actual = saved_actual;
+
+    return failures;
+}
+
 int main(void)
 {
     int rc, failures = 0, skipped = 0;
@@ -1543,15 +2563,25 @@ int main(void)
         return 1;
     }
 
+    failures += test_request_tracker();
     failures += test_departed_jobs();
+    failures += test_monitor_accounting();
     failures += test_connections();
+    failures += test_tool_registration();
+    failures += test_query_qualifiers();
+    failures += test_group_left();
     failures += test_prefix_normalization();
     failures += test_singleton_id();
+    failures += test_appfile();
     failures += test_xfer_job_info();
     failures += test_xfer_app();
     failures += test_job_info_cache();
     failures += test_session_time();
     failures += test_directive_distribution();
+    failures += test_prefix_conflicts();
+    failures += test_nprocs();
+    failures += test_uint_option();
+    failures += test_common_cli();
     failures += test_envar_order(&skipped);
     failures += test_envar_order_permutations(&skipped);
     failures += test_envar_order_mpmd(&skipped);
