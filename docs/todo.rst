@@ -27,10 +27,72 @@ so nobody spends the effort a second time.
 Runtime behavior
 ----------------
 
+**A daemon is never told that an application has terminated.**  The data
+store honors ``PMIX_PERSIST_APP`` at the application it names — the master
+counts each app's terminations and purges when the last one ends
+(``prte_state_base_purge_app``) — but only for its own store.  A
+``PMIX_RANGE_LOCAL`` publish lives in the store of the *daemon* that relayed
+it, and no message tells that daemon an application is over; it learns of a
+process exiting (it reaps the child) and of a namespace ending
+(``PRTE_DAEMON_DVM_CLEANUP_JOB_CMD``), and nothing in between.  So a local-range
+item published with an explicit ``APP`` persistence is held until its
+namespace ends, which is later than asked for but never shorter.
+
+Deferred rather than designed around: it needs a new notification, it affects
+only local-range publishes that name ``APP`` explicitly — not the default,
+which is ``PMIX_PERSIST_NSPACE`` — and no reported problem depends on it.  See
+``docs/plans/datastore/`` for the specification and the design the rest of
+that work follows.
+
 **``ras/flux`` has no ``modify()``.**  It returns ``PMIX_ERR_NOT_SUPPORTED``
 (``src/mca/ras/flux/ras_flux_module.c``), so the elastic extend/release
 surface exists for SLURM only.  Everything above the component is
 RM-agnostic; what is missing is the Flux-side conversation.
+
+**``ras_pmix_rank`` names nothing PMIx can act on.**  Every other
+``ras_pmix_*`` connection parameter is the name of a PMIx attach attribute
+and is now handed to ``PMIx_tool_attach_to_server`` (see
+``src/mca/ras/pmix/``).  This one has no counterpart: ``PMIX_SERVER_RANK`` is
+a ``PMIx_server_init`` attribute — the rank a server takes for *itself* — and
+PMIx identifies an attach target by namespace and rendezvous, so a rank
+selects nothing.  ``ras_pmix_server_host`` is a milder version of the same
+thing: ``PMIX_SERVER_HOSTNAME`` is the attribute defined for what the
+parameter means, but no PTL reads it, so it is forwarded to the server rather
+than used to choose one.  Either PMIx grows a way to name a scheduler by
+these, or the parameters should go; they are registered and reported by
+``prte_info`` today, which is a promise neither can keep.
+
+**``ras/pmix`` forwards allocation requests to a scheduler and never gives
+anything back.**  The component (``src/mca/ras/pmix/``) exists to relay a
+runtime ``PMIx_Allocation_request`` to a host PMIx server acting as the system
+scheduler, and it does that — but three things around it are unfinished, and
+they became visible only once ``ras`` selection went single-owner.
+
+Its ``allocate()`` returns ``PRTE_ERR_TAKE_NEXT_OPTION``: it discovers no
+initial allocation at all.  While every component that answered the query was
+kept, the next one down did that job.  Now the component that answers *is* the
+allocator, so pointing a DVM at a PMIx scheduler — a ``ras_pmix_uri``, an
+``ras_pmix_server_host``, ``ras_pmix_system_scheduler`` — makes this the
+allocator and leaves the base falling through to its one-slot local-node
+fabrication, with any ``--hostfile`` unread.  Asking the scheduler for the
+DVM's own allocation is the missing piece; until it exists, this component is
+only usable on a DVM whose initial nodes came from somewhere the user does not
+mind being ignored.
+
+It declares ``scheduler_owned = true`` and implements neither
+``release_allocation`` nor ``shrink_complete`` — the two module hooks the
+framework offers precisely so an RM learns when a reservation is torn down or
+a shrink has drained.  ``ras/slurm`` implements both.  So nodes a PMIx
+scheduler grants are never handed back to it, and stay charged to the DVM for
+its lifetime.
+
+And a request the scheduler *grants* but PRRTE then fails to apply locally is
+not compensated: ``passthru`` reports the local failure to the requester and
+nothing issues the ``PMIX_ALLOC_RELEASE`` that would return the nodes.  The
+self-inflicted version of this is fixed — the answer is now merged into the
+request rather than substituted for it, so the routing directives the local
+completion needs are still there — but a genuinely malformed request still
+reaches the scheduler before it is refused here.
 
 **Mixed allocators are not supported, and would need more than the ``ras``
 framework.**  The motivating case is a cloud/local combination: an allocation
@@ -492,6 +554,12 @@ does.
      - nothing.  The framework's own four files only — the driver, the
        node insert, the framework hooks and the selector.  The ``ras``
        *components* are not covered by this and stay in the table below.
+   * - ``src/mca/ras/pmix``
+     - 2026-08-26
+     - nothing.  Both files.  Note that nothing automated exercises this
+       component's one real path: there is no PMIx scheduler in any
+       harness, so the review is a reading plus what ``make check`` can
+       reach through the module vtable.
    * - ``src/event``
      - 2026-07-31
      - nothing

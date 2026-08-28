@@ -94,13 +94,22 @@ Three things follow, and each is load-bearing:
 - **Only the master attaches.** Every other daemon relays to it over the RML
   exactly as it does for a local store, so a DVM holds one connection however
   many daemons it has. At the master itself the RML send is a send to self.
-- **The requesting process is carried in `PMIX_REQUESTOR`.** Otherwise the far
-  end attributes the operation to the relaying daemon's *tool* identity, and
+- **The requesting process is carried in `PMIX_REQUESTOR`, and its uid and
+  gid in `prte.pub.ruid` / `prte.pub.rgid`.** Otherwise the far end
+  attributes the operation to the relaying daemon's *tool* identity, and
   every ownership rule — who may unpublish, what `PMIX_RANGE_NAMESPACE`
   admits, what a job-end purge takes — is answered about the wrong process.
-  `prte_ds_check_requestor()` honors the claim **only from a tool**; an
-  application process making one is trying to act under a peer's identity, and
-  the claim is dropped.
+  The uid half matters for the same reason and is newer: PMIx appends the
+  *relay's* `PMIX_USERID` and `PMIX_GRPID` to the call the relay makes, so
+  without a separate claim the far end would store the item under the
+  relaying daemon's user and test every later removal against it. They are
+  PRRTE-private keys rather than a second `PMIX_USERID` precisely because
+  PMIx adds its own, and two entries under one key make the answer depend on
+  array order. `prte_ds_check_requestor()` reads all three in one pass and
+  honors them **only from a tool**; an application process making the claim
+  is trying to act under a peer's identity, and it is dropped. Call it
+  *after* your own directive scan, or the relay's `PMIX_USERID` lands on top
+  of the claim.
 - **The primary server must be named per operation.** PMIx sends a tool's
   client-side call to whichever attached server is currently primary, and a
   master may also be attached to a scheduler. `prte_pmix_set_primary_server()`
@@ -187,10 +196,30 @@ range at all.
 
 `ds_unpublish` applies neither rule. **An owner may unpublish what it
 published on any range**, and the range the unpublish itself names does not
-narrow that. The test is that the requesting process *is* the owner — a
-stronger check than comparing uids, because a process identity is stamped by
-its own PMIx server rather than asserted by the caller (or, for a relay,
-claimed in `PMIX_REQUESTOR` and honored only from a tool).
+narrow that.
+
+**The owner is the publishing USER**, not the publishing process:
+`prte_data_server_owns()` compares the requestor's effective uid against the
+one recorded at publish, and the gid where both are known (either side
+reading `UINT32_MAX` degrades the test to uid alone, exactly as the read
+rule does). The same predicate scopes `PRTE_PUBLISH_REPLACE`.
+
+It used to be the process — namespace *and* rank — which sounds stricter and
+is, in the way that made it useless: a process takes no data with it when it
+exits, so an item published by a job that had ended was removable by nobody
+at all. Its own user's next job could read it, could not publish over it
+(that is a duplicate) and could not remove it, so the name was wedged for
+the life of the DVM. A predecessor that *died* before it could unpublish is
+the case that matters, and it is the one a checkpoint/restart handover hits.
+Keying on the user moves no boundary that matters: nothing here crosses
+between users, and there is still no administrative override.
+
+**Ownership is not access, in either direction.** A `PMIX_ACCESS_USERIDS`
+list widens who may *read* an item and confers no removal; and the sharper
+case, a publisher whose own accessor list excludes it may still remove what
+it cannot read, because it owns it. `prte_data_server_owns()` reads
+`data->uid` and `data->gid` and never touches `auids`/`agids`, which is what
+keeps those two questions apart.
 
 Gating removal on the read rule is exactly the confusion this section
 exists to prevent: it left a `PMIX_RANGE_RM` or `PMIX_RANGE_CUSTOM` item
@@ -250,6 +279,11 @@ not the directive was given, so it is a republish and never a way to take a
 live name away. Only the republished keys go; an object holding others keeps
 them.
 
+"Own" here is the same `prte_data_server_owns()` the removal rule uses — the
+publishing **user**. It has to be: once a same-uid process may unpublish a
+key and then publish its own, the two-step is available anyway, and refusing
+the one-step form would only make the same outcome take two calls.
+
 Everything those checks read — the owner (which `PMIX_REQUESTOR` may have
 replaced), the range, the uid and gid — is final only *after* the directive
 scan, so the gate has to sit between that scan and
@@ -262,7 +296,11 @@ scan, so the gate has to sit between that scan and
 `PMIX_PERSIST_FIRST_READ` removes an item from `data->info` as soon as it is
 returned. Both `ds_lookup` (returning from the store) and `ds_publish`
 (satisfying a parked request) implement it, and both then have to notice
-that an object whose `info` list is now empty must leave the store.
+that an object whose `info` list is now empty must leave the store —
+`ds_lookup` did not, so an item read by an ordinary lookup stayed in the
+store as an empty shell, matching nothing and removed only by a purge.
+`data` there is the loop variable of the scan over the store, so nothing may
+touch it after the drop; the `break` is what makes that safe.
 
 A lookup carrying `PMIX_WAIT` that cannot be fully satisfied is parked on
 `prte_data_store.pending` with **only the keys it is still missing**. When a
@@ -279,13 +317,42 @@ timer, so every path is covered by `PMIX_RELEASE`. Without the timer a wait
 for a key nobody publishes never returned: the timeout reached the daemon's
 caddy (`req->timeout` in `pmix_server_pub.c`) and went no further.
 
-**`PMIX_PERSISTENCE` is enforced by `ds_purge`, and only because the state
-machine tells it a lifetime ended.** The purge command carries the horizon
-that was reached as a `PMIX_PERSISTENCE` directive, and `expires_by()`
-decides what that takes: `FIRST_READ` and `PROC` at any horizon, `APP` at
-`APP` or `SESSION`, `INDEF` never. The values are *not* a numeric ladder —
-`PMIX_PERSIST_INDEF` is 0 and outlives all of them — so the ordering is
-spelled out rather than compared.
+**`PMIX_PERSISTENCE` is enforced by the purge, and only because the state
+machine says a lifetime ended.** `expires_by()` decides what a given
+horizon takes:
+
+| horizon | removes |
+|---------|---------|
+| `INVALID` (an explicit unpublish-all) | everything the target owns |
+| `PROC` | `PROC` |
+| `APP` | `PROC`, `APP` |
+| `NSPACE` | `PROC`, `APP`, `NSPACE` |
+| `SESSION` | `PROC`, `APP`, `NSPACE`, `SESSION` |
+
+The values are *not* a numeric ladder — `PMIX_PERSIST_INDEF` is 0 and
+outlives all of them, and `PMIX_PERSIST_NSPACE` is 5 while ending before
+`SESSION`'s 4 — so the ordering is spelled out rather than compared.
+
+Two of the horizons need something a `pmix_proc_t` cannot say. An
+**application** is not a process and not a namespace either: every app of a
+job shares the one namespace assigned to the job, so the target names them
+all and `prte.purge.appidx` says which one ended. A **session** outlives the
+jobs that ran in it and their job objects, so its target admits anybody (an
+empty namespace is a wildcard to `PMIX_CHECK_PROCID`) and `PMIX_SESSION_ID`
+selects. Each item records both at publish, in `app_idx` and `session_id`,
+because neither is derivable later — the purge arrives after the publisher
+has gone.
+
+`FIRST_READ` is in that list of what no horizon takes, and it took
+issue #2733 to get there. Its criterion is the first access and nothing
+else, so an item published for a reader that has not started yet is not
+the publisher's to lose when the publisher's job ends — `PROC` and `APP`
+are how a publisher says "remove this when I go away". Purging it made
+the one conforming handover between successive generations of a job
+impossible: the successor found nothing. The cost of not purging it is an
+unread item that nothing expires on its own, which is what `INDEF`
+already carries; a retention timeout for both is planned (see
+`docs/plans/datastore/`).
 
 A purge with **no** horizon (`PMIX_PERSIST_INVALID`) means an explicit
 `PMIx_Unpublish(NULL, ...)`: a live publisher taking back everything it
@@ -313,24 +380,132 @@ why a single-node run cannot tell them apart — and why the purge going only
 to the global store left local-range data unreclaimed until it also went to
 `PRTE_PROC_MY_NAME`.
 
-`prte_state_base_notify_data_server()` is what sends the lifecycle purge,
-with `PMIX_PERSIST_APP`, when a job's procs have all terminated. All three
-call sites used to be gated on `NULL != prte_data_server_uri`, so the
-**built-in** data server — the usual case — was never told a job had ended;
-nothing was ever reclaimed from it short of the DVM shutting down, and
-`PERSIST_APP` and `PERSIST_PROC` both behaved as `PERSIST_INDEF`. The
-function itself had always routed correctly for the built-in case; its own
-callers were what gated it out.
+**A purge is a call, not a message.** The store that has to act is in every
+case one the acting process already holds, so `state/base` offers four
+entry points and each is called by whoever can see that lifetime end:
 
-`PMIX_PERSIST_PROC` is therefore reclaimed at **job** granularity rather
-than when its individual publisher exits. That is later than the Standard's
-"until the publishing process terminates", and it is deliberate: a message
-to the store for every terminating process is not a cost the termination
-path can carry at scale.
+| call | called by | when |
+|------|-----------|------|
+| `prte_state_base_purge_proc` | the master, and the daemon that hosted it | a process terminates (both `track_procs` implementations) |
+| `prte_state_base_purge_app` | the master | an app's terminated count reaches its `num_procs` |
+| `prte_state_base_purge_nspace` | the master; every daemon | the job ends (`state_dvm.c`); `PRTE_DAEMON_DVM_CLEANUP_JOB_CMD` |
+| `prte_state_base_purge_session` | the master | `prte_ras_base_teardown_reservation()` |
 
-The object's default is `PMIX_PERSIST_APP`, which is the Standard's default.
-PMIx adds none of its own before handing a publish to the host, so the value
-in `ds_main.c`'s constructor is the one that governs.
+Each purges **its own** store. That is what makes the `PROC` horizon
+affordable — it fires once per terminating process, and a store nothing was
+ever published into is an array of one empty slot, so the scan costs
+nothing. The **only** thing that still needs a message is an *external*
+data server, which lives in another DVM behind the PMIx tool connection the
+master holds; a daemon never relays, since its own store is local-range
+data that never leaves this DVM.
+
+Two things that had to be got right here, both of which were once wrong:
+
+- **A daemon's share of a job finishing is not a lifetime ending.**
+  `state_prted.c`'s `job_teardown()` runs when the procs of a job that
+  *this daemon hosted* have terminated (`num_terminated ==
+  num_local_procs`), which says nothing about the rest of the job. It used
+  to send the DVM-wide purge from there, so the first node to finish its
+  share purged the entire namespace's `APP` and `PROC` data out of the
+  **master's** store while other nodes were still publishing into it. It
+  now sends nothing: each of its procs was purged at the `PROC` horizon as
+  it died, and the namespace horizon arrives from the master.
+- **The purge used to be gated on `prte_pmix_server_globals.server.nspace`
+  being set** — "nobody local to us has used the data server" — which is
+  true of *our* store and false of the global one, whose publishers are
+  anywhere in the DVM. On the master that guard held exactly when the
+  publishers ran on other nodes, which is the arrangement that most needs
+  the purge. It went unnoticed only because every daemon was sending the
+  DVM-wide purge as well.
+
+All three call sites were once gated on `NULL != prte_data_server_uri`, so
+the **built-in** data server — the usual case — was never told a job had
+ended at all; nothing was reclaimed from it short of the DVM shutting down,
+and `PERSIST_APP` and `PERSIST_PROC` both behaved as `PERSIST_INDEF`.
+
+**Two persistences name no lifetime, and a timeout is what bounds them.**
+`PMIX_PERSIST_INDEF` is "retained until specifically deleted" and only its
+publisher may delete it, so in a DVM that outlives the publisher it is a
+permanent allocation made by a process that no longer exists;
+`PMIX_PERSIST_FIRST_READ` is the same shape when the read it waits for never
+comes. `prte_data_server_timeout` (default 300 s) removes either once it has
+been **idle** that long — `last_access` is stamped at publish and restamped
+by every lookup that returns one of the item's keys, in *both* places that
+answer a lookup (`ds_lookup.c`, and `ds_publish.c` where a publish satisfies
+a parked request).
+
+Idle rather than a lifetime, deliberately: a rendezvous name in active use
+must not be pulled out from under its readers. Nothing else is swept — a
+persistence that names a lifetime has a criterion a running system reaches,
+and cutting it short would break the retention its publisher was promised
+while it is still alive to rely on it.
+
+One sweep event serves the whole store (`ds_purge.c`), armed only while the
+store holds something the timeout applies to and disarmed when it does not.
+The interval is `timeout / 4`, bounded to [1 s, 60 s], which is what makes
+"removed no earlier than the timeout, and normally within a sweep interval
+after it" a bound worth stating. A timer per item would be exact, at the
+cost of an armed libevent timer per published item and a re-arm on every
+read; the parked-lookup timeout in `ds_lookup.c` is per-request because a
+request is a one-shot with a caller waiting on it, which is not this case.
+
+## The cap: per user, and nobody else's data
+
+Retention alone leaves the store unbounded — a job publishes what it likes
+and exits, and what it published outlives it. `prte_data_server_max_size`
+(default 16 MiB) bounds that, **per publishing uid**, and eviction never
+crosses a uid boundary: a user who floods the store evicts only their own
+data. Without that scoping the cap is an abuse primitive in its own right,
+since publishing junk in bulk becomes a way to push somebody else's
+rendezvous name out.
+
+`prte_ds_usage_t` holds one running byte total per uid, on a list in the
+store — as many records as there are users publishing here, which is a small
+number. Three rules keep it honest:
+
+- **Every removal goes through `prte_ds_drop()`.** There are seven paths —
+  the duplicate drop, an unpublish, a `FIRST_READ` read that empties an item
+  (in *both* places that answer a lookup), each purge horizon, the expiry
+  sweep, and eviction itself — and one that forgets to uncharge leaves a uid
+  unable to publish anything ever again. That is why it is one function and
+  not a line repeated seven times.
+- **Every shrink calls `prte_ds_charge()`.** An item that loses a key to a
+  `FIRST_READ` read is smaller than what its publisher is charged for.
+- **The cap gate runs last**, after the duplicate scan and the directive
+  scan, immediately before `pmix_pointer_array_add()`. It is the only gate
+  that *modifies* the store, so a publish that is going to be refused must
+  not have cost anybody their data on the way — which is also why a publish
+  larger than the whole cap is refused before anything is evicted, rather
+  than emptying the user's store and failing anyway
+  (`PMIX_ERR_OUT_OF_RESOURCE`).
+
+Eviction takes the uid's own least-recently-used item, by the same clock the
+retention timeout reads, and ignores persistence — a user's own data is that
+user's own to budget. A per-uid list in LRU order would make the choice
+O(1); it is deliberately not built, because the store is a
+`pmix_pointer_array_t` whose objects are reached by index on several paths
+and a second membership is another thing every removal path has to keep in
+step. The scan runs only when a uid is at its cap. If a store is ever
+*measured* spending real time there, the list is the answer.
+
+The first eviction for a uid emits a `show_help` warning
+(`help-prte-data-server.txt`) naming the limit and the parameter that raises
+it: eviction is the store protecting itself, not a policy anyone asked for.
+A reader whose item was evicted gets `PMIX_ERR_NOT_FOUND` and cannot tell
+that from a key nobody published — which is deliberate, since a publisher
+cannot distinguish eviction from a reader that never arrived either.
+
+## Persistence and the default
+
+The object's default is `PMIX_PERSIST_NSPACE`, and PMIx adds none of its
+own before handing a publish to the host, so the value in `ds_main.c`'s
+constructor is the one that governs. It is deliberately **not** the
+Standard's `PMIX_PERSIST_APP`: `APP` means the publishing process's
+*application*, an MPMD job's applications need not end together, and
+applying that default literally would shorten the retention every unmarked
+publish has been getting — as a side effect of reading `APP` correctly.
+`NSPACE` is that same lifetime, said out loud. A publisher that wants app
+lifetime asks for `APP` and gets it.
 
 A lifecycle purge drops both the departing process's published items *and*
 any lookup it left parked; a request that outlives its requestor would
@@ -447,14 +622,32 @@ by a publish in the other, that an ended job's data is purged from the server
 and that the purge takes *only* that job's data — plus the control, that a
 DVM which was not given the URI sees none of it.
 
-**Not covered:** `PMIX_PERSIST_FIRST_READ` end-to-end, the duplicate-key and
-`PRTE_PUBLISH_REPLACE` paths, and the lifecycle side of `ds_purge` (which is
-driven by job termination rather than by a client call) — in particular that
-a `PERSIST_APP` item is gone once its job ends while a `PERSIST_SESSION` one
-is not, which needs two jobs under one persistent DVM. Access
-permissions are covered only with the harness running as a single user, so
-what the swarm proves is that a list naming *somebody else* keeps us out —
-not that a genuinely different uid gets in.
+The swarm covers the timeout with `--prtemca prte_data_server_timeout` set
+to a few seconds — no debug-only knob and no `PRTE_ENABLE_DEBUG` build. Note
+that a `prun` takes seconds to get a process running, so a case that reads a
+key repeatedly to show the clock restarting has to leave room for that in
+both directions: gaps comfortably inside the timeout, and a last read
+comfortably outside it, or the case passes without showing anything.
+
+The `SESSION` horizon lives in the **`test_session`** phase rather than
+this one, because that is where the tooling is: a reservation is
+instantiated with the publisher running inside it (which is what gives its
+data a session to belong to — the job carries `PRTE_JOB_SESSION_ID`), the
+key is read back while the session stands, and it is gone once
+`sessionctrl terminate` tears the reservation down. Its control is a key of
+the *same* persistence published outside any reservation, which must
+survive: what separates the two is the session id recorded on each item and
+nothing else. Nothing but the session purge can remove either — no job-end
+horizon takes `SESSION` data, and the sweep does not touch it — so the case
+cannot pass by accident.
+
+**Not covered:** anything that needs a second *user*. The harness runs as
+one uid in every container, so what the swarm can show of the ownership rule
+is the same-user half — a later job taking back its predecessor's name, and
+replacing it in one publish. That a different uid is refused is unit-tested
+(`test_data_server_ownership`) and nowhere else. Access permissions have the
+same limit: the swarm proves that a list naming *somebody else* keeps us
+out, not that a genuinely different uid gets in.
 
 A note on the partial-lookup case, because it took both code bases to make
 it work. PRRTE returning the status *and* the values it found is only half

@@ -539,6 +539,21 @@ types; a PMIx older than that refuses the documented spelling.
   pool index is a `PMIX_NODEID` and is never reused — and revert to the
   general pool still marked `PRTE_NODE_STATE_ADDED`, so the next grow adopts
   them, which is the right answer for nodes the allocator did grant.
+- **A request that parked the DVM must give it back.**
+  `prte_ras_base_add_hosts()` clears `prte_dvm_ready` and its caller parks the
+  requesting job in `prte_cache`; only the grow's `VM_READY` re-entry
+  (`state_dvm.c`) sets the flag again and drains the cache. A request that
+  fails before it ever reaches a grow therefore left that job — and every job
+  cached behind it — waiting on a DVM that would never be ready again, and
+  nothing times that out. A mistyped `--add-hostfile` path was enough. Such a
+  request is marked `dvm_held`, and `prte_ras_base_modify()`'s respond tail
+  fails the requesting job and restores the flag. The marker lives on the
+  request rather than being inferred from `prte_dvm_ready`, because that flag
+  is also false while somebody *else's* grow is in flight and this must not
+  cut that short. This is the same invariant the add-host refusal above is
+  placed to protect, on the other side of the decision: refusing before
+  posting keeps a request nothing will answer out of the machinery, and
+  `dvm_held` covers the one that was posted and then failed.
 - **A shrink that names no daemon is never broadcast.** A release may
   legitimately name only nodes that carry none — one a previous shrink handed
   back, one the DVM was never extended onto. Sending the command anyway is
@@ -767,7 +782,7 @@ prototype here compiles and then mismatches the real library.
 | Layer | What it covers |
 |-------|----------------|
 | [`test/unit/ras/test_ras.c`](../../../test/unit/ras/) (`make check`) | `prte_ras_base_node_insert` (dedup, drain, slot accounting, `ADD_SLOTS` clamping, FQDN normalization, HNP dedup, pre-assigned pool slots), the module vtable contract for every static component, `prte_ras_base_select` priority ordering, `prte_ras_base_flag_string`, and `ras/slurm`'s detect-and-report half — query gating on `SLURM_JOBID` at priority 50, then `allocate()` expanding a compressed `SLURM_NODELIST` and refusing a tainted jobid or an over-length nodelist. That last part is driven **through the framework** (find the component, query it, call the module it returns) rather than by naming its symbols, because `ras-slurm` is a plugin and has none in `libprrte`; keep it that way. It skips with a printed reason when the component is not there to be found. |
-| [`contrib/dockerswarm/run-tests.sh`](../../../contrib/dockerswarm/) (`linux`) | The multi-node paths: grow/shrink/re-grow leaving exactly one daemon per node (a duplicated pool entry launches two), `--add-hostfile` growing a live DVM through `add_hosts → ras/pmix defer → ras/hosts` including the `slots=+N` in-place adjust, `--activate` bringing an allocated-but-idle node into the DVM (one left out by `prte_max_vm_size`, and two a shrink handed back, named through `file=`) while refusing a host the allocation does not contain and refusing to apply the hostfile's `slots=`, the same operation asked for through `PMIX_ALLOC_ACTIVATE` (`elastic activate`, both the `PMIX_HOST` and the `PMIX_HOSTFILE` form, including its two-phase completion), and **`ras/slurm`'s whole modify surface** against a faked scheduler (below). |
+| [`contrib/dockerswarm/run-tests.sh`](../../../contrib/dockerswarm/) (`linux`) | The multi-node paths: grow/shrink/re-grow leaving exactly one daemon per node (a duplicated pool entry launches two), `--add-hostfile` growing a live DVM through `add_hosts → ras/hosts` (there is no scheduler in the swarm, so `ras/hosts` is the selected module and is asked directly) including the `slots=+N` in-place adjust, `--activate` bringing an allocated-but-idle node into the DVM (one left out by `prte_max_vm_size`, and two a shrink handed back, named through `file=`) while refusing a host the allocation does not contain and refusing to apply the hostfile's `slots=`, the same operation asked for through `PMIX_ALLOC_ACTIVATE` (`elastic activate`, both the `PMIX_HOST` and the `PMIX_HOSTFILE` form, including its two-phase completion), and **`ras/slurm`'s whole modify surface** against a faked scheduler (below). |
 | Live RM | PBS/LSF/Flux discovery still needs a real scheduler; there is no substitute. |
 
 **`ras/slurm`'s `modify` surface is covered in `contrib/dockerswarm`, not
@@ -833,5 +848,4 @@ Each component directory has its own `AGENTS.md`:
 - [`bootstrap/AGENTS.md`](bootstrap/AGENTS.md) — launcher-less bootstrap DVM.
 - [`simulator/AGENTS.md`](simulator/AGENTS.md) — synthetic allocation for testing.
 - [`testrm/AGENTS.md`](testrm/AGENTS.md) — fixed-hostfile fake RM.
-</content>
 </invoke>

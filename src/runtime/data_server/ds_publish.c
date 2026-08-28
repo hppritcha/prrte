@@ -44,6 +44,7 @@
 #include "src/rml/rml.h"
 #include "src/runtime/prte_globals.h"
 #include "src/runtime/prte_wait.h"
+#include "src/util/attr.h"
 #include "src/util/name_fns.h"
 
 #include "src/runtime/data_server/prte_data_server.h"
@@ -170,6 +171,36 @@ static bool same_data_range(prte_data_req_t *rq, prte_data_object_t *data,
  * own" and "that name is taken".  Nothing is modified here: the decision
  * has to be complete before anything is removed, so that a publish which
  * ends up refused leaves the store exactly as it found it. */
+/* Record which application and session the publisher belongs to.
+ *
+ * Every process that runs a data server holds the job objects it needs for
+ * this: the master holds them all, and a daemon holds the ones whose procs
+ * it hosts - which is exactly the set that can publish into its own store.
+ * The session id is a job attribute set PRTE_ATTR_GLOBAL where it is set at
+ * all, so it reaches the daemons in the launch message. */
+static void resolve_publisher(prte_data_object_t *data)
+{
+    prte_job_t *jdata;
+    prte_proc_t *proc;
+    uint32_t *ui32ptr;
+
+    jdata = prte_get_job_data_object(data->owner.nspace);
+    if (NULL == jdata) {
+        return;
+    }
+    proc = prte_get_proc_object(&data->owner);
+    if (NULL != proc) {
+        data->app_idx = (uint32_t) proc->app_idx;
+    }
+    ui32ptr = &data->session_id;
+    if (!prte_get_attribute(&jdata->attributes, PRTE_JOB_SESSION_ID,
+                            (void **) &ui32ptr, PMIX_UINT32)) {
+        /* no allocation of its own: the default session, which ends when
+         * the DVM does and therefore never needs a purge of its own */
+        data->session_id = UINT32_MAX;
+    }
+}
+
 static size_t count_duplicates(prte_data_req_t *rq, prte_data_object_t *data,
                                bool *foreign)
 {
@@ -199,7 +230,12 @@ static size_t count_duplicates(prte_data_req_t *rq, prte_data_object_t *data,
                                     PMIx_Data_range_string(data->range),
                                     PMIX_NAME_PRINT(&dptr->owner));
                 ndups++;
-                if (!PMIX_CHECK_PROCID(&data->owner, &dptr->owner)) {
+                /* Whose name is this?  Ownership is the publishing USER, so
+                 * a later job of the same user is republishing rather than
+                 * seizing - which is the point: unpublish-then-publish is
+                 * open to it either way, and refusing the one-step form
+                 * would only make the same outcome take two calls. */
+                if (!prte_data_server_owns(rq->uid, rq->gid, dptr)) {
                     *foreign = true;
                 }
             }
@@ -224,7 +260,7 @@ static void drop_prior(prte_data_req_t *rq, prte_data_object_t *data)
         if (NULL == dptr) {
             continue;
         }
-        if (!PMIX_CHECK_PROCID(&data->owner, &dptr->owner)) {
+        if (!prte_data_server_owns(rq->uid, rq->gid, dptr)) {
             continue;
         }
         if (!same_data_range(rq, dptr, data->range)) {
@@ -239,8 +275,10 @@ static void drop_prior(prte_data_req_t *rq, prte_data_object_t *data)
             }
         }
         if (0 == pmix_list_get_size(&dptr->info)) {
-            pmix_pointer_array_set_item(&prte_data_store.store, dptr->index, NULL);
-            PMIX_RELEASE(dptr);
+            prte_ds_drop(dptr);
+        } else {
+            /* it kept some keys and lost others: recharge the difference */
+            prte_ds_charge(dptr);
         }
     }
 }
@@ -336,9 +374,14 @@ pmix_status_t prte_ds_publish(pmix_proc_t *sender,
             ret = load_ids(&info[n].value, &data->auids, &data->nauids);
         } else if (PMIx_Check_key(info[n].key, PMIX_ACCESS_GRPIDS)) {
             ret = load_ids(&info[n].value, &data->agids, &data->nagids);
-        } else if (PMIx_Check_key(info[n].key, PMIX_REQUESTOR)) {
-            /* a relay publishing on behalf of a process in its own DVM */
-            prte_ds_check_requestor(&data->owner, &info[n]);
+        } else if (PMIx_Check_key(info[n].key, PMIX_REQUESTOR) ||
+                   PMIx_Check_key(info[n].key, PRTE_PUBLISH_REQ_UID) ||
+                   PMIx_Check_key(info[n].key, PRTE_PUBLISH_REQ_GID)) {
+            /* a relay publishing on behalf of a process in its own DVM.
+             * Applied below, once this scan has finished - see
+             * prte_ds_check_requestor().  Skipped here so it is not stored
+             * as published data. */
+            continue;
         } else if (PMIx_Check_key(info[n].key, PRTE_PUBLISH_REPLACE)) {
             /* the publisher is updating something it published itself */
             replace = PMIX_INFO_TRUE(&info[n]);
@@ -357,6 +400,30 @@ pmix_status_t prte_ds_publish(pmix_proc_t *sender,
             return ret;
         }
     }
+    /* Now let a relay's claimed identity override what PMIx told us about
+     * the caller, which for a relayed request is the relaying daemon's own
+     * tool identity.  After the scan, so the relay's PMIX_USERID cannot
+     * land on top of the claim. */
+    prte_ds_check_requestor(&data->owner, &data->uid, &data->gid, info, ninfo);
+
+    /* A publisher that named no persistence, or named an invalid one, gets
+     * the default the object was constructed with. */
+    if (PMIX_PERSIST_INVALID == data->persistence) {
+        data->persistence = PMIX_PERSIST_NSPACE;
+    }
+
+    /* Which application, and which session?  Neither is derivable later:
+     * the job object does not outlive the job, and the purge that reclaims
+     * an APP or SESSION item arrives after the publisher has gone.  Both
+     * are therefore resolved now, and both are allowed to fail - a relayed
+     * publish from another DVM has no proc object here, and a job with no
+     * allocation of its own runs in the default session, which ends with
+     * the DVM.  UINT32_MAX matches no purge. */
+    resolve_publisher(data);
+
+    /* the clock the retention timeout reads starts now */
+    data->last_access = time(NULL);
+
     /* the values we keep were copied into the data object above, so the
      * unpacked array has done its job - it used to be freed only on the
      * unpack-failure path, which leaked it on every successful publish */
@@ -408,8 +475,28 @@ pmix_status_t prte_ds_publish(pmix_proc_t *sender,
     }
     PMIX_DESTRUCT(&rq);
 
+    /* Room for it, within what this publisher's uid may hold - evicting
+     * that uid's own oldest items if need be, and refusing outright if the
+     * item could not fit in an empty store.  Last of the gates, because it
+     * is the only one that MODIFIES the store: a publish that is going to
+     * be refused must not have cost anybody their data on the way. */
+    if (!prte_ds_make_room(data)) {
+        pmix_output_verbose(1, prte_data_store.output,
+                            "%s data server: refusing publish from %s - larger than "
+                            "the whole per-uid limit",
+                            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                            PMIX_NAME_PRINT(&data->owner));
+        PMIX_RELEASE(data);
+        return PMIX_ERR_OUT_OF_RESOURCE;
+    }
+
     // add this data to our store
     data->index = pmix_pointer_array_add(&prte_data_store.store, data);
+    prte_ds_charge(data);
+
+    /* an INDEF or unread FIRST_READ item is the only thing the retention
+     * timeout applies to, so the sweep runs only while the store holds one */
+    prte_ds_arm_sweep();
 
     pmix_output_verbose(1, prte_data_store.output,
                         "%s data server: checking for pending requests",
@@ -460,6 +547,10 @@ pmix_status_t prte_ds_publish(pmix_proc_t *sender,
                     ds3 = PMIX_NEW(prte_info_item_t);
                     PMIX_INFO_XFER(&ds3->info, &ds1->info);
                     pmix_list_append(&answers, &ds3->super);
+                    /* it was of use to somebody, so the retention timeout
+                     * starts again from here.  Both places that answer a
+                     * lookup have to do this - the other is ds_lookup.c */
+                    data->last_access = time(NULL);
                     // if the persistence is "first read", then remove this info
                     if (PMIX_PERSIST_FIRST_READ == data->persistence) {
                         pmix_list_remove_item(&data->info, &ds1->super);
@@ -587,9 +678,11 @@ pmix_status_t prte_ds_publish(pmix_proc_t *sender,
         }
         if (0 == pmix_list_get_size(&data->info)) {
             // all the data was removed, so we no longer need this entry
-            pmix_pointer_array_set_item(&prte_data_store.store, data->index, NULL);
-            PMIX_RELEASE(data);
+            prte_ds_drop(data);
             data = NULL;
+        } else {
+            /* it shrank: what its publisher is charged has to follow */
+            prte_ds_charge(data);
         }
         if (complete_resolved) {
             // completely resolved this pending request, so remove it

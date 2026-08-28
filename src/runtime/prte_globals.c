@@ -60,8 +60,8 @@
 #include "src/runtime/runtime_internals.h"
 
 /* State Machine */
-pmix_list_t prte_job_states = PMIX_LIST_STATIC_INIT;
-pmix_list_t prte_proc_states = PMIX_LIST_STATIC_INIT;
+pmix_list_t prte_job_states = PMIX_LIST_STATIC_INIT(prte_job_states);
+pmix_list_t prte_proc_states = PMIX_LIST_STATIC_INIT(prte_proc_states);
 
 /* a clean output channel without prefix */
 int prte_clean_output = -1;
@@ -73,6 +73,7 @@ char *prte_data_server_uri = NULL;
 char *prte_tool_basename = NULL;
 char *prte_tool_actual = NULL;
 bool prte_dvm_ready = false;
+bool prte_dvm_started = false;
 pmix_pointer_array_t *prte_cache = NULL;
 
 int prte_dvm_launch_fence = 0;
@@ -397,6 +398,11 @@ prte_session_t *prte_get_session_object_from_refid(const char *refid)
     return NULL;
 }
 
+/* Monotonic, never reused: a released session's slot is handed to the next
+ * one registered, so position in prte_sessions says nothing about age. Every
+ * session is registered exactly once, so stamping here covers every path. */
+static uint32_t prte_session_acquisitions = 0;
+
 int prte_set_session_object(prte_session_t *session)
 {
     prte_session_t *session_ptr;
@@ -429,6 +435,7 @@ int prte_set_session_object(prte_session_t *session)
         session->index = save;
         pmix_pointer_array_set_item(prte_sessions, save, session);
     }
+    session->acquisition = ++prte_session_acquisitions;
     return PRTE_SUCCESS;
 }
 
@@ -622,6 +629,7 @@ static void prte_app_context_construct(prte_app_context_t *app_context)
     app_context->idx = 0;
     app_context->app = NULL;
     app_context->num_procs = 0;
+    app_context->num_terminated = 0;
     PMIX_CONSTRUCT(&app_context->procs, pmix_pointer_array_t);
     pmix_pointer_array_init(&app_context->procs, 1, PRTE_GLOBAL_ARRAY_MAX_SIZE, 16);
     app_context->state = PRTE_APP_STATE_UNDEF;
@@ -1059,6 +1067,7 @@ static void session_con(prte_session_t *s)
     PMIX_LOAD_PROCID(&s->requestor, NULL, PMIX_RANK_INVALID);
     s->owner_uid = PRTE_INVALID_UID;
     s->inheritance = PRTE_INHERIT_DEFAULT_VALUE;
+    s->acquisition = 0;
 }
 static void session_des(prte_session_t *s)
 {

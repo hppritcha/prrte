@@ -1993,6 +1993,153 @@ test_runtime() {
             && ok "...and a later job could publish that key again" \
             || bad "a reclaimed key could not be republished: $(echo "$out" | grep '^STATUS' | tr -d '\r')"
 
+        # PMIX_PERSIST_FIRST_READ, and the handover it exists for.  The
+        # criterion is the FIRST ACCESS and nothing else, so an item
+        # published for a reader that has not started yet must survive its
+        # publisher -- ds_purge used to take it at any horizon, which made
+        # this impossible and is issue #2733.  The two jobs never overlap,
+        # which is the point: predecessor exits, successor reads.
+        out=$(PRUN "--host node2:1 -n 1 $DS persist prte.test.pers.hand gen1 first-read 0" 2>&1)
+        echo "$out" | grep -q '^PUBLISHED prte.test.pers.hand' \
+            && ok "a PERSIST_FIRST_READ key was published by a job that then ended" \
+            || bad "the first-read publish never happened: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        sleep 5
+
+        out=$(PRUN "--host node3:1 -n 1 $DS lookup prte.test.pers.hand 15" 2>&1)
+        echo "$out" | grep -q '^FOUND prte.test.pers.hand gen1' \
+            && ok "a later job read what its predecessor left for it" \
+            || bad "an unread FIRST_READ key went with its publisher's job: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+
+        # ...and the read is what removed it.  Retention and consumption are
+        # different halves: the first half above must not have been bought
+        # by making the key permanent.
+        out=$(PRUN "--host node3:1 -n 1 $DS lookup prte.test.pers.hand 15" 2>&1)
+        echo "$out" | grep -q '^FOUND prte.test.pers.hand' \
+            && bad "a FIRST_READ key survived the read that answered it: $(echo "$out" | tr '\n' ' ' | tail -c 250)" \
+            || ok "...and the read consumed it, so a second lookup finds nothing"
+
+        # which leaves the name free for the successor's own generation --
+        # the whole reason a handover uses FIRST_READ rather than a key it
+        # would then have to unpublish.
+        out=$(PRUN "--host node3:1 -n 1 $DS dup prte.test.pers.hand gen2 0" 2>&1)
+        echo "$out" | grep -q 'STATUS PMIX_SUCCESS' \
+            && ok "...and the successor could publish its own value under that name" \
+            || bad "the consumed key was not free to republish: $(echo "$out" | grep '^STATUS' | tr -d '\r')"
+
+        banner "runtime/data_server: an application ending is not its job ending"
+        # PMIX_PERSIST_APP means the publishing process's APPLICATION - one
+        # app context - and an MPMD job's applications all share the single
+        # namespace assigned to the job.  They need not terminate together,
+        # so the app horizon and the namespace horizon are different moments
+        # and only a multi-app job can tell them apart.  (MPI hides this by
+        # requiring its apps to end together; that is an MPI rule.)
+        #
+        # One job, three apps.  Two publish and exit at once; the third
+        # holds the job open.  While it runs, the first app's APP data must
+        # be gone and its NSPACE data must not.
+        PRUN_BG /tmp/ds-mpmd.out \
+            "--host node2:1 -n 1 $DS persist prte.test.mp.app gone app 0 : --host node2:1 -n 1 $DS persist prte.test.mp.ns kept nspace 0 : --host node3:1 -n 1 $DS publish prte.test.mp.live alive session 30"
+        sleep 14
+        out=$(PRUN "--host node1:1 -n 1 $DS lookup prte.test.mp.live 15" 2>&1)
+        if ! echo "$out" | grep -q '^FOUND prte.test.mp.live'; then
+            skp "the MPMD job never got running; the app-horizon case is skipped"
+        else
+            ok "an MPMD job is running with one app still alive"
+            out=$(PRUN "--host node1:1 -n 1 $DS lookup prte.test.mp.app 15" 2>&1)
+            echo "$out" | grep -q '^FOUND prte.test.mp.app' \
+                && bad "PERSIST_APP data outlived its application: $(echo "$out" | tr '\n' ' ' | tail -c 250)" \
+                || ok "the PERSIST_APP key went when its own application ended"
+            out=$(PRUN "--host node1:1 -n 1 $DS lookup prte.test.mp.ns 15" 2>&1)
+            echo "$out" | grep -q '^FOUND prte.test.mp.ns kept' \
+                && ok "...and the PERSIST_NSPACE key beside it did not" \
+                || bad "NSPACE data went at the app horizon: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        fi
+        # ...and once the whole job is over, the namespace key goes too
+        sleep 25
+        out=$(PRUN "--host node1:1 -n 1 $DS lookup prte.test.mp.ns 15" 2>&1)
+        echo "$out" | grep -q '^FOUND prte.test.mp.ns' \
+            && bad "PERSIST_NSPACE data outlived its namespace: $(echo "$out" | tr '\n' ' ' | tail -c 250)" \
+            || ok "the PERSIST_NSPACE key went when the last app ended"
+
+        banner "runtime/data_server: a later job may take back its user's own name"
+        # Removal is owned by the publishing USER, not the publishing
+        # process.  It used to be the process - namespace AND rank - which
+        # sounds strict and is: a process takes no data with it when it
+        # exits, so an item published by a job that has ended was removable
+        # by nobody at all.  Its own user's next job could read it, could
+        # not publish over it (that is a duplicate) and could not remove it,
+        # so the name was wedged for the life of the DVM.  A predecessor
+        # that DIED before it could unpublish is the case this exists for,
+        # and it is exactly the case a checkpoint/restart handover hits.
+        #
+        # The predecessor here published PERSIST_SESSION, so nothing else
+        # was ever going to reclaim it.
+        out=$(PRUN "--host node2:1 -n 1 $DS persist prte.test.own kept session 0" 2>&1)
+        echo "$out" | grep -q '^PUBLISHED prte.test.own' \
+            && ok "a SESSION-persistence key was published by a job that then ended" \
+            || bad "the publish never happened: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        out=$(PRUN "--host node3:1 -n 1 $DS unpubonly prte.test.own 15" 2>&1)
+        echo "$out" | grep -q '^UNPUBLISHED prte.test.own PMIX_SUCCESS' \
+            && ok "a later job of the same user unpublished it" \
+            || bad "the unpublish was refused: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        echo "$out" | grep -q '^FOUND prte.test.own' \
+            && bad "the key survived an unpublish by its owner: $(echo "$out" | tr '\n' ' ' | tail -c 250)" \
+            || ok "...and the key is gone"
+        out=$(PRUN "--host node3:1 -n 1 $DS dup prte.test.own mine 0" 2>&1)
+        echo "$out" | grep -q 'STATUS PMIX_SUCCESS' \
+            && ok "...leaving the name free to publish under again" \
+            || bad "the freed name could not be reused: $(echo "$out" | grep '^STATUS' | tr -d '\r')"
+
+        # ...and the same ownership rule scopes prte.pub.replace, so the
+        # successor need not unpublish first.  Its predecessor's item is
+        # taken back by the publish itself.
+        out=$(PRUN "--host node2:1 -n 1 $DS persist prte.test.hand.rp gen1 session 0" 2>&1)
+        echo "$out" | grep -q '^PUBLISHED prte.test.hand.rp' \
+            && ok "a second SESSION key was published by a job that then ended" \
+            || bad "the publish never happened: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        # The replacing job stays alive for the read that follows it: what
+        # it publishes carries the DEFAULT persistence, which goes when its
+        # own job ends, and a lookup after that would be asking whether the
+        # replace worked long after the answer had been reclaimed.
+        PRUN_BG /tmp/ds-rp.out "--host node3:1 -n 1 $DS dup prte.test.hand.rp gen2 40 session replace"
+        sleep 10
+        RUN 'grep -q "STATUS PMIX_SUCCESS" /tmp/ds-rp.out' \
+            && ok "a later job replaced its predecessor's key in one publish" \
+            || bad "a same-user replace was refused: $(RUN 'cat /tmp/ds-rp.out' 2>&1 | tr '\n' ' ' | tail -c 250)"
+        out=$(PRUN "--host node1:1 -n 1 $DS lookup prte.test.hand.rp 15" 2>&1)
+        echo "$out" | grep -q '^FOUND prte.test.hand.rp gen2' \
+            && ok "...and the successor's value is what a lookup returns" \
+            || bad "the replace did not take effect: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        echo "$out" | grep -q '^FOUND prte.test.hand.rp gen1' \
+            && bad "the predecessor's value survived the replace: $(echo "$out" | tr '\n' ' ' | tail -c 250)" \
+            || ok "...and the predecessor's value is not still there beside it"
+        # What must still be refused is a DIFFERENT USER, which this harness
+        # cannot produce -- every container runs as one uid.  That half is
+        # unit-tested (test_data_server_ownership in test/unit/runtime), and
+        # what passes here says only that the same-user cases work.
+
+        banner "runtime/data_server: one node finishing does not purge the job's data"
+        # A daemon reaches job_teardown() when ITS OWN local procs of a job
+        # have terminated -- the gate is num_terminated == num_local_procs,
+        # not the whole job.  It used to send the DVM-wide purge from there,
+        # so on a job spanning nodes the first node to finish its share took
+        # the entire namespace's PERSIST_APP and PERSIST_PROC data out of the
+        # MASTER's store while the rest of the job was still running.
+        #
+        # One MPMD job, two nodes: node3's app exits at once, node2's stays
+        # alive holding a published key.  A third job then has to be able to
+        # read it.  node3's app does a lookup of its own before exiting
+        # because the purge is skipped entirely on a daemon whose clients
+        # never used the data server at all -- without it the case would pass
+        # for the wrong reason.
+        PRUN_BG /tmp/ds-span.out \
+            "--host node2:1 -n 1 $DS publish prte.test.span alive session 45 : --host node3:1 -n 1 $DS lookup prte.test.span 0"
+        sleep 15
+        out=$(PRUN "--host node1:1 -n 1 $DS lookup prte.test.span 15" 2>&1)
+        echo "$out" | grep -q '^FOUND prte.test.span alive' \
+            && ok "a key published on node2 survived node3 finishing its share" \
+            || bad "one node's completion purged the running job's data: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+
         banner "runtime/data_server: LOCAL-range data is reclaimed from the daemon holding it"
         # THE case that only exists with more than one node.  A LOCAL-range
         # publish never reaches the HNP: pmix_server_pub.c routes it to
@@ -2024,6 +2171,134 @@ test_runtime() {
         echo "$out" | grep -q '^FOUND prte.test.loc.keep kept' \
             && ok "...and the LOCAL PERSIST_SESSION key beside it did not" \
             || bad "the purge took local-range data it should have kept: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    fi
+    cleanup_swarm
+
+    banner "runtime/data_server: data that names no lifetime expires when idle"
+    # PMIX_PERSIST_INDEF is "retain until specifically deleted", and only its
+    # publisher may delete it -- so in a DVM that outlives the publisher it is
+    # a permanent allocation made by a process that no longer exists, and a
+    # job that publishes a few and exits leaves the store larger forever.  The
+    # retention timeout is what bounds it, and PMIX_PERSIST_FIRST_READ is
+    # bounded the same way when the read it waits for never comes.
+    #
+    # It is an IDLE timeout, not a lifetime: a rendezvous name in active use
+    # must not be pulled out from under its readers.  Both halves are asserted
+    # here, which is why the DVM is given a short one.
+    if ! RUN "test -x $DS"; then
+        skp "dataserver client not installed -- re-run ./build.sh"
+    elif ! prted_dvm_start_mca 'node1:2,node2:2,node3:2' '--prtemca prte_data_server_timeout 25'; then
+        bad "could not start a DVM for the retention-timeout test"
+    else
+        out=$(PRUN "--host node2:1 -n 1 $DS persist prte.test.idle forever indef 0" 2>&1)
+        echo "$out" | grep -q '^PUBLISHED prte.test.idle' \
+            && ok "a PERSIST_INDEF key was published by a job that then ended" \
+            || bad "the indef publish never happened: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+
+        # read it repeatedly across more than the timeout.  Each read restarts
+        # the clock, so a key in use survives a window it would not survive
+        # idle -- which is the difference between an idle timeout and a
+        # lifetime, and the whole reason the clock is per-item.
+        # Four reads, ~8s of sleep apiece plus however long a prun takes to
+        # get a process running -- so the gaps stay well inside the 25s
+        # timeout while the LAST read lands well outside it.  Both halves of
+        # that matter: if the reads were too close together the case would
+        # pass without ever showing the clock restart.
+        n=0
+        for i in 1 2 3 4; do
+            sleep 8
+            out=$(PRUN "--host node3:1 -n 1 $DS lookup prte.test.idle 15" 2>&1)
+            echo "$out" | grep -q '^FOUND prte.test.idle forever' && n=$((n+1))
+        done
+        [ "$n" = 4 ] \
+            && ok "...and being read kept it alive well past the 25s timeout" \
+            || bad "a key in active use was expired under its readers ($n/4 reads found it)"
+
+        # ...and now nobody reads it.  The sweep runs every timeout/4, so an
+        # item is gone within a sweep interval of falling idle past 25s.
+        sleep 40
+        out=$(PRUN "--host node3:1 -n 1 $DS lookup prte.test.idle 15" 2>&1)
+        echo "$out" | grep -q '^FOUND prte.test.idle' \
+            && bad "an idle PERSIST_INDEF key was never reclaimed: $(echo "$out" | tr '\n' ' ' | tail -c 250)" \
+            || ok "...and went once it had been idle past the timeout"
+
+        # the same bound on the other persistence that names no lifetime: a
+        # FIRST_READ item whose reader never arrives.  Job A publishes for a
+        # job B the user then decides not to run.
+        out=$(PRUN "--host node2:1 -n 1 $DS persist prte.test.unread waiting first-read 0" 2>&1)
+        echo "$out" | grep -q '^PUBLISHED prte.test.unread' \
+            && ok "a PERSIST_FIRST_READ key was published for a reader that never comes" \
+            || bad "the first-read publish never happened: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        sleep 40
+        out=$(PRUN "--host node3:1 -n 1 $DS lookup prte.test.unread 15" 2>&1)
+        echo "$out" | grep -q '^FOUND prte.test.unread' \
+            && bad "an unread FIRST_READ key was never reclaimed: $(echo "$out" | tr '\n' ' ' | tail -c 250)" \
+            || ok "...and it too went once the timeout had passed"
+
+        # the control: a persistence that DOES name a lifetime is not
+        # touched by the timeout, however long it sits idle.  Its publisher
+        # was promised that retention and is entitled to it.
+        out=$(PRUN "--host node2:1 -n 1 $DS persist prte.test.notidle kept session 0" 2>&1)
+        echo "$out" | grep -q '^PUBLISHED prte.test.notidle' \
+            && ok "a PERSIST_SESSION key was published beside them" \
+            || bad "the session publish never happened: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        sleep 40
+        out=$(PRUN "--host node3:1 -n 1 $DS lookup prte.test.notidle 15" 2>&1)
+        echo "$out" | grep -q '^FOUND prte.test.notidle kept' \
+            && ok "...and the timeout left it alone, idle or not" \
+            || bad "the sweep took data whose lifetime had not ended: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    fi
+    cleanup_swarm
+
+    banner "runtime/data_server: a store bounds what one user may hold"
+    # Retention alone leaves the store unbounded: a job can publish as much
+    # as it likes and exit, and what it published outlives it.  The cap is
+    # what bounds that, and it is applied PER PUBLISHING UID with eviction
+    # confined to that uid's own items -- because a blanket "replace the
+    # oldest" is an abuse primitive in its own right, letting junk published
+    # in bulk push somebody else's rendezvous name out of the store.
+    #
+    # The cap here is small enough that two items cannot both be held, which
+    # is what makes the outcome deterministic rather than a race with
+    # whatever else the DVM has published.
+    if ! RUN "test -x $DS"; then
+        skp "dataserver client not installed -- re-run ./build.sh"
+    elif ! prted_dvm_start_mca 'node1:2,node2:2,node3:2' '--prtemca prte_data_server_max_size 4096'; then
+        bad "could not start a DVM for the storage-cap test"
+    else
+        big=$(printf 'x%.0s' $(seq 1 1500))
+        huge=$(printf 'y%.0s' $(seq 1 5000))
+        out=$(PRUN "--host node2:1 -n 1 $DS persist prte.test.cap.first $big session 0" 2>&1)
+        echo "$out" | grep -q '^PUBLISHED prte.test.cap.first' \
+            && ok "a large key was published within the cap" \
+            || bad "the first capped publish was refused: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        out=$(PRUN "--host node2:1 -n 1 $DS persist prte.test.cap.second $big session 0" 2>&1)
+        echo "$out" | grep -q '^PUBLISHED prte.test.cap.second' \
+            && ok "...and a second one, which cannot fit beside it" \
+            || bad "the second capped publish was refused: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+
+        out=$(PRUN "--host node3:1 -n 1 $DS lookup prte.test.cap.first 15" 2>&1)
+        echo "$out" | grep -q '^FOUND prte.test.cap.first' \
+            && bad "the cap was not enforced: both keys are still there" \
+            || ok "the older key was evicted to make room"
+        out=$(PRUN "--host node3:1 -n 1 $DS lookup prte.test.cap.second 15" 2>&1)
+        echo "$out" | grep -q '^FOUND prte.test.cap.second' \
+            && ok "...and the newer one is what the store kept" \
+            || bad "eviction took the wrong item: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+
+        # A publish too large for the whole cap can never fit, so evicting on
+        # its behalf would cost this user everything it holds and still fail.
+        # It is refused before anything is touched.
+        out=$(PRUN "--host node3:1 -n 1 $DS dup prte.test.cap.huge $huge 0" 2>&1)
+        echo "$out" | grep -q 'STATUS PMIX_ERR_OUT_OF_RESOURCE' \
+            && ok "a publish larger than the whole cap was refused" \
+            || bad "an unfittable publish was not refused: $(echo "$out" | grep '^STATUS' | tr -d '\r')"
+        out=$(PRUN "--host node3:1 -n 1 $DS lookup prte.test.cap.second 15" 2>&1)
+        echo "$out" | grep -q '^FOUND prte.test.cap.second' \
+            && ok "...and it evicted nothing on its way to being refused" \
+            || bad "a refused publish cost the store data: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
         RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
     fi
     cleanup_swarm
@@ -3110,6 +3385,59 @@ test_session() {
         [ "$n" = 4 ] \
             && ok "the terminated reservation gave its node back" \
             || bad "expected 4 usable nodes after terminate, saw $n: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+
+        banner "session: tearing one down reclaims what its jobs published"
+        # PMIX_PERSIST_SESSION is "retain until the session terminates", and
+        # PRRTE's session is the ALLOCATION the publisher was running within.
+        # Nothing else reclaims such an item: no job-end horizon takes it, and
+        # its publisher is gone.  This is the only place the horizon can be
+        # seen at all -- it needs a reservation that is torn down while the
+        # DVM lives on, which one job, or one session, cannot show.
+        #
+        # The publisher runs INSIDE the reservation, which is what gives its
+        # data a session to belong to: the job carries PRTE_JOB_SESSION_ID and
+        # the datastore records it against each item at publish.
+        if ! RUN "test -x $DS"; then
+            skp "dataserver client not installed -- the session-horizon case is skipped"
+        else
+            # a key published from OUTSIDE any reservation, which the teardown
+            # below must leave alone.  Same persistence, different session --
+            # so what separates them is the session id and nothing else.
+            out=$(PRUN "--host node1:1 -n 1 $DS persist prte.test.sess.other kept session 0" 2>&1)
+            echo "$out" | grep -q '^PUBLISHED prte.test.sess.other' \
+                && ok "a SESSION key was published outside any reservation" \
+                || bad "the control publish never happened: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+
+            out=$(RUN "timeout 60 $SESSCTL instantiate 4244 --hosts node4:2 --np 1 \
+                           -- $DS persist prte.test.sess.inside kept session 200" 2>&1)
+            echo "$out" | grep -q PMIX_SUCCESS \
+                && ok "session 4244 instantiated with a publisher inside it" \
+                || bad "instantiate failed: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+            sleep 8
+
+            out=$(PRUN "--host node1:1 -n 1 $DS lookup prte.test.sess.inside 15" 2>&1)
+            if ! echo "$out" | grep -q '^FOUND prte.test.sess.inside kept'; then
+                skp "the in-session publisher never published; the horizon case is skipped"
+            else
+                ok "...and what it published is there while the session stands"
+                out=$(RUN "timeout 60 $SESSCTL terminate 4244" 2>&1)
+                echo "$out" | grep -q PMIX_SUCCESS \
+                    && ok "session 4244 terminated on request" \
+                    || bad "terminate failed: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+                sleep 6
+                out=$(PRUN "--host node1:1 -n 1 $DS lookup prte.test.sess.inside 15" 2>&1)
+                echo "$out" | grep -q '^FOUND prte.test.sess.inside' \
+                    && bad "SESSION data outlived its session: $(echo "$out" | tr '\n' ' ' | tail -c 250)" \
+                    || ok "...and it went when the session was torn down"
+                # the control: the purge names one session, and takes only its
+                # data.  Without the session id on each item this key would
+                # have gone with it, since it is the same persistence.
+                out=$(PRUN "--host node1:1 -n 1 $DS lookup prte.test.sess.other 15" 2>&1)
+                echo "$out" | grep -q '^FOUND prte.test.sess.other kept' \
+                    && ok "...while another session's key beside it was untouched" \
+                    || bad "the teardown took data belonging to another session: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+            fi
+        fi
 
         banner "session: an unknown session and a conflicting request are refused"
         out=$(RUN "timeout 60 $SESSCTL pause 9999" 2>&1)

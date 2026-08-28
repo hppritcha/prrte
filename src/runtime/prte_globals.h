@@ -292,6 +292,9 @@ typedef struct{
      * the struct compiles against a PMIx that lacks the type; defaults to the
      * value of PMIX_ALLOC_INHERIT_DEFAULT. */
     uint8_t inheritance;
+    /* Order in which this DVM acquired its allocations, from 1; 0 until the
+     * session is registered. Served as PMIX_ALLOC_SEQUENCE. */
+    uint32_t acquisition;
 } prte_session_t;
 PRTE_EXPORT PMIX_CLASS_DECLARATION(prte_session_t);
 
@@ -309,6 +312,11 @@ typedef struct {
     char *app;
     /** Number of copies of this process that are to be launched */
     int32_t num_procs;
+    /** How many of them have terminated.  Counted only at the master, which
+     * is the only process that sees every proc of the job stop, and used to
+     * decide when this APPLICATION - as distinct from the job - is over.
+     * Not packed: a daemon has no use for it. */
+    int32_t num_terminated;
     /** Array of pointers to the proc objects for procs of this app_context
      * NOTE - not always used
      */
@@ -680,6 +688,14 @@ PRTE_EXPORT extern bool prte_debug_daemons_file_flag;
 PRTE_EXPORT extern bool prte_leave_session_attached;
 PRTE_EXPORT extern char *prte_data_server_uri;
 PRTE_EXPORT extern bool prte_dvm_ready;
+/* Latched true the first time the DVM finishes starting, and never cleared.
+ * prte_dvm_ready is NOT this: it is cleared and re-set on every grow, session
+ * instantiate and teardown, so it answers "is a size change in flight", not
+ * "have we started". The difference is what tells a startup failure - where
+ * the HNP's terminal is the only place the user can be looking - from a
+ * failure during operation, where a tool is holding the connection and the
+ * HNP must stay quiet. See deliver_locally() in src/util/prte_show_help.c. */
+PRTE_EXPORT extern bool prte_dvm_started;
 PRTE_EXPORT extern pmix_pointer_array_t *prte_cache;
 PRTE_EXPORT extern bool prte_persistent;
 
