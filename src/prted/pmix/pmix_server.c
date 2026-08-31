@@ -539,20 +539,6 @@ void pmix_server_register_params(void)
                                       PMIX_MCA_BASE_VAR_TYPE_BOOL,
                                       &prte_pmix_server_globals.allow_client_clones);
 
-    /* Publish per-proc data only for the procs we host, and derive the rest on
-     * demand.  Every daemon registering a PMIx entry for every proc in the job
-     * is a table that grows with the job while the work on the node does not;
-     * the placement it describes is derivable here from the job object, so the
-     * direct-modex upcall can answer for a proc we do not host without any
-     * wire traffic.  See derive_proc_data() in pmix_server_fence.c. */
-    prte_pmix_server_globals.lazy_procdata = true;
-    (void) pmix_mca_base_var_register("prte", "pmix", NULL, "lazy_procdata",
-                                      "Publish per-proc data to the local PMIx server only "
-                                      "for procs this daemon hosts, deriving data for other "
-                                      "procs on demand",
-                                      PMIX_MCA_BASE_VAR_TYPE_BOOL,
-                                      &prte_pmix_server_globals.lazy_procdata);
-
     /* whether or not to drop a session-level tool rendezvous point */
     prte_pmix_server_globals.session_server = false;
     (void) pmix_mca_base_var_register("prte", "pmix", NULL, "session_server",
@@ -1344,6 +1330,10 @@ void pmix_server_start(void)
     PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_SCHED_RESP,
                   PRTE_RML_PERSISTENT, pmix_server_alloc_request_resp, NULL);
 
+    /* setup recv for the master's answer to a query we could not answer */
+    PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_QUERY_RESP,
+                  PRTE_RML_PERSISTENT, pmix_server_query_resp, NULL);
+
     /* setup recv for monitor request */
     PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_MONITOR_REQUEST,
                   PRTE_RML_PERSISTENT, pmix_server_monitor_request, NULL);
@@ -1367,6 +1357,10 @@ void pmix_server_start(void)
         /* setup recv for scheduler requests */
         PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_SCHED,
                       PRTE_RML_PERSISTENT, pmix_server_sched, NULL);
+        /* setup recv for queries relayed by a daemon - slot counts, node
+         * state and the session table live only here */
+        PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_QUERY,
+                      PRTE_RML_PERSISTENT, pmix_server_query_request, NULL);
         /* setup recv for the membership of connected assemblages, which is
          * held here because we are the one process that sees every proc in
          * the DVM terminate */
@@ -1393,12 +1387,14 @@ void pmix_server_finalize(void)
     PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_NOTIFICATION);
     PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_TCONN_RESP);
     PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_SCHED_RESP);
+    PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_QUERY_RESP);
     PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_MONITOR_REQUEST);
     PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_MONITOR_RESP);
     PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_LOGGING_RESP);
     if (PRTE_PROC_IS_MASTER) {
         PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_LOGGING);
         PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_SCHED);
+        PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_QUERY);
         PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_CONNECTED);
     }
 
@@ -3124,6 +3120,9 @@ static void rqcon(prte_pmix_server_req_t *p)
     p->infocbfunc = NULL;
     p->cbdata = NULL;
     p->rlcbdata = NULL;
+    p->qcaddy = NULL;
+    p->qresults = NULL;
+    p->nkeys = 0;
 }
 static void rqdes(prte_pmix_server_req_t *p)
 {

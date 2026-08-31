@@ -424,7 +424,11 @@ typedef struct prte_job_t {
     /* offset to the total number of procs so shared memory
      * components can potentially connect to any spawned jobs*/
     pmix_rank_t offset;
-    /* session this job is running in */
+    /* Session this job is running in.  A COUNTED reference: a reservation is
+     * torn down while the jobs that ran in it may still be alive, and the
+     * job-side pointer has to keep the object it names valid for as long as
+     * the job can read it.  Set with prte_set_job_session(), released by the
+     * job destructor.  There is no cycle to fear - session->jobs[] borrows. */
     prte_session_t *session;
     /* app_context array for this job */
     pmix_pointer_array_t *apps;
@@ -502,9 +506,9 @@ typedef struct prte_job_t {
     /* Sessions this job may map onto, resolved from PRTE_JOB_SPAWN_TARGET on the
      * HNP after the ownership check. HNP-local; never packed (rebuilt from the
      * attribute if ever needed). Defaults to { jdata->session } when no spawn
-     * target was given. target_sessions holds borrowed session pointers (owned
-     * via prte_set_session_object, not by the job), so the destructor frees only
-     * the array, not the sessions it points at. */
+     * target was given. Each entry is a COUNTED reference, for the same reason
+     * jdata->session is; the destructor releases every entry and then frees
+     * the array. */
     prte_session_t **target_sessions;
     size_t num_target_sessions;
     /* track the number of stack traces recv'd */
@@ -578,6 +582,40 @@ PRTE_EXPORT prte_session_t *prte_get_session_object_from_id(const char *id);
 PRTE_EXPORT prte_session_t *prte_get_session_object_from_refid(const char *refid);
 
 PRTE_EXPORT int prte_set_session_object(prte_session_t *session);
+
+/* Reach allocation state that only the DVM master holds.
+ *
+ * A prted's node pool carries a node's *identity* and nothing else: the
+ * nidmap ships names, aliases, daemon vpids and pool slots (see
+ * src/util/nidmap.c), and no writer of prte_node_t::slots, slots_max,
+ * slots_inuse or state runs anywhere but the master - the ras components,
+ * the hostfile and dash_host parsers, and plm_base_setup_virtual_machine()
+ * are all master-only.  Likewise prte_sessions on a prted holds the default session
+ * and nothing more, because every other session is created by the master's
+ * allocation paths.  So a daemon reading either gets a default-constructed
+ * zero that is indistinguishable from a real answer.
+ *
+ * These are the only sanctioned way into that state.  On the master they
+ * succeed and hand back exactly what a direct read would have; anywhere else
+ * they return PRTE_ERR_NOT_AUTHORITATIVE having touched nothing, which is the
+ * caller's cue to ask the master instead.  Answering from here rather than
+ * from a list of "keys that need the master" is deliberate: the set of such
+ * keys is not knowable in advance, but the set of *reads* that cannot be
+ * satisfied locally is exactly this, and it is enforced at the point of use.
+ *
+ * A NULL allocid means the DVM-wide allocation.  Do not reach past these to
+ * prte_node_pool or prte_sessions for capacity or session state - a checker
+ * run by "make check" fails the build if pmix_server_queries.c does. */
+PRTE_EXPORT int prte_get_allocated_nodes(const char *allocid,
+                                         pmix_pointer_array_t **nodes);
+PRTE_EXPORT int prte_get_allocation_session(const char *allocid,
+                                            prte_session_t **session);
+PRTE_EXPORT int prte_get_allocation_sessions(pmix_pointer_array_t **sessions);
+
+/* Point a job at the session it runs in, maintaining the reference count on
+ * both the outgoing and the incoming session.  Every assignment to
+ * prte_job_t::session must go through this. */
+PRTE_EXPORT void prte_set_job_session(prte_job_t *jdata, prte_session_t *session);
 
 /* True if nspace is in session->owners, or session is the default session,
  * or nspace is the scheduler. */

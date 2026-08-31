@@ -107,26 +107,6 @@ which nodes, and the daemon-launch path would have to fan out through more
 than one.  At minimum it needs a launcher affinity recorded per node and
 honored by ``prte_plm_base_setup_virtual_machine``.
 
-**A torn-down reservation leaks its session object.**
-``prte_ras_base_teardown_reservation`` (``src/mca/ras/base/ras_base_allocate.c``)
-gives a reservation's nodes back, drops its owners and its retained owner
-job, and removes it from ``prte_sessions`` so nothing can look it up or
-target it again — but it does not release the ``prte_session_t`` itself, and
-deregistering it also puts it beyond ``prte_finalize``'s sweep over that
-array, which is the only thing that would have reclaimed it.  Releasing it
-there is not safe as things stand: ``prte_job_t::session`` and
-``::target_sessions`` are borrowed pointers taken without a reference, so a
-job still running in the reservation — the reason the object is kept in the
-first place — would be left holding a dangling one.  The leak is one small
-object per reservation ever torn down, which an elastic DVM does once per
-grow, so it is bounded by the DVM's lifetime and by how much it grows.
-Fixing it properly means deciding who owns a session: either those job-side
-pointers become counted references, or teardown clears them (and the mapper's
-session filtering has to be correct for a job whose session has gone).  The
-one consequence that *was* fixable in isolation has been: the session's time
-limit is now disarmed at teardown, so a stale timer can no longer terminate
-jobs on a reservation that no longer exists.
-
 **``register_nspace()`` checks the list it is building, not the entries it
 puts in it.**  ``prte_pmix_server_register_nspace``
 (``src/prted/pmix/pmix_server_register_fns.c``) makes roughly forty
@@ -141,23 +121,6 @@ failing everywhere at once.  The consequence if that argument is wrong is a
 job registered with a key silently missing.  What would settle it properly
 is not forty checks but an accumulator — one status the adds fold into,
 tested once — which is a change to the macro, not to this file.
-
-**A client registration that fails is logged and the launch continues.**
-``register_nspace()`` calls ``PMIx_server_register_client`` for each proc it
-is about to host and, on an error, logs it and carries on.  The proc's
-``PMIx_Init`` will then be refused by our own PMIx server, which the
-application sees as an obscure failure some way downstream rather than as
-the launch failure it is.  Failing the whole job on it would be the honest
-alternative and is not obviously right either — the observed failure modes
-are out-of-memory — so it is recorded rather than changed.
-
-**``PRTE_JOB_NSPACE_REGISTERED`` is written and never read.**  Both
-registration paths in ``pmix_server_register_fns.c`` set it, and nothing in
-the tree consults it.  Either something should — the obvious candidate is
-the wildcard direct-modex arm of ``dmodex_req``, which re-registers a
-namespace it may already have registered — or the attribute should go, along
-with its entry in ``src/util/attr.h``.  Leaving it is the third option and
-is what the code does today.
 
 **A session control addressed to every session answers with no session id.**
 ``apply_to_all`` (``src/prted/pmix/pmix_server_session.c``) applies the
@@ -935,7 +898,8 @@ takes more off this traffic than aggregating it ever would have.
 **Lazy proc-data registration: the withholding half.**  The *deriving*
 half is in: ``dmodex_req`` answers a request for one of the placement keys
 out of ``jdata->procs[rank]`` rather than going to the hosting daemon
-(``prte_pmix_lazy_procdata``, on by default).  The *withholding* half is not,
+(unconditionally — the MCA parameter that used to gate it is gone, having
+only ever controlled the requesting side).  The *withholding* half is not,
 and not by omission from the design — the commit that landed the derivation
 does not touch ``pmix_server_register_fns.c`` at all.  That file's per-proc
 loop still emits a ``PMIX_PROC_INFO_ARRAY`` for **every** proc in the job on
@@ -956,8 +920,7 @@ anyone spends effort on the other half.  Measured with
 job where it is — at eight ranks over four nodes, with
 ``--prtemca prte_pmix_server_verbose 2``, the twenty-four peer lookups split
 six answered by the derivation and eighteen by a wire round trip to the
-hosting daemon; with ``prte_pmix_lazy_procdata 0`` it is zero and
-twenty-four.  Every one of the six is on the master, and every one is for
+hosting daemon.  Every one of the six is on the master, and every one is for
 ``PMIX_RANK``.  That is the only key PMIx never has: it consumes the rank
 entry as the array's identifier rather than storing it.  Everything else the
 eager registration publishes is found locally and never reaches the

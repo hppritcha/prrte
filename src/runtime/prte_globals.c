@@ -370,6 +370,54 @@ prte_session_t *prte_get_session_object_from_id(const char *id)
     return NULL;
 }
 
+/* See the block comment in prte_globals.h.  These three are the gate between
+ * code that wants allocation state and the fact that only the master has it. */
+int prte_get_allocated_nodes(const char *allocid, pmix_pointer_array_t **nodes)
+{
+    prte_session_t *session;
+
+    *nodes = NULL;
+    if (!PRTE_PROC_IS_MASTER) {
+        return PRTE_ERR_NOT_AUTHORITATIVE;
+    }
+    if (NULL == allocid) {
+        *nodes = prte_node_pool;
+        return PRTE_SUCCESS;
+    }
+    session = prte_get_session_object_from_id(allocid);
+    if (NULL == session) {
+        return PRTE_ERR_NOT_FOUND;
+    }
+    *nodes = session->nodes;
+    return PRTE_SUCCESS;
+}
+
+int prte_get_allocation_session(const char *allocid, prte_session_t **session)
+{
+    *session = NULL;
+    if (!PRTE_PROC_IS_MASTER) {
+        return PRTE_ERR_NOT_AUTHORITATIVE;
+    }
+    if (NULL == allocid) {
+        return PRTE_ERR_BAD_PARAM;
+    }
+    *session = prte_get_session_object_from_id(allocid);
+    if (NULL == *session) {
+        return PRTE_ERR_NOT_FOUND;
+    }
+    return PRTE_SUCCESS;
+}
+
+int prte_get_allocation_sessions(pmix_pointer_array_t **sessions)
+{
+    *sessions = NULL;
+    if (!PRTE_PROC_IS_MASTER) {
+        return PRTE_ERR_NOT_AUTHORITATIVE;
+    }
+    *sessions = prte_sessions;
+    return PRTE_SUCCESS;
+}
+
 prte_session_t *prte_get_session_object_from_refid(const char *refid)
 {
     prte_session_t *session;
@@ -437,6 +485,25 @@ int prte_set_session_object(prte_session_t *session)
     }
     session->acquisition = ++prte_session_acquisitions;
     return PRTE_SUCCESS;
+}
+
+void prte_set_job_session(prte_job_t *jdata, prte_session_t *session)
+{
+    prte_session_t *old;
+
+    if (NULL == jdata || jdata->session == session) {
+        return;
+    }
+    /* retain BEFORE releasing: the two may be the same object reached by
+     * different paths, and dropping the last reference first would free it */
+    old = jdata->session;
+    if (NULL != session) {
+        PMIX_RETAIN(session);
+    }
+    jdata->session = session;
+    if (NULL != old) {
+        PMIX_RELEASE(old);
+    }
 }
 
 prte_proc_t *prte_get_proc_object(const pmix_proc_t *proc)
@@ -826,12 +893,25 @@ static void prte_job_destruct(prte_job_t *job)
     if (NULL != job->traces) {
         PMIx_Argv_free(job->traces);
     }
-    /* target_sessions holds borrowed session pointers - free only the array */
+    /* Both the primary session and every target carry a counted reference -
+     * see prte_job_t::session.  Dropping them here is what finally reclaims a
+     * reservation that was torn down while this job was still running in it:
+     * teardown deregisters the session and gives up the registry's reference,
+     * and the last job to let go is what frees the object. */
     if (NULL != job->target_sessions) {
+        for (n = 0; n < (int) job->num_target_sessions; n++) {
+            if (NULL != job->target_sessions[n]) {
+                PMIX_RELEASE(job->target_sessions[n]);
+            }
+        }
         free(job->target_sessions);
         job->target_sessions = NULL;
     }
     job->num_target_sessions = 0;
+    if (NULL != job->session) {
+        PMIX_RELEASE(job->session);
+        job->session = NULL;
+    }
     PMIX_DESTRUCT(&job->cli);
 }
 

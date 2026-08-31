@@ -2550,6 +2550,8 @@ test_runtime() {
 PT=/opt/prte/prte/bin/proctable
 # ...and the client that asks a peer where it is, for the same reason.
 PI=/opt/prte/prte/bin/peerinfo
+# ...and the client that asks its own daemon how big the allocation is.
+SI=/opt/prte/prte/bin/slotinfo
 
 # Cross-check one peerinfo run.  Every rank prints a SELF line about itself
 # and a PEER line about each of the others, in the same field order, so the
@@ -2584,7 +2586,7 @@ peerinfo_mismatches() {
 }
 
 test_pmix() {
-    local out rc n hosts undef peers lazyout eagerout mism a b vrb
+    local out rc n hosts undef peers lazyout mism a vrb
 
     banner "pmix: the queried proc table carries a real state for every proc"
     # PMIX_QUERY_PROC_TABLE is the only caller of prte_pmix_convert_state(),
@@ -2798,11 +2800,13 @@ test_pmix() {
     # It matters because of what the daemon may legitimately not have
     # published.  Registering a PMIx entry for every proc in the job, on every
     # daemon, builds a table that grows with the whole job on a node that runs
-    # a fixed slice of it, so prte_pmix_lazy_procdata publishes only the procs
-    # this daemon hosts and derives the rest from its own job object when
-    # somebody asks.  The derivation is reached through the direct-modex
-    # up-call, which is a path no single-host run has: on one node every proc
-    # is local and there is nothing to derive.
+    # a fixed slice of it.  Publishing only the procs this daemon hosts was
+    # tried and closed (docs/todo.rst); what remains is the derivation, which
+    # answers out of this daemon's own job object for the keys it does hold
+    # and which the eager registration cannot publish -- above all the
+    # binding, which the launch message scatters.  The derivation is reached
+    # through the direct-modex up-call, which is a path no single-host run
+    # has: on one node every proc is local and there is nothing to derive.
     #
     # The assertion is a cross-check rather than a spot value, because the
     # interesting failure is not "no answer" but "a plausible wrong answer" --
@@ -2851,6 +2855,28 @@ test_pmix() {
             && ok "...including every peer's binding, which off-node had to be fetched" \
             || bad "$n of 56 peer lookups came back with a binding"
 
+        # ...and the one reserved key that must NOT be answered for a peer
+        # elsewhere.  Device distances are measured against the topology of
+        # the node the proc runs on, and a daemon holds only its own -- the
+        # HNP collects every node's, no daemon receives anybody else's.  So
+        # a daemon that answered would be handing back distances computed
+        # from ITS hardware and labelled with somebody else's rank, which is
+        # worse than a refusal because it is plausible.  The request is
+        # refused outright rather than sent on a round trip that cannot
+        # answer it.  Nothing is asserted about a peer on this same node:
+        # the daemon published those at registration and the question never
+        # leaves the local server, and whether any device of the configured
+        # types exists at all is a property of the machine.
+        n=$(echo "$lazyout" | tr -d '\r' | awk '$1 == "DIST" && $4 == "remote" {c++} END {print c+0}')
+        a=$(echo "$lazyout" | tr -d '\r' | awk '$1 == "DIST" && $4 == "remote" && $5 != "PMIX_ERR_NOT_SUPPORTED" {c++} END {print c+0}')
+        if [ "${n:-0}" -eq 0 ]; then
+            bad "no rank asked an off-node peer for its device distances -- the refusal went untested"
+        elif [ "${a:-0}" -eq 0 ]; then
+            ok "...and all $n requests for an off-node peer's device distances were refused as unsupported"
+        else
+            bad "$a of $n off-node device-distance requests were not refused: $(echo "$lazyout" | tr -d '\r' | awk '$1 == "DIST" && $4 == "remote" && $5 != "PMIX_ERR_NOT_SUPPORTED"' | head -3 | tr '\n' ' ')"
+        fi
+
         # Note what that comparison already is: a SELF line is what the
         # proc's OWN daemon published about it -- which a daemon does for
         # its own procs either way -- while the PEER lines about it are what
@@ -2859,18 +2885,76 @@ test_pmix() {
         # two separate runs would not be: a second job has a different
         # PMIX_GLOBAL_RANK offset, so the tables legitimately differ.
         #
-        # The same job with the derivation off is therefore a control on the
-        # client rather than a second reading: it must pass here too, or a
-        # failure above says nothing about the derivation.
-        eagerout=$(PRUN "$peers --prtemca prte_pmix_lazy_procdata 0 $PI" 2>&1)
-        mism=$(peerinfo_mismatches "$eagerout")
-        n=$(echo "$eagerout" | grep -c '^PEERFAIL')
-        if [ -z "$mism" ] && [ "$n" = 0 ]; then
-            ok "eager publication (prte_pmix_lazy_procdata 0) passes the same check"
-        else
-            bad "the check fails with the derivation off, so it is not testing the derivation: $(echo "$mism" | head -2 | tr '\n' ' ' | tail -c 400)"
-        fi
+        # There used to be a second reading here with the derivation
+        # switched off, as a control on the client.  The switch is gone --
+        # deriving what we can and asking the wire for the rest is what the
+        # daemon does, and the parameter only ever controlled the requesting
+        # side, so "off" meant "fetch the same answer over the wire".  The
+        # control that remains is the one below: the daemon has to say it
+        # derived something, or the compare above is passing on eagerly
+        # published data and proves nothing.
         RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    fi
+    cleanup_swarm
+
+    banner "prted: an allocation query is answered the same on every node"
+    # PMIX_NUM_SLOTS and PMIX_QUERY_AVAILABLE_SLOTS describe the DVM, so every
+    # rank must get the same answer whichever daemon it asked.  They cannot be
+    # answered from a prted's own state: the nidmap ships node names, aliases,
+    # daemon vpids and pool slots and nothing else, so slots, slots_max,
+    # slots_inuse and node state are all still at their constructed defaults
+    # on every daemon but the master.  Answering there returns zero -- and
+    # returns it as PMIX_SUCCESS, so the client cannot tell.  The daemon now
+    # relays such keys to the master and merges the reply with what it could
+    # answer itself.
+    #
+    # The assertion is a cross-check rather than a spot value for the same
+    # reason as the peer lookups above: the failure is not "no answer" but a
+    # plausible wrong one.  One rank per node, and every rank has to agree.
+    cleanup_swarm
+    if ! RUN "test -x $SI"; then
+        skp "slotinfo client not installed -- re-run ./build.sh"
+    elif ! prted_dvm_start 'node1:2,node2:2,node3:2,node4:2'; then
+        bad "could not start a DVM for the allocation-query test"
+        cleanup_swarm
+    else
+        out=$(PRUN "--host node1:1,node2:1,node3:1,node4:1 -n 4 --map-by node $SI" 2>&1)
+        n=$(echo "$out" | tr -d '\r' | grep -c '^SLOTS ')
+        [ "$n" = 4 ] \
+            && ok "all 4 ranks got an answer for PMIX_NUM_SLOTS" \
+            || bad "$n of 4 ranks were answered: $(echo "$out" | tr '\n' ' ' | tail -c 400)"
+        # the run must actually span nodes or the case is vacuous - a single
+        # node would put every rank on the master and never relay anything
+        hosts=$(echo "$out" | tr -d '\r' | awk '$1=="SLOTS" {print $2}' | sort -u | grep -c '^node')
+        [ "${hosts:-0}" -ge 2 ] \
+            && ok "...from $hosts different nodes (so daemons other than the master answered)" \
+            || bad "the job did not span nodes -- this case would be vacuous"
+        # zero is the shape of the bug: a daemon reading its own node pool
+        n=$(echo "$out" | tr -d '\r' | awk '$1=="SLOTS" && $3+0==0 {c++} END {print c+0}')
+        [ "$n" = 0 ] \
+            && ok "...and no rank was told the allocation has zero slots" \
+            || bad "$n rank(s) were told zero slots: $(echo "$out" | tr -d '\r' | grep '^SLOTS ' | tr '\n' ' ' | tail -c 300)"
+        # ...and they must agree, which is what says the relayed answer is the
+        # master's own rather than each daemon's guess
+        n=$(echo "$out" | tr -d '\r' | awk '$1=="SLOTS" {print $3}' | sort -u | wc -l | tr -d ' ')
+        [ "$n" = 1 ] \
+            && ok "...and every rank was given the same number" \
+            || bad "ranks disagree about the slot count: $(echo "$out" | tr -d '\r' | grep '^SLOTS ' | tr '\n' ' ' | tail -c 300)"
+        # the second key in the same query - a request that mixes keys has to
+        # come back whole, not just the half the master answered
+        n=$(echo "$out" | tr -d '\r' | grep -c '^AVAIL ')
+        [ "$n" = 4 ] \
+            && ok "...and the other key in the same query was answered too" \
+            || bad "$n of 4 ranks got PMIX_QUERY_AVAILABLE_SLOTS: $(echo "$out" | tr '\n' ' ' | tail -c 400)"
+        n=$(echo "$out" | tr -d '\r' | awk '$1=="AVAIL" {print $3}' | sort -u | wc -l | tr -d ' ')
+        [ "$n" = 1 ] \
+            && ok "...consistently" \
+            || bad "ranks disagree about the available slots: $(echo "$out" | tr -d '\r' | grep '^AVAIL ' | tr '\n' ' ' | tail -c 300)"
+        n=$(echo "$out" | tr -d '\r' | grep -c '^ERROR ')
+        [ "$n" = 0 ] \
+            && ok "...and no rank reported a query failure" \
+            || bad "$n rank(s) failed the query: $(echo "$out" | tr -d '\r' | grep '^ERROR ' | tr '\n' ' ' | tail -c 300)"
+        RUN "timeout -k 5 30 pterm --dvm-uri file:$PRTED_URI" >/dev/null 2>&1
     fi
     cleanup_swarm
 
@@ -2896,12 +2980,14 @@ test_pmix() {
         [ "$n" = 0 ] \
             && ok "...and none of the lookups failed" \
             || bad "$n lookups failed while the derivation was in use"
-        # ...and with it off, nothing may claim to have derived anything.
-        out=$(RUN "timeout -k 5 150 prterun --host node1:2,node2:2,node3:2,node4:2 \
-                     -n 8 --map-by node $vrb --prtemca prte_pmix_lazy_procdata 0 $PI" 2>&1)
-        echo "$out" | grep -q 'ANSWERED LOCALLY' \
-            && bad "the derivation ran even though prte_pmix_lazy_procdata was 0" \
-            || ok "prte_pmix_lazy_procdata 0 turns the derivation off completely"
+        # ...and the one key no daemon can derive is refused rather than
+        # sent on a round trip that cannot answer it.  Device distances are
+        # measured against the topology of the node the proc runs on, and a
+        # daemon holds only its own.
+        n=$(echo "$out" | grep -c 'DEVICE DISTANCES - NOT SUPPORTED')
+        [ "${n:-0}" -gt 0 ] \
+            && ok "...and $n requests for a remote proc's device distances were refused by the daemon" \
+            || bad "no daemon refused a device-distance request -- either peerinfo stopped asking or the refusal moved"
     fi
     cleanup_swarm
 }
@@ -7601,6 +7687,98 @@ gcc -o /root/staged_marker /root/staged_marker.c' >/dev/null 2>&1
         RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
     else
         bad "could not start an elastic DVM for the reservation-ownership test"
+    fi
+    cleanup_swarm
+
+    banner "elastic DVM: a reservation torn down under a live job"
+    # Tearing a reservation down RELEASES the prte_session_t: teardown
+    # deregisters it from prte_sessions, which puts it beyond every later
+    # sweep, so teardown is the only place left that can reclaim it. That is
+    # safe only because prte_job_t::session and ::target_sessions are counted
+    # references -- and this is the case that proves it has to be, because it
+    # is the one where a job is still running in a reservation at the moment
+    # the reservation goes away.
+    #
+    # The shape: the elastic client grows a reservation and holds it open
+    # with a short job of its own, a SECOND job from a different namespace is
+    # spawned into that reservation by --alloc-id, and then the client exits.
+    # Its exit terminates the owning namespace, which fires the reservation's
+    # inheritance disposition -- teardown -- while the second job is still
+    # running. That job then has to run to completion and retire normally,
+    # and retiring is precisely when the master reads jdata->session again
+    # (state_dvm's release path removes the job from session->jobs and hands
+    # the session to prte_pmix_server_session_job_terminated). With the
+    # job-side pointer borrowed rather than counted, that read is of freed
+    # memory and it takes the HNP with it.
+    #
+    # Gated on PMIX_CAP_TOOL_FINALIZED for the same reason the departing-tool
+    # case above is: without it the host is never told the tool went, the
+    # disposition never runs, no teardown ever happens, and every assertion
+    # below would pass without having tested anything.
+    cleanup_swarm
+    RUN 'nohup prte --daemonize --prtemca prte_elastic_mode 1 >/tmp/prte.out 2>&1 & sleep 8' >/dev/null
+    if ! RUN 'pgrep -x prte >/dev/null'; then
+        bad "could not start an elastic DVM for the reservation-teardown test"
+    elif ! pmix_cap PMIX_CAP_TOOL_FINALIZED; then
+        skp "teardown under a live job (PMIx predates PMIX_CAP_TOOL_FINALIZED)"
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    else
+        RUN 'rm -f /tmp/resv-own.out /tmp/resv-late.out' >/dev/null 2>&1
+        # the owner's own job is what keeps the reservation alive long enough
+        # to spawn into; it has to outlast that spawn and no longer
+        RUN_BG /tmp/resv-own.out "timeout 120 elastic grow node2:2,node3:2 -- sleep 20"
+        for _ in $(seq 1 40); do
+            RUN 'grep -q "^>>> SPAWNED" /tmp/resv-own.out' >/dev/null 2>&1 && break
+            sleep 2
+        done
+        aid=$(RUN 'sed -n "s/^>>> ALLOC_ID //p" /tmp/resv-own.out' | tr -d '\r')
+        if [ -z "$aid" ]; then
+            bad "no allocation id from the background grow: $(RUN 'tr "\n" " " < /tmp/resv-own.out' | tail -c 200)"
+        else
+            ok "the grow handed back an allocation id ($aid)"
+            # a job in the reservation from a namespace that does NOT own it,
+            # long enough to outlive the owner
+            RUN_BG /tmp/resv-late.out \
+                "{ timeout 120 prun --alloc-id $aid -np 1 sleep 45; echo LATE-JOB-RC=\$?; }"
+            sleep 8
+            RUN 'pgrep -x prun >/dev/null' \
+                && ok "a second namespace is running in the reservation" \
+                || bad "the second job never started: $(RUN 'tr "\n" " " < /tmp/resv-late.out' | tail -c 200)"
+
+            # wait for the owner to finish and exit - that is the teardown
+            for _ in $(seq 1 40); do
+                RUN 'pgrep -x elastic >/dev/null' >/dev/null 2>&1 || break
+                sleep 2
+            done
+            RUN 'pgrep -x elastic >/dev/null' >/dev/null 2>&1 \
+                && bad "the owning tool never exited, so no teardown happened" \
+                || ok "the owning tool exited, tearing its reservation down"
+            sleep 3
+            RUN 'pgrep -x prte >/dev/null' \
+                && ok "the HNP survived a teardown under a live job" \
+                || bad "the HNP died when the reservation was torn down"
+
+            # the job has to reach its own end, and be accounted for there
+            for _ in $(seq 1 40); do
+                RUN 'grep -q LATE-JOB-RC /tmp/resv-late.out' >/dev/null 2>&1 && break
+                sleep 2
+            done
+            RUN 'grep -q "^LATE-JOB-RC=0" /tmp/resv-late.out' >/dev/null 2>&1 \
+                && ok "the job outlived its reservation and completed" \
+                || bad "the job did not complete cleanly: $(RUN 'tr "\n" " " < /tmp/resv-late.out' | tail -c 200)"
+            RUN 'pgrep -x prte >/dev/null' \
+                && ok "the HNP survived the job's termination" \
+                || bad "the HNP died retiring a job whose session had gone"
+
+            # and the nodes came back to the general pool, which is what the
+            # disposition asked for - so the DVM is still usable afterwards
+            out=$(RUN 'timeout 60 prun --host node2:1,node3:1 -np 2 --map-by node hostname' 2>&1)
+            [ "$(echo "$out" | grep -cE '^node[23]$')" = 2 ] \
+                && ok "the released nodes are usable from the general pool" \
+                || bad "the DVM did not survive usable: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+        fi
+        RUN 'pkill -x elastic' >/dev/null 2>&1
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
     fi
     cleanup_swarm
 
