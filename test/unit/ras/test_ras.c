@@ -804,8 +804,175 @@ static int test_pmix_gate(void)
           NULL == module ||
           ((prte_ras_base_module_t *) module)->scheduler_owned);
 
+    if (NULL != module) {
+        prte_ras_base_module_t *mod = (prte_ras_base_module_t *) module;
+        pmix_list_t nodes;
+
+        /* it discovers nothing: this component forwards runtime requests to
+         * a scheduler and never contributes a node to initial discovery.
+         * Worth pinning because the query gate above now makes it the sole
+         * selected module whenever anyone points it at a scheduler, so this
+         * return is what sends the base to its local-node fallback rather
+         * than to another allocator. */
+        CHECK("pmix: has an allocate", NULL != mod->allocate);
+        if (NULL != mod->allocate) {
+            PMIX_CONSTRUCT(&nodes, pmix_list_t);
+            CHECK("pmix: allocate contributes nothing",
+                  PRTE_ERR_TAKE_NEXT_OPTION == mod->allocate(NULL, &nodes));
+            CHECK("pmix: allocate leaves the list empty",
+                  0 == pmix_list_get_size(&nodes));
+            PMIX_LIST_DESTRUCT(&nodes);
+        }
+
+        /* init() must hand the component's connection parameters to the code
+         * that goes looking for the scheduler.
+         *
+         * Every ras_pmix_* connection parameter is the name of a PMIx attach
+         * attribute - ras_pmix_uri is PMIX_SERVER_URI, the retry pair is
+         * PMIX_CONNECT_MAX_RETRIES/PMIX_CONNECT_RETRY_DELAY - and not one of
+         * them was ever handed to anything: the attach passed only
+         * PMIX_CONNECT_TO_SCHEDULER and PMIX_TOOL_CONNECT_OPTIONAL, so PRRTE
+         * scanned for a rendezvous and took whatever it found while the
+         * parameter naming the scheduler the site meant was accepted,
+         * reported by prte_info, used to decide that this component is the
+         * allocator - and then ignored.
+         *
+         * The retry pair is what this checks because it is the half that is
+         * always published (the parameters document defaults, so a user who
+         * reads that is entitled to get them) and because it needs no string
+         * MCA variable to be written from the test. */
+        CHECK("pmix: has an init", NULL != mod->init);
+        if (NULL != mod->init) {
+            bool sawmax = false, sawdelay = false;
+            size_t d;
+
+            CHECK("pmix: init succeeds", PRTE_SUCCESS == mod->init());
+            for (d = 0; d < prte_pmix_server_globals.nscheddirs; d++) {
+                if (PMIx_Check_key(prte_pmix_server_globals.scheduler_directives[d].key,
+                                   PMIX_CONNECT_MAX_RETRIES)) {
+                    sawmax = true;
+                } else if (PMIx_Check_key(prte_pmix_server_globals.scheduler_directives[d].key,
+                                          PMIX_CONNECT_RETRY_DELAY)) {
+                    sawdelay = true;
+                }
+            }
+            CHECK("pmix: init publishes the retry count", sawmax);
+            CHECK("pmix: init publishes the retry delay", sawdelay);
+            /* leave nothing behind for the rest of the suite */
+            prte_pmix_set_scheduler_directives(NULL, 0);
+        }
+
+        /* With no scheduler reachable, modify() must say UNREACH.
+         *
+         * It used to say PMIX_ERR_TAKE_NEXT_OPTION, from a time when the
+         * framework kept every module that answered and ras/hosts could
+         * serve the request locally further down the list.  Selection keeps
+         * exactly one module now, so there is no next option: the driver's
+         * loop simply ends and req->pstatus is left holding the
+         * PMIX_ERR_NOT_SUPPORTED it was seeded with, telling the requester
+         * the operation is unsupported when the truth is that the scheduler
+         * is out of touch - "give up" where "try again" was meant.
+         *
+         * scheduler_lookup_done is what makes this deterministic and cheap:
+         * prte_pmix_set_scheduler() looks for a scheduler exactly once, and
+         * with the search already marked done it answers UNREACH without
+         * going near PMIx_tool_attach_to_server (a blocking rendezvous scan
+         * this test has no business performing). */
+        CHECK("pmix: has a modify", NULL != mod->modify);
+        if (NULL != mod->modify) {
+            prte_pmix_server_req_t *req;
+            bool saved = prte_pmix_server_globals.scheduler_lookup_done;
+
+            prte_pmix_server_globals.scheduler_lookup_done = true;
+            req = PMIX_NEW(prte_pmix_server_req_t);
+            req->allocdir = PMIX_ALLOC_EXTEND;
+            CHECK("pmix: modify reports UNREACH with no scheduler",
+                  PMIX_ERR_UNREACH == mod->modify(req));
+            PMIX_RELEASE(req);
+            prte_pmix_server_globals.scheduler_lookup_done = saved;
+        }
+    }
+
     if (0 == failures) {
         fprintf(stdout, "PASSED test_pmix_gate\n");
+    }
+    return failures;
+}
+
+/*
+ * ras/hosts allocate(): a hostfile specification naming no file must be
+ * refused, not indexed.
+ *
+ * PMIx_Argv_split answers "nothing" with NULL rather than with an empty
+ * array, so "" and "," both split to NULL and the loop walking the result
+ * dereferenced address zero.  The command line reaches this: the persistent
+ * branch of prte.c joins --hostfile's values raw (the prterun branch
+ * absolutizes each one first, which is why only prte gets here with an empty
+ * string), so `prte --hostfile ''` and `prte --hostfile ,` both segfaulted
+ * the DVM master inside prte_ras_base_allocate - before there was a node
+ * pool, a daemon or an errmgr to fail over.
+ *
+ * Driven through the module vtable rather than by naming allocate(): it is
+ * static, and reaching the component the way the base does is also the only
+ * spelling that works whether it was linked statically or loaded as a
+ * plugin.
+ */
+static int test_hosts_empty_hostfile(void)
+{
+    int failures = 0;
+    pmix_mca_base_component_t *comp;
+    pmix_mca_base_module_t *module = NULL;
+    prte_ras_base_module_t *mod;
+    int pri = -1, rc;
+    size_t n;
+    const char *specs[] = {"", ",", ",,", NULL};
+
+    comp = find_ras_component("hosts");
+    if (NULL == comp) {
+        fprintf(stdout, "SKIP test_hosts_empty_hostfile: ras/hosts not found\n");
+        return 0;
+    }
+    CHECK("hosts: has a query function", NULL != comp->pmix_mca_query_component);
+    if (NULL == comp->pmix_mca_query_component) {
+        return failures;
+    }
+    rc = comp->pmix_mca_query_component(&module, &pri);
+    CHECK("hosts: always answers the query", PRTE_SUCCESS == rc && NULL != module);
+    CHECK("hosts: at priority 1", 1 == pri);
+    if (NULL == module) {
+        return failures;
+    }
+    mod = (prte_ras_base_module_t *) module;
+    CHECK("hosts: has an allocate", NULL != mod->allocate);
+    if (NULL == mod->allocate) {
+        return failures;
+    }
+
+    for (n = 0; NULL != specs[n]; n++) {
+        prte_job_t *jdata;
+        prte_app_context_t *app;
+        pmix_list_t nodes;
+
+        jdata = PMIX_NEW(prte_job_t);
+        app = PMIX_NEW(prte_app_context_t);
+        app->idx = pmix_pointer_array_add(jdata->apps, app);
+        jdata->num_apps = 1;
+        prte_set_attribute(&app->attributes, PRTE_APP_HOSTFILE, PRTE_ATTR_GLOBAL,
+                           (void *) specs[n], PMIX_STRING);
+        PMIX_CONSTRUCT(&nodes, pmix_list_t);
+
+        rc = mod->allocate(jdata, &nodes);
+        CHECK("hosts: a hostfile naming no file is refused",
+              PRTE_SUCCESS != rc && PRTE_ERR_TAKE_NEXT_OPTION != rc);
+        CHECK("hosts: ... and contributes no nodes",
+              0 == pmix_list_get_size(&nodes));
+
+        PMIX_LIST_DESTRUCT(&nodes);
+        PMIX_RELEASE(jdata);
+    }
+
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_hosts_empty_hostfile\n");
     }
     return failures;
 }
@@ -1612,6 +1779,85 @@ static int test_spawn_alloc(void)
     return failures;
 }
 
+
+/* A reservation torn down while a job is still running in it.
+ *
+ * Teardown deregisters the session, which puts it beyond every later sweep
+ * over prte_sessions - so teardown is the only place left that can give the
+ * registry's reference back, and it has to.  That is safe only because the
+ * job-side pointers into a session are counted: the job that is still
+ * running in the reservation holds its own reference, and the object stays
+ * valid for as long as anything can read it.  Both halves are checked here,
+ * because either one alone is a defect - without the release the object
+ * leaks once per reservation ever torn down, and without the job's reference
+ * the release hands a running job a dangling pointer. */
+static int test_teardown_reservation(void)
+{
+    int failures = 0;
+    prte_session_t *s;
+    prte_job_t *jdata;
+    prte_node_t *nd;
+    int idx;
+
+    s = PMIX_NEW(prte_session_t);
+    s->session_id = 4242;
+    s->alloc_refid = strdup("prte-unit-test.4242");
+    s->flags |= PRTE_SESSION_FLAG_RESERVED;
+    CHECK("teardown/register", PRTE_SUCCESS == prte_set_session_object(s));
+    idx = s->index;
+    CHECK("teardown/registry holds the only reference",
+          1 == s->super.obj_reference_count);
+
+    /* a reservation withholds nodes: give it one, counted, with the
+     * backpointer that is what actually withholds it */
+    nd = PMIX_NEW(prte_node_t);
+    nd->name = strdup("prte-unit-test-reserved");
+    nd->state = PRTE_NODE_STATE_UP;
+    nd->slots = 1;
+    nd->index = pmix_pointer_array_add(prte_node_pool, nd);
+    nd->session = s;
+    PMIX_RETAIN(nd);
+    pmix_pointer_array_add(s->nodes, nd);
+
+    /* a job running in the reservation */
+    jdata = PMIX_NEW(prte_job_t);
+    PMIX_LOAD_NSPACE(jdata->nspace, "prte-unit-test-resv-job");
+    prte_set_job_session(jdata, s);
+    CHECK("teardown/job takes a reference", 2 == s->super.obj_reference_count);
+    CHECK("teardown/job names the session", s == jdata->session);
+    pmix_pointer_array_add(s->jobs, jdata);
+
+    /* our own handle, so the object can still be inspected afterwards */
+    PMIX_RETAIN(s);
+
+    prte_ras_base_teardown_reservation(s, false);
+
+    CHECK("teardown/deregistered", -1 == s->index);
+    CHECK("teardown/not findable", NULL == prte_get_session_object(4242));
+    CHECK("teardown/slot cleared",
+          NULL == pmix_pointer_array_get_item(prte_sessions, idx));
+    CHECK("teardown/node back in the general pool", NULL == nd->session);
+    CHECK("teardown/no longer reserved",
+          0 == (s->flags & PRTE_SESSION_FLAG_RESERVED));
+    /* the registry's reference is gone; the job's and ours remain */
+    CHECK("teardown/registry reference given back",
+          2 == s->super.obj_reference_count);
+    CHECK("teardown/job can still read its session",
+          4242 == jdata->session->session_id);
+
+    /* the running job is now the only thing keeping the object alive */
+    PMIX_RELEASE(jdata);
+    CHECK("teardown/job gives its reference back",
+          1 == s->super.obj_reference_count);
+
+    /* and dropping ours is what frees it - nothing else is left to */
+    PMIX_RELEASE(s);
+
+    pmix_pointer_array_set_item(prte_node_pool, nd->index, NULL);
+    PMIX_RELEASE(nd);
+    return failures;
+}
+
 int main(void)
 {
     int rc, failures = 0;
@@ -1663,10 +1909,12 @@ int main(void)
     failures += test_activate_hosts();
     failures += test_activate_nodes();
     failures += test_spawn_alloc();
+    failures += test_teardown_reservation();
     /* after test_select(), which opens the framework and latches a
      * selection made with no SLURM allocation in the environment -- so
      * nothing has called slurm's init() before this does */
     failures += test_pmix_gate();
+    failures += test_hosts_empty_hostfile();
     failures += test_slurm_allocation();
 
     /* PMIx last, and after the frameworks are closed: finalizing it unloads

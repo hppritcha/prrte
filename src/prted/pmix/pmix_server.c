@@ -171,10 +171,14 @@ typedef struct {
 static char *prte_attrs_none[] = {"NONE", NULL};
 static char *prte_attrs_na[] = {"N/A", NULL};
 
-/* PMIx_Get: the direct-modex upcall.  No PMIX_TIMEOUT - PMIx deliberately
- * sets no timeout on a host request, and we honor none of our own. */
+/* PMIx_Get: the direct-modex upcall.  PMIx arms no timer of its own on a
+ * host request - deliberately, so as not to race the host that may also
+ * honor one - but it does hand the caller's directives up, and the daemon
+ * that services the request arms the caller's PMIX_TIMEOUT itself
+ * (pmix_server_dmdx_recv). */
 static char *prte_attrs_get[] = {"PMIX_GET_REFRESH_CACHE",
                                  "PMIX_REQUIRED_KEY",
+                                 "PMIX_TIMEOUT",
                                  NULL};
 
 /* PMIx_Fence, and the connect/disconnect operations built on it */
@@ -194,6 +198,9 @@ static char *prte_attrs_publish[] = {"PMIX_RANGE",
                                      "PMIX_ACCESS_PERMISSIONS",
                                      "PMIX_ACCESS_USERIDS",
                                      "PMIX_ACCESS_GRPIDS",
+                                     /* PRRTE's own - the Standard has no
+                                      * attribute for republishing a key */
+                                     PRTE_PUBLISH_REPLACE,
                                      NULL};
 
 static char *prte_attrs_lookup[] = {"PMIX_RANGE",
@@ -532,20 +539,6 @@ void pmix_server_register_params(void)
                                       PMIX_MCA_BASE_VAR_TYPE_BOOL,
                                       &prte_pmix_server_globals.allow_client_clones);
 
-    /* Publish per-proc data only for the procs we host, and derive the rest on
-     * demand.  Every daemon registering a PMIx entry for every proc in the job
-     * is a table that grows with the job while the work on the node does not;
-     * the placement it describes is derivable here from the job object, so the
-     * direct-modex upcall can answer for a proc we do not host without any
-     * wire traffic.  See derive_proc_data() in pmix_server_fence.c. */
-    prte_pmix_server_globals.lazy_procdata = true;
-    (void) pmix_mca_base_var_register("prte", "pmix", NULL, "lazy_procdata",
-                                      "Publish per-proc data to the local PMIx server only "
-                                      "for procs this daemon hosts, deriving data for other "
-                                      "procs on demand",
-                                      PMIX_MCA_BASE_VAR_TYPE_BOOL,
-                                      &prte_pmix_server_globals.lazy_procdata);
-
     /* whether or not to drop a session-level tool rendezvous point */
     prte_pmix_server_globals.session_server = false;
     (void) pmix_mca_base_var_register("prte", "pmix", NULL, "session_server",
@@ -611,16 +604,34 @@ static void timeout_cbfunc(int sd, short args, void *cbdata)
 
     /* mark that we timed out */
     req->timed_out = true;
+    /* the timer that brought us here has fired and is no longer armed */
+    req->event_active = false;
 
     /* don't let the caller hang */
     if (0 <= req->remote_index) {
-        /* this was a remote request */
-        send_error(PMIX_ERR_TIMEOUT, &req->tproc, &req->proxy, req->remote_index);
-        /* note: we cannot release the req object because whomever
-         * we gave it to (host or PMIx server library) is still
-         * using it. We'll take care of it once the current holder
-         * returns.
-         */
+        /* This was a remote request, and it is now finished: we have told
+         * the peer it timed out, and the index we answered under is one it
+         * is free to reuse.  So stop retrying - leaving the two-second
+         * cycle armed makes the daemon retry a dead request for the life of
+         * the DVM, and a retry that finally succeeds sends a SECOND reply
+         * under an index that by then belongs to some other request of
+         * theirs, which is answered with data it never asked for. */
+        send_error(PRTE_ERR_TIMEOUT, &req->tproc, &req->proxy, req->remote_index);
+        if (req->cycle_active) {
+            prte_event_del(&req->cycle);
+            req->cycle_active = false;
+        }
+        if (0 <= req->local_index) {
+            pmix_pointer_array_set_item(&prte_pmix_server_globals.remote_reqs,
+                                        req->local_index, NULL);
+            req->local_index = -1;
+        }
+        /* ...but we can only free it if nobody else holds it. A request
+         * handed to the PMIx server library is released by the callback
+         * that library still owes us */
+        if (!req->inprogress) {
+            PMIX_RELEASE(req);
+        }
         return;
     }
 
@@ -671,6 +682,13 @@ void prte_pmix_server_clear(pmix_proc_t *pname)
                 prte_event_del(&req->cycle);
             }
             pmix_pointer_array_set_item(&prte_pmix_server_globals.remote_reqs, n, NULL);
+            /* The slot is free again the moment we clear it, and the array
+             * hands out the lowest free one - so a request we leave alive
+             * here (because somebody else is holding it) must forget its
+             * index, or the reply it eventually sends will clear the slot
+             * that now belongs to an unrelated request and leave THAT
+             * peer waiting. */
+            req->local_index = -1;
             if (!req->inprogress) {
                 /* Somebody is still waiting on the other end of this, and
                  * dropping it in silence leaves them waiting forever.  The
@@ -694,27 +712,27 @@ void prte_pmix_server_clear(pmix_proc_t *pname)
  * to cleanup after any tools once they depart */
 static void _lost_conn(int sd, short args, void *cbdata)
 {
-     prte_pmix_server_op_caddy_t *cd = (prte_pmix_server_op_caddy_t*)cbdata;
-     prte_job_t *jdata;
-     PRTE_HIDE_UNUSED_PARAMS(sd, args);
+    prte_pmix_server_op_caddy_t *cd = (prte_pmix_server_op_caddy_t*)cbdata;
+    prte_job_t *jdata;
+    PRTE_HIDE_UNUSED_PARAMS(sd, args);
 
-     // check the source to see if it is a client or tool
-     jdata = prte_get_job_data_object(cd->proc.nspace);
-     if (NULL != jdata && !PRTE_FLAG_TEST(jdata, PRTE_JOB_FLAG_TOOL)) {
+    // check the source to see if it is a client or tool
+    jdata = prte_get_job_data_object(cd->proc.nspace);
+    if (NULL != jdata && !PRTE_FLAG_TEST(jdata, PRTE_JOB_FLAG_TOOL)) {
         // client - do nothing, the ODLS will see it go away
         goto complete;
-     }
+    }
 
-     // Either a tool, or a peer we hold no job object for - which on a
-     // daemon other than the master is what a tool looks like, since only
-     // the master keeps one. Not knowing the job is therefore not a reason
-     // to do nothing here; prte_pmix_server_tool_departed() decides, and on
-     // the master it re-checks the TOOL flag before acting.
-     //
-     // A tool isn't a child of ours, so we cannot see a waitpid fire: this
-     // is the only notice we get that a tool has dropped without finalizing
-     // (a clean finalize arrives as the client_finalized upcall instead).
-     prte_pmix_server_tool_departed(&cd->proc);
+    // Either a tool, or a peer we hold no job object for - which on a
+    // daemon other than the master is what a tool looks like, since only
+    // the master keeps one. Not knowing the job is therefore not a reason
+    // to do nothing here; prte_pmix_server_tool_departed() decides, and on
+    // the master it re-checks the TOOL flag before acting.
+    //
+    // A tool isn't a child of ours, so we cannot see a waitpid fire: this
+    // is the only notice we get that a tool has dropped without finalizing
+    // (a clean finalize arrives as the client_finalized upcall instead).
+    prte_pmix_server_tool_departed(&cd->proc);
 
 complete:
     // progress the PMIx event notification chain
@@ -726,25 +744,25 @@ complete:
 
 static void lost_connection_hdlr(size_t evhdlr_registration_id, pmix_status_t status,
                                  const pmix_proc_t *source, pmix_info_t info[], size_t ninfo,
-                                 pmix_info_t *results, size_t nresults,
-                                 pmix_event_notification_cbfunc_fn_t cbfunc, void *cbdata)
+                                pmix_info_t *results, size_t nresults,
+                                pmix_event_notification_cbfunc_fn_t cbfunc, void *cbdata)
 {
-     prte_pmix_server_op_caddy_t *cd;
-     PRTE_HIDE_UNUSED_PARAMS(evhdlr_registration_id);
+    prte_pmix_server_op_caddy_t *cd;
+    PRTE_HIDE_UNUSED_PARAMS(evhdlr_registration_id);
 
-     // need to threadshift this into our own progress thread
-     cd = PMIX_NEW(prte_pmix_server_op_caddy_t);
-     cd->status = status;
-     memcpy(&cd->proc, source, sizeof(pmix_proc_t));
-     cd->info = info;
-     cd->ninfo = ninfo;
-     cd->directives = results;
-     cd->ndirs = nresults;
-     cd->evcbfunc = cbfunc;
-     cd->cbdata = cbdata;
-     prte_event_set(prte_event_base, &(cd->ev), -1, PRTE_EV_WRITE, _lost_conn, cd);
-     PMIX_POST_OBJECT(cd);
-     prte_event_active(&(cd->ev), PRTE_EV_WRITE, 1);
+    // need to threadshift this into our own progress thread
+    cd = PMIX_NEW(prte_pmix_server_op_caddy_t);
+    cd->status = status;
+    memcpy(&cd->proc, source, sizeof(pmix_proc_t));
+    cd->info = info;
+    cd->ninfo = ninfo;
+    cd->directives = results;
+    cd->ndirs = nresults;
+    cd->evcbfunc = cbfunc;
+    cd->cbdata = cbdata;
+    prte_event_set(prte_event_base, &(cd->ev), -1, PRTE_EV_WRITE, _lost_conn, cd);
+    PMIX_POST_OBJECT(cd);
+    prte_event_active(&(cd->ev), PRTE_EV_WRITE, 1);
 }
 
 static void regcbfunc(pmix_status_t status, size_t ref, void *cbdata)
@@ -896,6 +914,8 @@ int pmix_server_init(void)
     prte_pmix_server_globals.server = *PRTE_NAME_INVALID;
     prte_pmix_server_globals.scheduler_connected = false;
     prte_pmix_server_globals.scheduler_lookup_done = false;
+    prte_pmix_server_globals.scheduler_directives = NULL;
+    prte_pmix_server_globals.nscheddirs = 0;
     prte_pmix_server_globals.primary_server = *PRTE_NAME_INVALID;
     prte_pmix_server_globals.primary_server_set = false;
 
@@ -970,13 +990,13 @@ int pmix_server_init(void)
     }
 
     /* tell the server whether or not to drop a session-level PMIx connection point */
-   PMIX_INFO_LIST_ADD(prc, ilist, PMIX_SERVER_SESSION_SUPPORT,
-                      &prte_pmix_server_globals.session_server, PMIX_BOOL);
-   if (PMIX_SUCCESS != prc) {
-       PMIX_INFO_LIST_RELEASE(ilist);
-       rc = prte_pmix_convert_status(prc);
-       return rc;
-   }
+    PMIX_INFO_LIST_ADD(prc, ilist, PMIX_SERVER_SESSION_SUPPORT,
+                       &prte_pmix_server_globals.session_server, PMIX_BOOL);
+    if (PMIX_SUCCESS != prc) {
+        PMIX_INFO_LIST_RELEASE(ilist);
+        rc = prte_pmix_convert_status(prc);
+        return rc;
+    }
 
     if (PRTE_PROC_IS_MASTER) {
         // mark ourselves as a gateway server
@@ -1013,23 +1033,23 @@ int pmix_server_init(void)
          * PMIx connection point - only do this for the HNP as, in
          * at least one case, a daemon can be colocated with the
          * HNP and would overwrite the server rendezvous file */
-       PMIX_INFO_LIST_ADD(prc, ilist, PMIX_SERVER_SYSTEM_SUPPORT,
-                          (void*)&prte_pmix_server_globals.system_server, PMIX_BOOL);
-       if (PMIX_SUCCESS != prc) {
-           PMIX_INFO_LIST_RELEASE(ilist);
-           rc = prte_pmix_convert_status(prc);
-           return rc;
-       }
+        PMIX_INFO_LIST_ADD(prc, ilist, PMIX_SERVER_SYSTEM_SUPPORT,
+                           (void*)&prte_pmix_server_globals.system_server, PMIX_BOOL);
+        if (PMIX_SUCCESS != prc) {
+            PMIX_INFO_LIST_RELEASE(ilist);
+            rc = prte_pmix_convert_status(prc);
+            return rc;
+        }
 
         // tell if they want to allow tools from other users
-       flag = !prte_pmix_server_globals.no_foreign_tools;
-       PMIX_INFO_LIST_ADD(prc, ilist, PMIX_SERVER_ALLOW_FOREIGN_TOOLS,
-                          (void*)&flag, PMIX_BOOL);
-       if (PMIX_SUCCESS != prc) {
-           PMIX_INFO_LIST_RELEASE(ilist);
-           rc = prte_pmix_convert_status(prc);
-           return rc;
-       }
+        flag = !prte_pmix_server_globals.no_foreign_tools;
+        PMIX_INFO_LIST_ADD(prc, ilist, PMIX_SERVER_ALLOW_FOREIGN_TOOLS,
+                           (void*)&flag, PMIX_BOOL);
+        if (PMIX_SUCCESS != prc) {
+            PMIX_INFO_LIST_RELEASE(ilist);
+            rc = prte_pmix_convert_status(prc);
+            return rc;
+        }
 
         /* if requested and persistent, tell the server that we are the system
          * controller - don't do this for the non-persistent mode */
@@ -1099,13 +1119,13 @@ int pmix_server_init(void)
     }
 
     /* tell if we allow remote tool connections */
-     PMIX_INFO_LIST_ADD(prc, ilist, PMIX_SERVER_REMOTE_CONNECTIONS,
+    PMIX_INFO_LIST_ADD(prc, ilist, PMIX_SERVER_REMOTE_CONNECTIONS,
                        (void*)&prte_pmix_server_globals.remote_connections, PMIX_BOOL);
-     if (PMIX_SUCCESS != prc) {
-         PMIX_INFO_LIST_RELEASE(ilist);
-         rc = prte_pmix_convert_status(prc);
-         return rc;
-     }
+    if (PMIX_SUCCESS != prc) {
+        PMIX_INFO_LIST_RELEASE(ilist);
+        rc = prte_pmix_convert_status(prc);
+        return rc;
+    }
 
     PMIX_INFO_LIST_ADD(prc, ilist, PMIX_ALLOW_CLIENT_CLONES,
                       (void*)&prte_pmix_server_globals.allow_client_clones, PMIX_BOOL);
@@ -1127,7 +1147,7 @@ int pmix_server_init(void)
             rc = prte_pmix_convert_status(prc);
             return rc;
         }
-     }
+    }
 
     /* tell the server what we are doing with FQDN */
     PMIX_INFO_LIST_ADD(prc, ilist, PMIX_HOSTNAME_KEEP_FQDN, &prte_keep_fqdn_hostnames, PMIX_BOOL);
@@ -1310,6 +1330,10 @@ void pmix_server_start(void)
     PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_SCHED_RESP,
                   PRTE_RML_PERSISTENT, pmix_server_alloc_request_resp, NULL);
 
+    /* setup recv for the master's answer to a query we could not answer */
+    PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_QUERY_RESP,
+                  PRTE_RML_PERSISTENT, pmix_server_query_resp, NULL);
+
     /* setup recv for monitor request */
     PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_MONITOR_REQUEST,
                   PRTE_RML_PERSISTENT, pmix_server_monitor_request, NULL);
@@ -1333,6 +1357,10 @@ void pmix_server_start(void)
         /* setup recv for scheduler requests */
         PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_SCHED,
                       PRTE_RML_PERSISTENT, pmix_server_sched, NULL);
+        /* setup recv for queries relayed by a daemon - slot counts, node
+         * state and the session table live only here */
+        PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_QUERY,
+                      PRTE_RML_PERSISTENT, pmix_server_query_request, NULL);
         /* setup recv for the membership of connected assemblages, which is
          * held here because we are the one process that sees every proc in
          * the DVM terminate */
@@ -1359,31 +1387,59 @@ void pmix_server_finalize(void)
     PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_NOTIFICATION);
     PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_TCONN_RESP);
     PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_SCHED_RESP);
+    PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_QUERY_RESP);
     PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_MONITOR_REQUEST);
     PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_MONITOR_RESP);
     PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_LOGGING_RESP);
     if (PRTE_PROC_IS_MASTER) {
         PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_LOGGING);
         PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_SCHED);
+        PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_QUERY);
         PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_CONNECTED);
     }
 
     /* finalize our local data server */
     prte_data_server_finalize();
 
-    /* cleanup collectives */
+    if (NULL != prte_pmix_server_globals.scheduler_directives) {
+        PMIX_INFO_FREE(prte_pmix_server_globals.scheduler_directives,
+                       prte_pmix_server_globals.nscheddirs);
+        prte_pmix_server_globals.nscheddirs = 0;
+    }
+
+    /* cleanup collectives.  A request may still have a timer armed - the
+     * two-second dmodex retry cycle, or a caller's timeout - and libevent
+     * keeps a pointer to the event structure inside the request until it
+     * is deleted.  Freeing the request first leaves that pointer dangling
+     * in the base, which prte_event_base_close() then walks. */
     prte_pmix_server_req_t *cd;
     for (int i = 0; i < prte_pmix_server_globals.local_reqs.size; i++) {
-      cd = (prte_pmix_server_req_t*)pmix_pointer_array_get_item(&prte_pmix_server_globals.local_reqs, i);
-      if (NULL != cd) {
-          PMIX_RELEASE(cd);
-      }
+        cd = (prte_pmix_server_req_t*)pmix_pointer_array_get_item(&prte_pmix_server_globals.local_reqs, i);
+        if (NULL != cd) {
+            if (cd->event_active) {
+                prte_event_del(&cd->ev);
+                cd->event_active = false;
+            }
+            if (cd->cycle_active) {
+                prte_event_del(&cd->cycle);
+                cd->cycle_active = false;
+            }
+            PMIX_RELEASE(cd);
+        }
     }
     for (int i = 0; i < prte_pmix_server_globals.remote_reqs.size; i++) {
-      cd = (prte_pmix_server_req_t*)pmix_pointer_array_get_item(&prte_pmix_server_globals.remote_reqs, i);
-      if (NULL != cd) {
-          PMIX_RELEASE(cd);
-      }
+        cd = (prte_pmix_server_req_t*)pmix_pointer_array_get_item(&prte_pmix_server_globals.remote_reqs, i);
+        if (NULL != cd) {
+            if (cd->event_active) {
+                prte_event_del(&cd->ev);
+                cd->event_active = false;
+            }
+            if (cd->cycle_active) {
+                prte_event_del(&cd->cycle);
+                cd->cycle_active = false;
+            }
+            PMIX_RELEASE(cd);
+        }
     }
 
     PMIX_DESTRUCT(&prte_pmix_server_globals.remote_reqs);
@@ -1492,8 +1548,25 @@ static void _mdxresp(int sd, short args, void *cbdata)
                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                         req->tproc.nspace, req->tproc.rank);
 
-    /* remove us from the pending array */
-    pmix_pointer_array_set_item(&prte_pmix_server_globals.remote_reqs, req->local_index, NULL);
+    /* remove us from the pending array - unless a job teardown already
+     * took us out of it, in which case the index names somebody else now */
+    if (0 <= req->local_index) {
+        pmix_pointer_array_set_item(&prte_pmix_server_globals.remote_reqs, req->local_index, NULL);
+        req->local_index = -1;
+    }
+
+    /* If this request already timed out then the peer has had its answer
+     * and has retired the index we would reply under - it may well have
+     * given that index to a different request by now, which would receive
+     * this payload as its own. The data is late; drop it. */
+    if (req->timed_out) {
+        pmix_output_verbose(2, prte_pmix_server_globals.output,
+                            "%s DATA FOR PROC %s:%u ARRIVED AFTER TIMEOUT - DISCARDING",
+                            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                            req->tproc.nspace, req->tproc.rank);
+        PMIX_RELEASE(req);
+        return;
+    }
 
     /* pack the status */
     PMIX_DATA_BUFFER_CREATE(reply);
@@ -1530,6 +1603,8 @@ static void _mdxresp(int sd, short args, void *cbdata)
                 goto error;
             }
             free(req->data);
+            req->data = NULL;
+            req->sz = 0;
         }
     }
 
@@ -1787,7 +1862,10 @@ static void dmdx_check(int sd, short args, void *cbdata)
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
         req->inprogress = false;
-        send_error(rc, &req->tproc, &req->proxy, req->remote_index);
+        /* send_error answers in PRRTE codes and converts on the way out;
+         * this one is already a PMIx status, so hand it over in the space
+         * that function expects rather than converting it backwards */
+        send_error(prte_pmix_convert_status(rc), &req->tproc, &req->proxy, req->remote_index);
         if (req->event_active) {
             /* delete the timeout event */
             prte_event_del(&req->ev);
@@ -1844,6 +1922,7 @@ static void pmix_server_dmdx_recv(int status, pmix_proc_t *sender,
         cnt = ninfo;
         if (PMIX_SUCCESS != (prc = PMIx_Data_unpack(NULL, buffer, info, &cnt, PMIX_INFO))) {
             PMIX_ERROR_LOG(prc);
+            PMIX_INFO_FREE(info, ninfo);
             return;
         }
     }
@@ -1860,7 +1939,7 @@ static void pmix_server_dmdx_recv(int status, pmix_proc_t *sender,
                 continue;
             }
             if (PMIX_CHECK_KEY(&info[sz], PMIX_TIMEOUT)) {
-                PMIX_VALUE_GET_NUMBER(prc, &info[sz].value, timeout, int32_t);
+                prc = PMIx_Value_get_number(&info[sz].value, &timeout, PMIX_INT32);
                 if (PMIX_SUCCESS != prc) {
                     PMIX_ERROR_LOG(prc);
                     if (NULL != info) {
@@ -1935,6 +2014,10 @@ static void pmix_server_dmdx_recv(int status, pmix_proc_t *sender,
         pmix_asprintf(&req->operation, "DMDX: %s:%d", __FILE__, __LINE__);
         req->proxy = *sender;
         memcpy(&req->tproc, &pproc, sizeof(pmix_proc_t));
+        /* this array was unpacked off the wire, so it is ours to free -
+         * unlike the one a local client's dmodex borrows from PMIx, which
+         * is why the destructor frees only what "copy" claims */
+        req->copy = true;
         req->info = info;
         req->ninfo = ninfo;
         if (NULL != key) {
@@ -1974,16 +2057,22 @@ static void pmix_server_dmdx_recv(int status, pmix_proc_t *sender,
     if (NULL == proc) {
         /* this is truly an error, so notify the sender */
         send_error(PRTE_ERR_NOT_FOUND, &pproc, sender, index);
+        if (NULL != info) {
+            PMIX_INFO_FREE(info, ninfo);
+        }
         if (NULL != key) {
-          free(key);
+            free(key);
         }
         return;
     }
     if (!PRTE_FLAG_TEST(proc, PRTE_PROC_FLAG_LOCAL)) {
         /* send back an error - they obviously have made a mistake */
         send_error(PRTE_ERR_NOT_FOUND, &pproc, sender, index);
+        if (NULL != info) {
+            PMIX_INFO_FREE(info, ninfo);
+        }
         if (NULL != key) {
-          free(key);
+            free(key);
         }
         return;
     }
@@ -2015,6 +2104,7 @@ static void pmix_server_dmdx_recv(int status, pmix_proc_t *sender,
             pmix_asprintf(&req->operation, "DMDX: %s:%d", __FILE__, __LINE__);
             req->proxy = *sender;
             memcpy(&req->tproc, &pproc, sizeof(pmix_proc_t));
+            req->copy = true;  // unpacked here, so ours to free
             req->info = info;
             req->ninfo = ninfo;
             req->key = key;
@@ -2059,6 +2149,7 @@ static void pmix_server_dmdx_recv(int status, pmix_proc_t *sender,
     pmix_asprintf(&req->operation, "DMDX: %s:%d", __FILE__, __LINE__);
     req->proxy = *sender;
     memcpy(&req->tproc, &pproc, sizeof(pmix_proc_t));
+    req->copy = true;  // unpacked here, so ours to free
     req->info = info;
     req->ninfo = ninfo;
     req->remote_index = index;
@@ -2091,6 +2182,8 @@ static void pmix_server_dmdx_recv(int status, pmix_proc_t *sender,
         pmix_pointer_array_set_item(&prte_pmix_server_globals.remote_reqs, req->local_index, NULL);
         rc = prte_pmix_convert_status(prc);
         send_error(rc, &pproc, sender, index);
+        /* nobody holds it now - the server never took it */
+        PMIX_RELEASE(req);
         return;
     }
     return;
@@ -2099,7 +2192,9 @@ static void pmix_server_dmdx_recv(int status, pmix_proc_t *sender,
 typedef struct {
     pmix_object_t super;
     char *data;
-    int32_t ndata;
+    /* the payload size as it came off the wire and as the modex callback
+     * takes it - a size_t at both ends, so do not narrow it here */
+    size_t ndata;
 } datacaddy_t;
 static void dccon(datacaddy_t *p)
 {
@@ -2167,37 +2262,57 @@ static void pmix_server_dmdx_resp(int status, pmix_proc_t *sender,
         return;
     }
 
-    /* unload the remainder of the buffer */
+    /* Unload the remainder of the buffer.  We know which request this
+     * answers by now, so a failure here is reported to it rather than
+     * dropped: returning in silence leaves the client that asked blocked
+     * in PMIx_Get with nothing left to wake it. */
     if (PMIX_SUCCESS == pret) {
         cnt = 1;
         if (PMIX_SUCCESS != (prc = PMIx_Data_unpack(NULL, buffer, &psz, &cnt, PMIX_SIZE))) {
             PMIX_ERROR_LOG(prc);
-            PMIX_RELEASE(d);
-            return;
+            pret = prc;
+            psz = 0;
         }
-        if (0 < psz) {
-            d->ndata = psz;
+        if (PMIX_SUCCESS == pret && 0 < psz) {
             d->data = (char *) malloc(psz);
             if (NULL == d->data) {
                 PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
-            }
-            cnt = psz;
-            if (PMIX_SUCCESS != (prc = PMIx_Data_unpack(NULL, buffer, d->data, &cnt, PMIX_BYTE))) {
-                PMIX_ERROR_LOG(prc);
-                PMIX_RELEASE(d);
-                return;
+                pret = PMIX_ERR_NOMEM;
+            } else {
+                d->ndata = psz;
+                cnt = psz;
+                if (PMIX_SUCCESS != (prc = PMIx_Data_unpack(NULL, buffer, d->data, &cnt, PMIX_BYTE))) {
+                    PMIX_ERROR_LOG(prc);
+                    free(d->data);
+                    d->data = NULL;
+                    d->ndata = 0;
+                    pret = prc;
+                }
             }
         }
     }
 
     /* get the request out of the tracking array */
     req = (prte_pmix_server_req_t*)pmix_pointer_array_get_item(&prte_pmix_server_globals.local_reqs, index);
+    /* The index arrived on the wire, and the slot it names is reused the
+     * moment its previous occupant is retired - so a response that crossed
+     * with a retirement can name a live request of an entirely different
+     * kind.  local_reqs holds the scheduler relays too, and completing one
+     * of those here would retire it without answering the daemon waiting on
+     * it.  mdxcbfunc is the discriminator: PRTE_DMX_REQ is the only thing
+     * that builds a direct-modex request and it always sets one, and no
+     * other operation sets it at all. */
+    if (NULL != req && NULL == req->mdxcbfunc) {
+        pmix_output_verbose(2, prte_pmix_server_globals.output,
+                            "%s dmdx response for index %d found a %s request - dropping it",
+                            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), index,
+                            (NULL == req->operation) ? "non-modex" : req->operation);
+        req = NULL;
+    }
     /* return the returned data to the requestor */
     if (NULL != req) {
-        if (NULL != req->mdxcbfunc) {
-            PMIX_RETAIN(d);
-            req->mdxcbfunc(pret, d->data, d->ndata, req->cbdata, relcbfunc, d);
-        }
+        PMIX_RETAIN(d);
+        req->mdxcbfunc(pret, d->data, d->ndata, req->cbdata, relcbfunc, d);
         pmix_pointer_array_set_item(&prte_pmix_server_globals.local_reqs, index, NULL);
         PMIX_RELEASE(req);
     } else {
@@ -2212,11 +2327,30 @@ static void pmix_server_dmdx_resp(int status, pmix_proc_t *sender,
         if (NULL == req) {
             continue;
         }
+        /* Only a direct-modex request can be waiting on this answer, and
+         * mdxcbfunc is what says one is: PRTE_DMX_REQ is the sole builder
+         * of them and always sets it, while nothing else does.  Everything
+         * else in local_reqs is matched here purely by accident of tproc
+         * and would be retired without ever being answered.
+         *
+         * Two different kinds of entry get caught without this test.  The
+         * operations that name no target at all - monitor, publish/lookup,
+         * spawn, tool connection - carry the {"", PMIX_RANK_INVALID}
+         * sentinel, and an empty nspace is PMIx's wildcard, so they match
+         * every namespace.  Worse, the scheduler relays - allocate,
+         * session control, group context id - deliberately record the
+         * REQUESTING proc in tproc, which is a real identity that sails
+         * past a sentinel check: a job-level fetch (rank WILDCARD) for the
+         * requestor's own namespace covers it, and the relayed request is
+         * released while the daemon that sent it, and its client, wait for
+         * the life of the DVM.  For allocate and session control that
+         * release is also one of three on an object built to take two. */
+        if (NULL == req->mdxcbfunc || PMIX_NSPACE_INVALID(req->tproc.nspace)) {
+            continue;
+        }
         if (PMIX_CHECK_PROCID(&req->tproc, &pproc)) {
-            if (NULL != req->mdxcbfunc) {
-                PMIX_RETAIN(d);
-                req->mdxcbfunc(pret, d->data, d->ndata, req->cbdata, relcbfunc, d);
-            }
+            PMIX_RETAIN(d);
+            req->mdxcbfunc(pret, d->data, d->ndata, req->cbdata, relcbfunc, d);
             pmix_pointer_array_set_item(&prte_pmix_server_globals.local_reqs, n, NULL);
             PMIX_RELEASE(req);
         }
@@ -2572,6 +2706,40 @@ static void send_alloc_resp(pmix_status_t status,
     PRTE_PMIX_THREADSHIFT(cd, prte_event_base, _send_alloc_resp);
 }
 
+/* Answer a relayed scheduler request that we could not even parse.
+ *
+ * The requesting daemon is holding a tracker under the index it sent us and
+ * nothing else will ever complete it, so an error reply is the only thing
+ * that releases its client - dropping the request in silence leaves that
+ * client blocked for the life of the DVM.  The reply carries just the status
+ * and the index, which is all pmix_server_alloc_request_resp() reads when
+ * the status is not success. */
+static void send_sched_error(pmix_proc_t *dest, int refid, pmix_status_t st)
+{
+    pmix_data_buffer_t *reply;
+    pmix_status_t prc;
+    int rc;
+
+    PMIX_DATA_BUFFER_CREATE(reply);
+    prc = PMIx_Data_pack(NULL, reply, &st, 1, PMIX_STATUS);
+    if (PMIX_SUCCESS != prc) {
+        PMIX_ERROR_LOG(prc);
+        PMIX_DATA_BUFFER_RELEASE(reply);
+        return;
+    }
+    prc = PMIx_Data_pack(NULL, reply, &refid, 1, PMIX_INT);
+    if (PMIX_SUCCESS != prc) {
+        PMIX_ERROR_LOG(prc);
+        PMIX_DATA_BUFFER_RELEASE(reply);
+        return;
+    }
+    PRTE_RML_RELIABLE_SEND(rc, dest->rank, reply, PRTE_RML_TAG_SCHED_RESP);
+    if (PRTE_SUCCESS != rc) {
+        PRTE_ERROR_LOG(rc);
+        PMIX_DATA_BUFFER_RELEASE(reply);
+    }
+}
+
 /* release the one-element context-id result once it has been packed */
 static void ctxid_relfn(void *cbdata)
 {
@@ -2643,12 +2811,12 @@ static void pmix_server_sched(int status, pmix_proc_t *sender,
     /* a group context-id request carries no field of its own - see the
      * matching pack in prte_server_send_request() */
 
-   /* unpack the number of info */
-   cnt = 1;
-   rc = PMIx_Data_unpack(NULL, buffer, &ninfo, &cnt, PMIX_SIZE);
+    /* unpack the number of info */
+    cnt = 1;
+    rc = PMIx_Data_unpack(NULL, buffer, &ninfo, &cnt, PMIX_SIZE);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
-            goto reply;
+        goto reply;
     }
 
     /* Need to add the requestor's ID to the info array, so allocate one
@@ -2796,8 +2964,15 @@ static void pmix_server_sched(int status, pmix_proc_t *sender,
 
 reply:
     if (NULL == req) {
-        // cannot send a response
-        pmix_output(0, "Unable to process/relay the scheduler controller command");
+        /* We never got far enough to build a tracker, but every path that
+         * arrives here has already unpacked the requestor's index - so we
+         * can still answer, and must: the daemon that relayed this to us is
+         * holding a request under that index on behalf of a blocked client. */
+        pmix_output_verbose(2, prte_pmix_server_globals.output,
+                            "%s unable to parse relayed scheduler command from %s: %s",
+                            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(sender),
+                            PMIx_Error_string(rc));
+        send_sched_error(sender, refid, rc);
         if (0 < ninfo) {
             PMIX_INFO_FREE(info, ninfo);
         }
@@ -2896,6 +3071,7 @@ static void rqcon(prte_pmix_server_req_t *p)
     p->launcher = false;
     p->scheduler = false;
     p->copy = false;
+    p->dvm_held = false;
     p->moncopy = false;
     p->dircopy = false;
     p->local_index = -1;
@@ -2914,9 +3090,22 @@ static void rqcon(prte_pmix_server_req_t *p)
     p->sz = 0;
     p->ndaemons = 0;
     p->nreported = 0;
+    p->nsuccess = 0;
+    /* constructed, deliberately not initialized: an empty bitmap is usable
+     * and set_bit grows it from nothing, so a request that never fans out
+     * pays nothing for carrying these */
+    PMIX_CONSTRUCT(&p->expected_dmns, pmix_bitmap_t);
+    PMIX_CONSTRUCT(&p->reported_dmns, pmix_bitmap_t);
     p->range = PMIX_RANGE_SESSION;
     p->proxy = *PRTE_NAME_INVALID;
     p->target = *PRTE_NAME_INVALID;
+    /* PMIX_NEW mallocs - it does not zero - so a field the constructor
+     * forgets is heap garbage, and this is the field almost every request
+     * lookup in this directory matches on.  An operation that names no
+     * target proc (monitor, publish/lookup, spawn, tool connection) leaves
+     * it as we set it here, and the sentinel's empty nspace is what the
+     * "does this request name a target at all" guards test for. */
+    p->tproc = *PRTE_NAME_INVALID;
     p->procs = NULL;
     p->nprocs = 0;
     p->jdata = NULL;
@@ -2931,6 +3120,9 @@ static void rqcon(prte_pmix_server_req_t *p)
     p->infocbfunc = NULL;
     p->cbdata = NULL;
     p->rlcbdata = NULL;
+    p->qcaddy = NULL;
+    p->qresults = NULL;
+    p->nkeys = 0;
 }
 static void rqdes(prte_pmix_server_req_t *p)
 {
@@ -2952,6 +3144,12 @@ static void rqdes(prte_pmix_server_req_t *p)
     if (NULL != p->cmdline) {
         free(p->cmdline);
     }
+    /* the modex payload, if we still hold one: _mdxresp frees it as it
+     * packs and clears the pointer, so what survives to here is a reply
+     * that was never sent */
+    if (NULL != p->data) {
+        free(p->data);
+    }
     if (NULL != p->key) {
         free(p->key);
     }
@@ -2959,6 +3157,8 @@ static void rqdes(prte_pmix_server_req_t *p)
         PMIX_RELEASE(p->jdata);
     }
     PMIX_DATA_BUFFER_DESTRUCT(&p->msg);
+    PMIX_DESTRUCT(&p->expected_dmns);
+    PMIX_DESTRUCT(&p->reported_dmns);
 }
 PMIX_CLASS_INSTANCE(prte_pmix_server_req_t,
                     pmix_object_t,
@@ -2977,7 +3177,7 @@ static void psdes(prte_pmix_server_pset_t *p)
         free(p->name);
     }
     if (NULL != p->jdata) {
-     PMIX_RELEASE(p->jdata);
+        PMIX_RELEASE(p->jdata);
     }
     if (NULL != p->members) {
         free(p->members);

@@ -51,9 +51,6 @@
 #ifdef HAVE_SYS_TYPES_H
 #    include <sys/types.h>
 #endif /* HAVE_SYS_TYPES_H */
-#ifdef HAVE_SYS_WAIT_H
-#    include <sys/wait.h>
-#endif /* HAVE_SYS_WAIT_H */
 #ifdef HAVE_SYS_TIME_H
 #    include <sys/time.h>
 #endif /* HAVE_SYS_TIME_H */
@@ -70,7 +67,6 @@
 #include "src/mca/prteinstalldirs/prteinstalldirs.h"
 #include "src/pmix/pmix-internal.h"
 #include "src/threads/pmix_mutex.h"
-#include "src/util/daemon_init.h"
 #include "src/util/pmix_argv.h"
 #include "src/util/pmix_basename.h"
 #include "src/util/prte_cmd_line.h"
@@ -95,8 +91,6 @@
 #include "src/runtime/prte_globals.h"
 #include "src/runtime/prte_quit.h"
 #include "src/runtime/runtime.h"
-
-#include "src/prted/prted.h"
 
 typedef struct {
     prte_pmix_lock_t lock;
@@ -151,7 +145,6 @@ static child_status_t *child_statuses = NULL;
 static size_t evid = INT_MAX;
 static pmix_proc_t myproc;
 static bool verbose = false;
-static pmix_list_t forwarded_signals;
 
 static void signal_forward_callback(int signal);
 
@@ -298,7 +291,8 @@ static void evhandler(size_t evhdlr_registration_id, pmix_status_t status,
                 /* the application's own status - preferred over the
                  * termination reason when we come to exit */
                 xcode = info[n].value.data.integer;
-            } else if (0 == strncmp(info[n].key, PMIX_EVENT_AFFECTED_PROC, PMIX_MAX_KEYLEN)) {
+            } else if (0 == strncmp(info[n].key, PMIX_EVENT_AFFECTED_PROC, PMIX_MAX_KEYLEN) &&
+                       NULL != info[n].value.data.proc) {
                 PMIX_LOAD_NSPACE(jobid, info[n].value.data.proc->nspace);
             } else if (0 == strncmp(info[n].key, PMIX_EVENT_RETURN_OBJECT, PMIX_MAX_KEYLEN)) {
                 lock = (prte_pmix_lock_t *) info[n].value.data.ptr;
@@ -368,7 +362,14 @@ static void evhandler(size_t evhdlr_registration_id, pmix_status_t status,
         /* save the status */
         lock->status = status_from_tree;
         if (NULL != tree_msg) {
-            lock->msg = tree_msg;
+            /* first message wins, here as everywhere else - the default
+             * handler may already have put one here, and overwriting it
+             * would drop both the message and its allocation */
+            if (NULL == lock->msg) {
+                lock->msg = tree_msg;
+            } else {
+                free(tree_msg);
+            }
             tree_msg = NULL;
         }
         /* release the lock */
@@ -407,7 +408,9 @@ static void launch_failed_cbfunc(size_t evhdlr_registration_id, pmix_status_t st
 
     for (n = 0; n < ninfo; n++) {
         if (PMIX_CHECK_KEY(&info[n], PMIX_EVENT_AFFECTED_PROC)) {
-            rank = info[n].value.data.proc->rank;
+            if (NULL != info[n].value.data.proc) {
+                rank = info[n].value.data.proc->rank;
+            }
         } else if (PMIX_CHECK_KEY(&info[n], PMIX_HOSTNAME)) {
             nodename = info[n].value.data.string;
         } else if (PMIX_CHECK_KEY(&info[n], "prte.launch.failed.app")) {
@@ -473,28 +476,39 @@ static void setupcbfunc(pmix_status_t status, pmix_info_t info[], size_t ninfo,
     PRTE_PMIX_WAKEUP_THREAD(&mylock->lock);
 }
 
-static int wait_pipe[2];
-
-static int wait_dvm(pid_t pid)
+/* Resolve "--stdin": the two words, or a rank.
+ *
+ * A value that is none of those is REFUSED rather than read as strtoul's
+ * zero, which would quietly send our stdin to rank 0.  This has to be
+ * asked before the spawn - once the job is running, refusing the command
+ * line leaves it running with nobody to report it - so the validation is
+ * done in prte_prun_parse_common_cli() and the answer is computed again
+ * here, from the same string, once we have a namespace to aim it at.
+ * prte's own path has an equivalent check of its own; prun and
+ * "prterun --dvm" reach this one. */
+static int stdin_target_rank(pmix_cli_result_t *results, pmix_rank_t *rank)
 {
-    char reply;
-    int rc;
-    int status;
+    pmix_cli_item_t *opt;
+    unsigned long ulval;
 
-    close(wait_pipe[1]);
-    do {
-        rc = read(wait_pipe[0], &reply, 1);
-    } while (0 > rc && EINTR == errno);
-
-    if (1 == rc && 'K' == reply) {
-        return 0;
-    } else if (0 == rc) {
-        waitpid(pid, &status, 0);
-        if (WIFEXITED(status)) {
-            return WEXITSTATUS(status);
-        }
+    *rank = 0;
+    opt = pmix_cmd_line_get_param(results, PRTE_CLI_STDIN);
+    if (NULL == opt) {
+        return PRTE_SUCCESS;
     }
-    return 255;
+    if (0 == strcmp(opt->values[0], "all")) {
+        *rank = PMIX_RANK_WILDCARD;
+        return PRTE_SUCCESS;
+    }
+    if (0 == strcmp(opt->values[0], "none")) {
+        *rank = PMIX_RANK_INVALID;
+        return PRTE_SUCCESS;
+    }
+    if (PRTE_SUCCESS != prte_parse_uint_option(opt->values[0], PMIX_RANK_VALID - 1, &ulval)) {
+        return PRTE_ERR_BAD_PARAM;
+    }
+    *rank = (pmix_rank_t) ulval;
+    return PRTE_SUCCESS;
 }
 
 int prun_common(pmix_cli_result_t *results,
@@ -507,7 +521,7 @@ int prun_common(pmix_cli_result_t *results,
     pmix_list_t apps, jobdata;
     prte_info_item_t *iprteinfo;
     prte_pmix_app_t *app;
-    void *tinfo, *jinfo;
+    void *tinfo, *jinfo = NULL;
     pmix_info_t info, *iptr;
     pmix_proc_t pname;
     pmix_status_t ret;
@@ -519,7 +533,6 @@ int prun_common(pmix_cli_result_t *results,
     uint32_t ui32;
     pid_t pid;
     prte_ess_base_signal_t *sig;
-    prte_event_list_item_t *evitm;
     pmix_value_t *val;
     pmix_data_array_t darray;
     char hostname[PRTE_PATH_MAX];
@@ -527,31 +540,34 @@ int prun_common(pmix_cli_result_t *results,
     pmix_status_t code;
     pmix_proc_t parent;
     pmix_cli_item_t *opt;
+    unsigned long ulval;
     PRTE_HIDE_UNUSED_PARAMS(pargc);
 
     /* init the globals */
+    /* "-v" was accepted and never read here: "verbose" is a file-scope bool
+     * hardwired to false, so every "if (verbose)" below it was dead and the
+     * option did nothing at all.  prte.c had the same defect and reads its
+     * own copy now; this is the one prun and "prterun --dvm" run. */
+    verbose = pmix_cmd_line_is_taken(results, PRTE_CLI_VERBOSE);
     PMIX_CONSTRUCT(&apps, pmix_list_t);
-    PMIX_CONSTRUCT(&forwarded_signals, pmix_list_t);
-    gethostname(hostname, sizeof(hostname));
-
-    /* detach from controlling terminal
-     * otherwise, remain attached so output can get to us
-     */
-    if (pmix_cmd_line_is_taken(results, PRTE_CLI_DAEMONIZE)) {
-        if (0 > pipe(wait_pipe)) {
-            return PRTE_ERROR;
-        }
-        prte_state_base.parent_fd = wait_pipe[1];
-        prte_daemon_init_callback(NULL, wait_dvm);
-        close(wait_pipe[0]);
-    } else {
-#if defined(HAVE_SETSID)
-        /* see if we were directed to separate from current session */
-        if (pmix_cmd_line_is_taken(results, PRTE_CLI_SET_SID)) {
-            setsid();
-        }
-#endif
+    /* this only names the tool to PMIx, so a host that will not tell us
+     * its name is not fatal - but the buffer has to be readable either
+     * way, and gethostname leaves it untouched when it fails */
+    hostname[0] = '\0';
+    if (0 != gethostname(hostname, sizeof(hostname))) {
+        hostname[0] = '\0';
     }
+    hostname[sizeof(hostname) - 1] = '\0';
+
+#if defined(HAVE_SETSID)
+    /* see if we were directed to separate from current session.  There is
+     * no --daemonize arm to this: neither prun nor prterun offers the
+     * option (it was removed from prterun), so the fork-and-wait that used
+     * to sit here could not be reached. */
+    if (pmix_cmd_line_is_taken(results, PRTE_CLI_SET_SID)) {
+        setsid();
+    }
+#endif
 
     /** setup callbacks for signals we should forward */
     opt = pmix_cmd_line_get_param(results, PRTE_CLI_FWD_SIGNALS);
@@ -575,7 +591,9 @@ int prun_common(pmix_cli_result_t *results,
                                   PRTE_GLOBAL_ARRAY_BLOCK_SIZE);
     if (PRTE_SUCCESS != ret) {
         PRTE_ERROR_LOG(ret);
-        return rc;
+        /* NOT rc: it holds the SUCCESS the signal setup just returned, so
+         * returning it told our caller the tool had done its job */
+        return ret;
     }
 
     /* setup options */
@@ -589,10 +607,14 @@ int prun_common(pmix_cli_result_t *results,
         PMIX_INFO_LIST_ADD(ret, tinfo, PMIX_TOOL_NSPACE, param, PMIX_STRING);
         free(param);
     }
+    rank = 0;
     if (NULL != (param = getenv("PMIX_RANK"))) {
-        rank = strtoul(param, NULL, 10);
-    } else {
-        rank = 0;
+        /* whatever set this in our environment is a PMIx launcher, so it is
+         * well formed - but strtoul reads anything else as rank 0, which is
+         * a real rank, so take it only when it is one */
+        if (PRTE_SUCCESS == prte_parse_uint_option(param, PMIX_RANK_VALID - 1, &ulval)) {
+            rank = (pmix_rank_t) ulval;
+        }
     }
     PMIX_INFO_LIST_ADD(ret, tinfo, PMIX_TOOL_RANK, &rank, PMIX_PROC_RANK);
 
@@ -608,13 +630,25 @@ int prun_common(pmix_cli_result_t *results,
 
     opt = pmix_cmd_line_get_param(results, PRTE_CLI_WAIT_TO_CONNECT);
     if (NULL != opt) {
-        ui32 = strtol(opt->values[0], NULL, 10);
+        if (PRTE_SUCCESS != prte_parse_uint_option(opt->values[0], UINT32_MAX, &ulval)) {
+            prte_show_help("help-prun.txt", "bad-option-input", true, prte_tool_basename,
+                           "--" PRTE_CLI_WAIT_TO_CONNECT, opt->values[0], "a number of seconds");
+            PMIX_INFO_LIST_RELEASE(tinfo);
+            return PRTE_ERR_BAD_PARAM;
+        }
+        ui32 = (uint32_t) ulval;
         PMIX_INFO_LIST_ADD(ret, tinfo, PMIX_CONNECT_RETRY_DELAY, &ui32, PMIX_UINT32);
     }
 
     opt = pmix_cmd_line_get_param(results, PRTE_CLI_NUM_CONNECT_RETRIES);
     if (NULL != opt) {
-        ui32 = strtol(opt->values[0], NULL, 10);
+        if (PRTE_SUCCESS != prte_parse_uint_option(opt->values[0], UINT32_MAX, &ulval)) {
+            prte_show_help("help-prun.txt", "bad-option-input", true, prte_tool_basename,
+                           "--" PRTE_CLI_NUM_CONNECT_RETRIES, opt->values[0], "a number of retries");
+            PMIX_INFO_LIST_RELEASE(tinfo);
+            return PRTE_ERR_BAD_PARAM;
+        }
+        ui32 = (uint32_t) ulval;
         PMIX_INFO_LIST_ADD(ret, tinfo, PMIX_CONNECT_MAX_RETRIES, &ui32, PMIX_UINT32);
     }
 
@@ -683,7 +717,16 @@ int prun_common(pmix_cli_result_t *results,
     if (PMIX_SUCCESS != (ret = PMIx_tool_init(&myproc, iptr, ninfo))) {
         fprintf(stderr, "%s failed to initialize, likely due to no DVM being available\n",
                 prte_tool_basename);
-        exit(1);
+        PMIX_INFO_FREE(iptr, ninfo);
+        /* return rather than exit(): our caller has teardown of its own to
+         * do - it is holding the pid file it was asked to write, and it
+         * expects the ess framework we close here to have been closed by
+         * whoever reached this function.  There is nothing to finalize:
+         * PMIx never came up. */
+        (void) pmix_mca_base_framework_close(&prte_ess_base_framework);
+        /* 1, not a PRTE code: our return IS the tool's exit status, and
+         * this is the commonest failure a script driving us will see */
+        return 1;
     }
     PMIX_INFO_FREE(iptr, ninfo);
 
@@ -695,8 +738,15 @@ int prun_common(pmix_cli_result_t *results,
     PMIX_INFO_LOAD(&iptr[1], PMIX_EVENT_RETURN_OBJECT, &rellock, PMIX_POINTER);
     PMIX_INFO_LOAD(&iptr[0], PMIX_EVENT_HDLR_NAME, "DEFAULT", PMIX_STRING);
     PRTE_PMIX_CONSTRUCT_LOCK(&lock);
-    PMIx_Register_event_handler(NULL, 0, iptr, 2, defhandler, regcbfunc, &lock);
-    PRTE_PMIX_WAIT_THREAD(&lock);
+    /* Only a PMIX_SUCCESS return means the callback we are about to park
+     * on will be made: the entry point refuses an uninitialized or
+     * shutting-down library, and a failed allocation, in front of the
+     * thread-shift that would eventually call regcbfunc.  Waiting anyway
+     * is a permanent hang in place of an error. */
+    ret = PMIx_Register_event_handler(NULL, 0, iptr, 2, defhandler, regcbfunc, &lock);
+    if (PMIX_SUCCESS == ret) {
+        PRTE_PMIX_WAIT_THREAD(&lock);
+    }
     PRTE_PMIX_DESTRUCT_LOCK(&lock);
     PMIX_INFO_FREE(iptr, 2);
 
@@ -716,8 +766,10 @@ int prun_common(pmix_cli_result_t *results,
     PMIX_INFO_LOAD(&iptr[0], PMIX_EVENT_HDLR_NAME, "LAUNCH-FAILED", PMIX_STRING);
     code = PMIX_ERR_JOB_FAILED_TO_LAUNCH;
     PRTE_PMIX_CONSTRUCT_LOCK(&lock);
-    PMIx_Register_event_handler(&code, 1, iptr, 1, launch_failed_cbfunc, regcbfunc, &lock);
-    PRTE_PMIX_WAIT_THREAD(&lock);
+    ret = PMIx_Register_event_handler(&code, 1, iptr, 1, launch_failed_cbfunc, regcbfunc, &lock);
+    if (PMIX_SUCCESS == ret) {
+        PRTE_PMIX_WAIT_THREAD(&lock);
+    }
     PRTE_PMIX_DESTRUCT_LOCK(&lock);
     PMIX_INFO_FREE(iptr, 1);
 
@@ -731,10 +783,20 @@ int prun_common(pmix_cli_result_t *results,
     ret = PMIx_Get(&pname, PMIX_LAUNCH_DIRECTIVES, &info, 1, &val);
     PMIX_INFO_DESTRUCT(&info);
     if (PMIX_SUCCESS == ret) {
-        iptr = (pmix_info_t *) val->data.darray->array;
-        ninfo = val->data.darray->size;
-        for (n = 0; n < ninfo; n++) {
-            PMIX_INFO_LIST_XFER(ret, jinfo, &iptr[n]);
+        /* Whoever launched us supplied this, so its type is not ours to
+         * assume: reading a value of any other type as a data array walks
+         * whatever else the value union happens to hold. */
+        if (PMIX_DATA_ARRAY != val->type || NULL == val->data.darray ||
+            PMIX_INFO != val->data.darray->type) {
+            pmix_output(0, "%s: ignoring launch directives given as %s - "
+                        "they must be an array of info",
+                        prte_tool_basename, PMIx_Data_type_string(val->type));
+        } else {
+            iptr = (pmix_info_t *) val->data.darray->array;
+            ninfo = val->data.darray->size;
+            for (n = 0; n < ninfo; n++) {
+                PMIX_INFO_LIST_XFER(ret, jinfo, &iptr[n]);
+            }
         }
         PMIX_VALUE_RELEASE(val);
     }
@@ -759,8 +821,10 @@ int prun_common(pmix_cli_result_t *results,
                                         &mylock);
     if (PMIX_SUCCESS != ret) {
         PMIX_ERROR_LOG(ret);
+        PMIX_INFO_FREE(iptr, ninfo);
         PRTE_PMIX_DESTRUCT_LOCK(&mylock.lock);
         PRTE_UPDATE_EXIT_STATUS(ret);
+        rc = ret;
         goto DONE;
     }
     PRTE_PMIX_WAIT_THREAD(&mylock.lock);
@@ -803,23 +867,47 @@ int prun_common(pmix_cli_result_t *results,
     /* bozo check */
     if (0 == pmix_list_get_size(&apps)) {
         pmix_output(0, "No application specified!");
+        PMIX_LIST_DESTRUCT(&apps);
+        rc = PRTE_ERR_BAD_PARAM;
         goto DONE;
     }
 
     ret = prte_prun_parse_common_cli(jinfo, results, schizo, &apps);
     if (PRTE_SUCCESS != ret) {
+        /* rc still holds the SUCCESS of the parse above, and it is what we
+         * return - so a command line we have just REFUSED left the tool
+         * exiting 0 without having launched anything */
+        PMIX_LIST_DESTRUCT(&apps);
+        rc = ret;
         goto DONE;
     }
 
     /* convert the job info into an array */
     PMIX_INFO_LIST_CONVERT(ret, jinfo, &darray);
+    if (PMIX_SUCCESS != ret) {
+        /* the list is never empty here - NOTIFY_COMPLETION alone sees to
+         * that - so this is a real failure, and going on with the empty
+         * array the convert leaves behind would launch the job with none
+         * of the directives the user asked for */
+        PMIX_ERROR_LOG(ret);
+        PMIX_LIST_DESTRUCT(&apps);
+        rc = ret;
+        goto DONE;
+    }
     iptr = (pmix_info_t *) darray.array;
     ninfo = darray.size;
     PMIX_INFO_LIST_RELEASE(jinfo);
+    jinfo = NULL;
 
     /* convert the apps to an array */
     napps = pmix_list_get_size(&apps);
     PMIX_APP_CREATE(papps, napps);
+    if (NULL == papps) {
+        PMIX_LIST_DESTRUCT(&apps);
+        PMIX_INFO_FREE(iptr, ninfo);
+        rc = PRTE_ERR_OUT_OF_RESOURCE;
+        goto DONE;
+    }
     n = 0;
     PMIX_LIST_FOREACH(app, &apps, prte_pmix_app_t)
     {
@@ -828,7 +916,17 @@ int prun_common(pmix_cli_result_t *results,
         papps[n].env = PMIx_Argv_copy(app->app.env);
         papps[n].cwd = strdup(app->app.cwd);
         papps[n].maxprocs = app->app.maxprocs;
+        /* an app that carries no directives of its own is ordinary, and
+         * the convert reports it as EMPTY after zeroing the array - but
+         * anything else has lost directives that were given */
         PMIX_INFO_LIST_CONVERT(ret, app->info, &darray);
+        if (PMIX_SUCCESS != ret && PMIX_ERR_EMPTY != ret) {
+            PMIX_ERROR_LOG(ret);
+            PMIX_LIST_DESTRUCT(&apps);
+            PMIX_INFO_FREE(iptr, ninfo);
+            rc = ret;
+            goto DONE;
+        }
         papps[n].info = (pmix_info_t *) darray.array;
         papps[n].ninfo = darray.size;
         ++n;
@@ -840,6 +938,11 @@ int prun_common(pmix_cli_result_t *results,
     }
 
     ret = PMIx_Spawn(iptr, ninfo, papps, napps, spawnednspace);
+    /* the blocking form has packed everything it needed by the time it
+     * returns, and iptr is about to be reused for the next registration */
+    PMIX_INFO_FREE(iptr, ninfo);
+    iptr = NULL;
+    ninfo = 0;
     if (PMIX_SUCCESS != ret) {
         /* SILENT is the DVM saying it has already explained itself - it is
          * how every refusal that comes with a show_help message is reported.
@@ -862,26 +965,18 @@ int prun_common(pmix_cli_result_t *results,
     ++n;
     PMIX_LOAD_PROCID(&pname, spawnednspace, PMIX_RANK_WILDCARD);
     PMIX_INFO_LOAD(&iptr[n], PMIX_EVENT_AFFECTED_PROC, &pname, PMIX_PROC);
-    PMIx_Register_event_handler(&code, 1, iptr, 2, debug_cbfunc, regcbfunc,
-                                (void *) &lock);
-    PRTE_PMIX_WAIT_THREAD(&lock);
+    ret = PMIx_Register_event_handler(&code, 1, iptr, 2, debug_cbfunc, regcbfunc,
+                                      (void *) &lock);
+    if (PMIX_SUCCESS == ret) {
+        PRTE_PMIX_WAIT_THREAD(&lock);
+    }
     PRTE_PMIX_DESTRUCT_LOCK(&lock);
     PMIX_INFO_FREE(iptr, 2);
 
-    /* check what user wants us to do with stdin */
+    /* check what user wants us to do with stdin - the value was refused
+     * before the spawn if it was not one we can act on */
     PMIX_LOAD_NSPACE(pname.nspace, spawnednspace);
-    opt = pmix_cmd_line_get_param(results, PRTE_CLI_STDIN);
-    if (NULL != opt) {
-        if (0 == strcmp(opt->values[0], "all")) {
-            pname.rank = PMIX_RANK_WILDCARD;
-        } else if (0 == strcmp(opt->values[0], "none")) {
-            pname.rank = PMIX_RANK_INVALID;
-        } else {
-            pname.rank = strtoul(opt->values[0], NULL, 10);
-        }
-    } else {
-        pname.rank = 0;
-    }
+    (void) stdin_target_rank(results, &pname.rank);
     if (PMIX_RANK_INVALID != pname.rank) {
         PMIX_INFO_CREATE(iptr, 1);
         PMIX_INFO_LOAD(&iptr[0], PMIX_IOF_PUSH_STDIN, NULL, PMIX_BOOL);
@@ -905,7 +1000,6 @@ int prun_common(pmix_cli_result_t *results,
      * events we most needed.  We take every job end the session reports and
      * sort out which are ours in the handler, where the spawn-tree root the
      * DVM stamps on each one makes that a string compare. */
-    ret = PMIX_EVENT_JOB_END;
     /* setup the info */
     ninfo = 2;
     PMIX_INFO_CREATE(iptr, ninfo);
@@ -915,11 +1009,22 @@ int prun_common(pmix_cli_result_t *results,
     PMIX_INFO_LOAD(&iptr[1], PMIX_EVENT_RETURN_OBJECT, &rellock, PMIX_POINTER);
     /* do the registration */
     PRTE_PMIX_CONSTRUCT_LOCK(&lock);
-    PMIx_Register_event_handler(&ret, 1, iptr, ninfo, evhandler, regcbfunc, &lock);
-    PRTE_PMIX_WAIT_THREAD(&lock);
+    code = PMIX_EVENT_JOB_END;
+    ret = PMIx_Register_event_handler(&code, 1, iptr, ninfo, evhandler, regcbfunc, &lock);
+    if (PMIX_SUCCESS == ret) {
+        PRTE_PMIX_WAIT_THREAD(&lock);
+    }
     PRTE_PMIX_DESTRUCT_LOCK(&lock);
     /* the registration copied these */
     PMIX_INFO_FREE(iptr, ninfo);
+    if (PMIX_SUCCESS != ret) {
+        /* nothing will tell us the job ended, so there is nothing to wait
+         * for - say so rather than blocking on an event that cannot come */
+        pmix_output(0, "%s: failed to register for job termination: %s",
+                    prte_tool_basename, PMIx_Error_string(ret));
+        rc = ret;
+        goto DONE;
+    }
 
     if (verbose) {
         pmix_output(0, "JOB %s EXECUTING", PRTE_JOBID_PRINT(spawnednspace));
@@ -939,10 +1044,11 @@ int prun_common(pmix_cli_result_t *results,
 
     /* deregister our event handler */
     PRTE_PMIX_CONSTRUCT_LOCK(&lock);
-    PMIx_Deregister_event_handler(evid, opcbfunc, &lock);
-    PRTE_PMIX_WAIT_THREAD(&lock);
+    ret = PMIx_Deregister_event_handler(evid, opcbfunc, &lock);
+    if (PMIX_SUCCESS == ret) {
+        PRTE_PMIX_WAIT_THREAD(&lock);
+    }
     PRTE_PMIX_DESTRUCT_LOCK(&lock);
-    PRTE_PMIX_DESTRUCT_LOCK(&rellock);
 
     /* Report any child job that ended non-zero while "report child jobs
      * separately" was in effect.  Held until here rather than said as it
@@ -970,8 +1076,11 @@ int prun_common(pmix_cli_result_t *results,
     PMIX_INFO_DESTRUCT(&info);
 
 DONE:
-    /* the release lock is about to leave scope */
-    release_lock = NULL;
+    /* the job spec, on a path that never got as far as converting it */
+    if (NULL != jinfo) {
+        PMIX_INFO_LIST_RELEASE(jinfo);
+        jinfo = NULL;
+    }
     /* an abort message we never got to hand to a waiter - the DVM went away
      * before the tree drained */
     if (NULL != tree_msg) {
@@ -983,11 +1092,6 @@ DONE:
         child_statuses = cstmp->next;
         free(cstmp);
     }
-    PMIX_LIST_FOREACH(evitm, &forwarded_signals, prte_event_list_item_t)
-    {
-        prte_event_signal_del(&evitm->ev);
-    }
-    PMIX_LIST_DESTRUCT(&forwarded_signals);
     if (NULL != papps) {
         PMIX_APP_FREE(papps, napps);
     }
@@ -1013,6 +1117,18 @@ DONE:
         // a warning here, if prte logging is on.
         pmix_output(0, "PMIx_tool_finalize() failed. Status = %d", ret);
     }
+
+    /* Only NOW is the release lock finished with.  It is on our stack, and
+     * the default event handler holds a pointer to it that is never
+     * deregistered - so destroying it while PMIx could still deliver an
+     * event left that handler locking a destroyed mutex.  The window is
+     * narrow (a lost connection between the job's end and our teardown),
+     * which is exactly the interval in which losing the DVM is likeliest.
+     * The finalize above is the point after which no handler can run.
+     * Destructing here also frees any message the lock was still carrying,
+     * which the lost-connection exit above used to walk away from. */
+    release_lock = NULL;
+    PRTE_PMIX_DESTRUCT_LOCK(&rellock);
 
     /* Our caller makes this our exit status.  If the DVM told us what the
      * application exited with, that is the answer - a launcher reports the
@@ -1043,6 +1159,7 @@ int prte_prun_parse_common_cli(void *jinfo, pmix_cli_result_t *results,
     pmix_cli_item_t *opt, opt2;
     int ret, i, ntargets;
     uint32_t ui32;
+    unsigned long ulval;
     bool flag;
     prte_pmix_app_t *app;
     char *param;
@@ -1115,6 +1232,14 @@ int prte_prun_parse_common_cli(void *jinfo, pmix_cli_result_t *results,
     /* check what user wants us to do with stdin */
     opt = pmix_cmd_line_get_param(results, PRTE_CLI_STDIN);
     if (NULL != opt) {
+        pmix_rank_t stdintgt;
+
+        if (PRTE_SUCCESS != stdin_target_rank(results, &stdintgt)) {
+            prte_show_help("help-prun.txt", "bad-option-input", true, prte_tool_basename,
+                           "--" PRTE_CLI_STDIN, opt->values[0], "all, none, or a rank");
+            PRTE_UPDATE_EXIT_STATUS(PRTE_ERR_FATAL);
+            return PRTE_ERR_BAD_PARAM;
+        }
         PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_STDIN_TGT, opt->values[0], PMIX_STRING);
     }
 
@@ -1139,7 +1264,13 @@ int prte_prun_parse_common_cli(void *jinfo, pmix_cli_result_t *results,
     /* record the max restarts */
     opt = pmix_cmd_line_get_param(results, PRTE_CLI_MAX_RESTARTS);
     if (NULL != opt) {
-        ui32 = strtol(opt->values[0], NULL, 10);
+        if (PRTE_SUCCESS != prte_parse_uint_option(opt->values[0], UINT32_MAX, &ulval)) {
+            prte_show_help("help-prun.txt", "bad-option-input", true, prte_tool_basename,
+                           "--" PRTE_CLI_MAX_RESTARTS, opt->values[0], "a number of restarts");
+            PRTE_UPDATE_EXIT_STATUS(PRTE_ERR_FATAL);
+            return PRTE_ERR_BAD_PARAM;
+        }
+        ui32 = (uint32_t) ulval;
         PMIX_LIST_FOREACH(app, apps, prte_pmix_app_t)
         {
             PMIX_INFO_LIST_ADD(ret, app->info, PMIX_MAX_RESTARTS, &ui32, PMIX_UINT32);
@@ -1163,14 +1294,32 @@ int prte_prun_parse_common_cli(void *jinfo, pmix_cli_result_t *results,
     i = 0;
     opt = pmix_cmd_line_get_param(results, PRTE_CLI_TIMEOUT);
     if (NULL != opt) {
-        i = strtol(opt->values[0], NULL, 10);
+        if (PRTE_SUCCESS != prte_parse_uint_option(opt->values[0], INT_MAX, &ulval)) {
+            prte_show_help("help-prun.txt", "bad-option-input", true, prte_tool_basename,
+                           "--" PRTE_CLI_TIMEOUT, opt->values[0], "a number of seconds");
+            PRTE_UPDATE_EXIT_STATUS(PRTE_ERR_FATAL);
+            return PRTE_ERR_BAD_PARAM;
+        }
+        i = (int) ulval;
     } else if (NULL != (param = getenv("MPIEXEC_TIMEOUT"))) {
-        i = strtol(param, NULL, 10);
+        if (PRTE_SUCCESS != prte_parse_uint_option(param, INT_MAX, &ulval)) {
+            prte_show_help("help-prun.txt", "bad-option-input", true, prte_tool_basename,
+                           "MPIEXEC_TIMEOUT", param, "a number of seconds");
+            PRTE_UPDATE_EXIT_STATUS(PRTE_ERR_FATAL);
+            return PRTE_ERR_BAD_PARAM;
+        }
+        i = (int) ulval;
     }
     if (0 != i) {
         PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_JOB_TIMEOUT, &i, PMIX_INT);
     }
 
+    /* these two are the bare presence of an option: the value they carry is
+     * the assertion the user made by writing it.  They used to be handed
+     * "flag" as it stood, which is set only by the recovery and continuous
+     * blocks above - so on any command line that gave neither, the DVM was
+     * told to take stack traces "false" and --get-stack-traces did nothing */
+    flag = true;
     if (pmix_cmd_line_is_taken(results, PRTE_CLI_STACK_TRACES)) {
         PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_TIMEOUT_STACKTRACES, &flag, PMIX_BOOL);
     }
@@ -1179,7 +1328,13 @@ int prte_prun_parse_common_cli(void *jinfo, pmix_cli_result_t *results,
     }
     opt = pmix_cmd_line_get_param(results, PRTE_CLI_SPAWN_TIMEOUT);
     if (NULL != opt) {
-        i = strtol(opt->values[0], NULL, 10);
+        if (PRTE_SUCCESS != prte_parse_uint_option(opt->values[0], INT_MAX, &ulval)) {
+            prte_show_help("help-prun.txt", "bad-option-input", true, prte_tool_basename,
+                           "--" PRTE_CLI_SPAWN_TIMEOUT, opt->values[0], "a number of seconds");
+            PRTE_UPDATE_EXIT_STATUS(PRTE_ERR_FATAL);
+            return PRTE_ERR_BAD_PARAM;
+        }
+        i = (int) ulval;
         PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_SPAWN_TIMEOUT, &i, PMIX_INT);
     }
     opt = pmix_cmd_line_get_param(results, PRTE_CLI_DO_NOT_AGG_HELP);
@@ -1193,13 +1348,19 @@ int prte_prun_parse_common_cli(void *jinfo, pmix_cli_result_t *results,
         PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_MEM_ALLOC_KIND, opt->values[0], PMIX_STRING);
     }
 
-    pmix_info_t info;
     opt = pmix_cmd_line_get_param(results, PRTE_CLI_GPU_SUPPORT);
     if (NULL != opt) {
-        // they could be enabling or disabling it
-        info.value.type = PMIX_STRING;
-        info.value.data.string = opt->values[0];
-        flag = PMIX_INFO_TRUE(&info);
+        /* they could be enabling or disabling it - but the truth test
+         * underneath reports anything it does not recognize as FALSE, so
+         * "--gpu-support maybe" quietly meant "no GPU support".  Refuse a
+         * value that is neither, the way every other boolean option here
+         * does */
+        if (PRTE_SUCCESS != prte_cli_bool_value(opt->values[0], &flag)) {
+            prte_show_help("help-prun.txt", "bad-option-input", true, prte_tool_basename,
+                           "--" PRTE_CLI_GPU_SUPPORT, opt->values[0], "true or false");
+            PRTE_UPDATE_EXIT_STATUS(PRTE_ERR_FATAL);
+            return PRTE_ERR_BAD_PARAM;
+        }
         PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_GPU_SUPPORT, &flag, PMIX_BOOL);
     }
 
@@ -1273,6 +1434,21 @@ static void signal_forward_callback(int signum)
     pmix_status_t rc;
     pmix_proc_t proc;
     pmix_info_t info;
+
+    /* We are installed before the tool has connected to anything, let alone
+     * spawned, and every forwardable signal is forwarded by default - so a
+     * SIGTSTP or a "kill -USR1" that lands while we are still connecting or
+     * still inside PMIx_Spawn finds spawnednspace empty.  An empty namespace
+     * is not a safe way to say "no job": the job-control path packs it
+     * verbatim and prted_comm.c reads it as EVERY job, so on a shared
+     * persistent DVM we would deliver the signal to other people's work. */
+    if ('\0' == spawnednspace[0]) {
+        if (verbose) {
+            fprintf(stderr, "%s: signal %d received before the job was spawned - not forwarded\n",
+                    prte_tool_basename, signum);
+        }
+        return;
+    }
 
     if (verbose) {
         fprintf(stderr, "%s: Forwarding signal %d to job\n", prte_tool_basename, signum);

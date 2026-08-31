@@ -16,6 +16,8 @@
 #include "constants.h"
 #include "types.h"
 
+#include <string.h>
+
 #include "src/class/pmix_list.h"
 #include "src/mca/state/state.h"
 #include "src/runtime/prte_globals.h"
@@ -25,6 +27,94 @@
 /*
  * Local functions
  */
+static int init(void);
+/* Hand the scheduler's whereabouts to the code that will go looking for it.
+ *
+ * Every ras_pmix_* connection parameter is the name of a PMIx attach
+ * attribute - ras_pmix_uri is PMIX_SERVER_URI, ras_pmix_server_pid is
+ * PMIX_SERVER_PIDINFO, and so on down to the retry pair, which PMIx
+ * implements itself.  None of them was ever handed to anything: the attach
+ * in prte_pmix_set_scheduler() passed only PMIX_CONNECT_TO_SCHEDULER and
+ * PMIX_TOOL_CONNECT_OPTIONAL, so PRRTE scanned for a rendezvous and took
+ * whatever it found.  A site naming the scheduler it means - one of two on
+ * the machine, or one whose rendezvous is not where PMIx looks by default -
+ * got its parameter accepted, reported by prte_info, used to decide that this
+ * component is the allocator (so no hostfile is read), and then ignored at
+ * the one moment it meant anything.
+ *
+ * This runs at selection, which is the only place with both the parameters
+ * and a guarantee of being ahead of every consumer: allocation, session
+ * control and the tool-connection path all reach prte_pmix_set_scheduler(),
+ * it looks exactly once, and whichever of them gets there first would
+ * otherwise burn that one look with nothing to aim it.
+ *
+ * A parameter left at its default contributes nothing, so a DVM that has not
+ * been told anything gets the same bare scan it always did. */
+static int init(void)
+{
+    pmix_info_t *dirs;
+    size_t ndirs = 0, n = 0;
+    prte_ras_pmix_component_t *c = &prte_mca_ras_pmix_component;
+
+    if (NULL != c->uri) {
+        ++ndirs;
+    }
+    if (0 < strlen(c->server.nspace)) {
+        ++ndirs;
+    }
+    if (0 < c->server_pid) {
+        ++ndirs;
+    }
+    if (NULL != c->server_host) {
+        ++ndirs;
+    }
+    if (NULL != c->connection_order) {
+        ++ndirs;
+    }
+    /* the retry pair always goes: the parameters document defaults (5 and 1)
+     * and a user who reads that is entitled to get them */
+    ndirs += 2;
+
+    PMIX_INFO_CREATE(dirs, ndirs);
+    if (NULL == dirs) {
+        PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+        return PRTE_ERR_OUT_OF_RESOURCE;
+    }
+    if (NULL != c->uri) {
+        PMIX_INFO_LOAD(&dirs[n++], PMIX_SERVER_URI, c->uri, PMIX_STRING);
+    }
+    if (0 < strlen(c->server.nspace)) {
+        PMIX_INFO_LOAD(&dirs[n++], PMIX_SERVER_NSPACE, c->server.nspace, PMIX_STRING);
+    }
+    if (0 < c->server_pid) {
+        PMIX_INFO_LOAD(&dirs[n++], PMIX_SERVER_PIDINFO, &c->server_pid, PMIX_PID);
+    }
+    if (NULL != c->server_host) {
+        /* PMIX_SERVER_HOSTNAME is the attribute defined for exactly this -
+         * the node the target server is on - and no PTL reads it yet, so it
+         * is forwarded to the server rather than used to choose one.  Send it
+         * anyway: it is the right attribute for what the parameter says, and
+         * a PMIx that starts honoring it needs nothing here.
+         *
+         * ras_pmix_rank is NOT sent, and there is nothing to send it as.
+         * PMIX_SERVER_RANK is a PMIx_server_init attribute - the rank a
+         * server takes for ITSELF - not a way to name the server a tool wants,
+         * and PMIx identifies an attach target by nspace and rendezvous.  Sent
+         * here it would not select anything and would be forwarded to the
+         * server as an assertion we have no business making.  See
+         * docs/todo.rst. */
+        PMIX_INFO_LOAD(&dirs[n++], PMIX_SERVER_HOSTNAME, c->server_host, PMIX_STRING);
+    }
+    if (NULL != c->connection_order) {
+        PMIX_INFO_LOAD(&dirs[n++], PMIX_CONNECTION_ORDER, c->connection_order, PMIX_STRING);
+    }
+    PMIX_INFO_LOAD(&dirs[n++], PMIX_CONNECT_MAX_RETRIES, &c->max_retries, PMIX_UINT32);
+    PMIX_INFO_LOAD(&dirs[n++], PMIX_CONNECT_RETRY_DELAY, &c->retry_delay, PMIX_UINT32);
+
+    prte_pmix_set_scheduler_directives(dirs, ndirs);
+    return PRTE_SUCCESS;
+}
+
 static int allocate(prte_job_t *jdata, pmix_list_t *nodes);
 static int finalize(void);
 static pmix_status_t modify(prte_pmix_server_req_t *req);
@@ -34,7 +124,7 @@ static pmix_status_t modify(prte_pmix_server_req_t *req);
  */
 prte_ras_base_module_t prte_ras_pmix_module = {
     .scheduler_owned = true,
-    .init = NULL,
+    .init = init,
     .allocate = allocate,
     .modify = modify,
     .finalize = finalize
@@ -43,7 +133,6 @@ prte_ras_base_module_t prte_ras_pmix_module = {
 static int allocate(prte_job_t *jdata, pmix_list_t *nodes)
 {
     PRTE_HIDE_UNUSED_PARAMS(jdata, nodes);
-
 
     return PRTE_ERR_TAKE_NEXT_OPTION;
 }
@@ -68,7 +157,8 @@ static int finalize(void)
  * callback stay trivial; every mutation of the request happens in the
  * thread-shifted handler below.
  *
- * The caddy holds a reference on the request so the request cannot be
+ * The caddy is built by modify() before the request is issued - see the note
+ * there - and holds a reference on the request so the request cannot be
  * reclaimed out from under the shift. The answer's info array remains owned by
  * PMIx and stays valid until we invoke rel(relcbdata), which is why that pair
  * is carried across too. */
@@ -100,13 +190,112 @@ static void rpdes(prte_ras_pmix_caddy_t *p)
 }
 static PMIX_CLASS_INSTANCE(prte_ras_pmix_caddy_t, pmix_object_t, rpcon, rpdes);
 
+/* Fold the scheduler's answer into the request's info array.
+ *
+ * The answer is the operation's result, but it is not the whole of what the
+ * completion needs.  prte_ras_base_complete_request routes the grow or the
+ * teardown using directives that belong to the ORIGINAL request:
+ * PMIX_ALLOC_ID and PMIX_ALLOC_REQ_ID name which reservation an EXTEND or a
+ * RELEASE is for, and PMIX_ALLOC_TARGET / PMIX_ALLOC_SHARE /
+ * PMIX_ALLOC_INHERITANCE decide which session a PMIX_ALLOC_NEW's nodes join
+ * and what becomes of them afterwards.  A scheduler has no reason to echo any
+ * of those - they are PRRTE-local routing, not anything it was asked to
+ * decide - so replacing the array outright threw them away and then failed
+ * the request locally after the scheduler had already committed the change:
+ * an EXTEND with nothing left to name its target is refused
+ * PMIX_ERR_BAD_PARAM, and a RELEASE by allocation id falls through to a node
+ * list that is no longer there and is refused PMIX_ERR_NOT_FOUND.
+ *
+ * So merge.  Every key the answer carries wins - the granted node list
+ * supersedes the requested one - and every key of the request's that the
+ * answer does not mention is kept.  PMIX_REQUESTOR is dropped: modify() added
+ * it for the scheduler's benefit and it is nobody's answer.
+ *
+ * The copy is deliberate.  The answer belongs to PMIx until cd->rel() is
+ * invoked, and there is no good moment to invoke it if we point at it
+ * instead: the requester is handed prte_pmix_server_req_release (so it never
+ * calls cd->rel), and prte_ras_base_complete_request may repoint req->info at
+ * a response of its own.  Copying makes the request the sole owner of
+ * everything downstream - its destructor frees whatever req->info ends up
+ * being - and lets us hand PMIx's array back immediately, where the lifetime
+ * is obvious. */
+static void merge_answer(prte_pmix_server_req_t *req,
+                         pmix_info_t *ans, size_t nans)
+{
+    pmix_info_t *merged;
+    bool *keep = NULL;
+    size_t nkeep = 0, nmerged, idx, n, m;
+
+    if (0 < req->ninfo && NULL != req->info) {
+        keep = (bool *) malloc(req->ninfo * sizeof(bool));
+        if (NULL == keep) {
+            /* leave the request holding what it has - the original directives
+             * are the ones the completion below cannot do without */
+            PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+            return;
+        }
+        for (n = 0; n < req->ninfo; n++) {
+            keep[n] = !PMIx_Check_key(req->info[n].key, PMIX_REQUESTOR);
+            for (m = 0; keep[n] && m < nans; m++) {
+                if (PMIx_Check_key(req->info[n].key, ans[m].key)) {
+                    keep[n] = false;
+                }
+            }
+            if (keep[n]) {
+                ++nkeep;
+            }
+        }
+    }
+
+    nmerged = nkeep + ((NULL == ans) ? 0 : nans);
+    if (0 == nmerged) {
+        if (NULL != keep) {
+            free(keep);
+        }
+        if (req->copy && NULL != req->info) {
+            PMIX_INFO_FREE(req->info, req->ninfo);
+        }
+        req->info = NULL;
+        req->ninfo = 0;
+        req->copy = false;
+        return;
+    }
+
+    PMIX_INFO_CREATE(merged, nmerged);
+    if (NULL == merged) {
+        PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+        if (NULL != keep) {
+            free(keep);
+        }
+        return;
+    }
+    idx = 0;
+    for (n = 0; NULL != ans && n < nans; n++) {
+        PMIX_INFO_XFER(&merged[idx++], &ans[n]);
+    }
+    for (n = 0; NULL != keep && n < req->ninfo; n++) {
+        if (keep[n]) {
+            PMIX_INFO_XFER(&merged[idx++], &req->info[n]);
+        }
+    }
+    if (NULL != keep) {
+        free(keep);
+    }
+
+    if (req->copy && NULL != req->info) {
+        PMIX_INFO_FREE(req->info, req->ninfo);
+    }
+    req->info = merged;
+    req->ninfo = nmerged;
+    req->copy = true;
+}
+
 /* Runs on the PRRTE progress thread: record the scheduler's answer on the
  * request, apply it, and relay it to whoever asked. */
 static void passthru(int sd, short args, void *cbdata)
 {
     prte_ras_pmix_caddy_t *cd = (prte_ras_pmix_caddy_t*)cbdata;
     prte_pmix_server_req_t *req = cd->req;
-    size_t n;
     PRTE_HIDE_UNUSED_PARAMS(sd, args);
 
     PMIX_ACQUIRE_OBJECT(cd);
@@ -120,38 +309,16 @@ static void passthru(int sd, short args, void *cbdata)
     req->status = cd->status;
     req->pstatus = cd->status;
 
-    /* The answer replaces whatever the request was carrying, so drop our own
-     * copy first if we made one in modify() below.
-     *
-     * Take a COPY of the scheduler's array rather than pointing at it. The
-     * array belongs to PMIx until cd->rel() is invoked, and there is no good
-     * moment to invoke it if we keep it: the requester below is handed
-     * prte_pmix_server_req_release (so it never calls cd->rel), and
-     * prte_ras_base_complete_request may repoint req->info at a response of
-     * its own (so we cannot simply forward it either). Copying makes the
-     * request the sole owner of everything downstream - its destructor frees
-     * whatever req->info ends up being - and lets us hand PMIx's array back
-     * immediately, right here, where the lifetime is obvious. */
-    if (req->copy && NULL != req->info) {
-        PMIX_INFO_FREE(req->info, req->ninfo);
-    }
-    req->info = NULL;
-    req->ninfo = 0;
-    req->copy = false;
-    if (0 < cd->ninfo && NULL != cd->info) {
-        PMIX_INFO_CREATE(req->info, cd->ninfo);
-        if (NULL != req->info) {
-            for (n = 0; n < cd->ninfo; n++) {
-                PMIX_INFO_XFER(&req->info[n], &cd->info[n]);
-            }
-            req->ninfo = cd->ninfo;
-            req->copy = true;
-        }
-    }
+    merge_answer(req, cd->info, cd->ninfo);
+
     if (NULL != cd->rel) {
         cd->rel(cd->relcbdata);
         cd->rel = NULL;
+        cd->relcbdata = NULL;
     }
+    /* the answer is PMIx's again - leave nothing here that looks readable */
+    cd->info = NULL;
+    cd->ninfo = 0;
     /* nothing of PMIx's is left for anyone to release */
     req->rlcbfunc = NULL;
     req->rlcbdata = NULL;
@@ -185,21 +352,14 @@ static void infocbfunc(pmix_status_t status,
                        void *cbdata,
                        pmix_release_cbfunc_t rel, void *relcbdata)
 {
-    prte_pmix_server_req_t *req = (prte_pmix_server_req_t*)cbdata;
-    prte_ras_pmix_caddy_t *cd;
+    prte_ras_pmix_caddy_t *cd = (prte_ras_pmix_caddy_t*)cbdata;
 
-    /* GOLDEN RULE: we are on the PMIx progress thread. Capture the answer and
-     * post it - touch no PRRTE state here. */
-    cd = PMIX_NEW(prte_ras_pmix_caddy_t);
-    if (NULL == cd) {
-        /* nothing we can do but hand the answer back so PMIx can reclaim it */
-        if (NULL != rel) {
-            rel(relcbdata);
-        }
-        return;
-    }
-    PMIX_RETAIN(req);
-    cd->req = req;
+    /* GOLDEN RULE: we are on the PMIx progress thread.  Capture the answer and
+     * post it - touch no PRRTE state here, and allocate nothing.  The caddy
+     * was built by modify() before the request went out precisely so that this
+     * cannot fail: there is no way to report a failure from here, so an
+     * allocation that came up short left the request sitting in the tracker
+     * array and the client waiting on a callback that would never arrive. */
     cd->status = status;
     cd->info = info;
     cd->ninfo = ninfo;
@@ -211,6 +371,7 @@ static void infocbfunc(pmix_status_t status,
 
 static pmix_status_t modify(prte_pmix_server_req_t *req)
 {
+    prte_ras_pmix_caddy_t *cd;
     pmix_status_t rc;
     pmix_info_t *xfer;
     size_t n;
@@ -219,17 +380,31 @@ static pmix_status_t modify(prte_pmix_server_req_t *req)
     // attach if not
     rc = prte_pmix_set_scheduler();
     if (PMIX_SUCCESS != rc) {
-        /* No scheduler is reachable, so we cannot forward this request.  Defer
-         * to the next RAS module rather than failing the whole request: in a
-         * schedulerless DVM the ras/hosts component handles node-list grow and
-         * shrink locally.  Returning a hard error here (e.g. PMIX_ERR_UNREACH)
-         * would instead abort the modify loop before hosts is consulted. */
-        return PMIX_ERR_TAKE_NEXT_OPTION;
+        /* No scheduler is reachable, so we cannot forward this request.  Say
+         * so, and say it accurately.
+         *
+         * This used to answer PMIX_ERR_TAKE_NEXT_OPTION so that ras/hosts,
+         * further down the module list, could serve a grow or shrink locally
+         * in a DVM with no scheduler.  There is no module list any more:
+         * prte_ras_base_select() keeps exactly one module, and this component
+         * is selected only when it has actually been pointed at a scheduler
+         * (see ras_pmix_component_query).  So a schedulerless DVM never
+         * reaches this function at all - ras/hosts owns the allocation and is
+         * asked directly - and where we ARE the selected module there is
+         * nothing to defer to.  All the old return bought was leaving
+         * req->pstatus holding the PMIX_ERR_NOT_SUPPORTED that
+         * prte_ras_base_modify seeds, telling the requester the operation is
+         * unsupported when in truth it is supported and the scheduler is out
+         * of touch - the difference between "give up" and "try again". */
+        return PMIX_ERR_UNREACH;
     }
 
     // we need to pass the request on to the scheduler
     // need to add the requestor's ID to the info array
     PMIX_INFO_CREATE(xfer, req->ninfo + 1);
+    if (NULL == xfer) {
+        return PMIX_ERR_NOMEM;
+    }
     for (n=0; n < req->ninfo; n++) {
         PMIX_INFO_XFER(&xfer[n], &req->info[n]);
     }
@@ -246,9 +421,27 @@ static pmix_status_t modify(prte_pmix_server_req_t *req)
     req->info = xfer;
     req->ninfo++;
 
+    /* Build the capture buffer for the answer BEFORE the request goes out.
+     * The completion callback runs on the PMIx progress thread, where it may
+     * do nothing but capture and post - and where it has no one to tell if it
+     * cannot.  Allocated here, a failure is still one we can answer. */
+    cd = PMIX_NEW(prte_ras_pmix_caddy_t);
+    if (NULL == cd) {
+        return PMIX_ERR_NOMEM;
+    }
+    /* the caddy holds a reference on the request so the request cannot be
+     * reclaimed out from under the shift */
+    PMIX_RETAIN(req);
+    cd->req = req;
+
     /* pass the request to the scheduler */
     rc = PMIx_Allocation_request_nb(req->allocdir, req->info, req->ninfo,
-                                    infocbfunc, req);
+                                    infocbfunc, cd);
+    if (PMIX_SUCCESS != rc) {
+        /* PMIx answers anything other than PMIX_SUCCESS without ever calling
+         * back, so nothing will come to consume the caddy */
+        PMIX_RELEASE(cd);
+    }
 
     return rc;
 }

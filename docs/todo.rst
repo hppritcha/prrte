@@ -27,10 +27,72 @@ so nobody spends the effort a second time.
 Runtime behavior
 ----------------
 
+**A daemon is never told that an application has terminated.**  The data
+store honors ``PMIX_PERSIST_APP`` at the application it names — the master
+counts each app's terminations and purges when the last one ends
+(``prte_state_base_purge_app``) — but only for its own store.  A
+``PMIX_RANGE_LOCAL`` publish lives in the store of the *daemon* that relayed
+it, and no message tells that daemon an application is over; it learns of a
+process exiting (it reaps the child) and of a namespace ending
+(``PRTE_DAEMON_DVM_CLEANUP_JOB_CMD``), and nothing in between.  So a local-range
+item published with an explicit ``APP`` persistence is held until its
+namespace ends, which is later than asked for but never shorter.
+
+Deferred rather than designed around: it needs a new notification, it affects
+only local-range publishes that name ``APP`` explicitly — not the default,
+which is ``PMIX_PERSIST_NSPACE`` — and no reported problem depends on it.  See
+``docs/plans/datastore/`` for the specification and the design the rest of
+that work follows.
+
 **``ras/flux`` has no ``modify()``.**  It returns ``PMIX_ERR_NOT_SUPPORTED``
 (``src/mca/ras/flux/ras_flux_module.c``), so the elastic extend/release
 surface exists for SLURM only.  Everything above the component is
 RM-agnostic; what is missing is the Flux-side conversation.
+
+**``ras_pmix_rank`` names nothing PMIx can act on.**  Every other
+``ras_pmix_*`` connection parameter is the name of a PMIx attach attribute
+and is now handed to ``PMIx_tool_attach_to_server`` (see
+``src/mca/ras/pmix/``).  This one has no counterpart: ``PMIX_SERVER_RANK`` is
+a ``PMIx_server_init`` attribute — the rank a server takes for *itself* — and
+PMIx identifies an attach target by namespace and rendezvous, so a rank
+selects nothing.  ``ras_pmix_server_host`` is a milder version of the same
+thing: ``PMIX_SERVER_HOSTNAME`` is the attribute defined for what the
+parameter means, but no PTL reads it, so it is forwarded to the server rather
+than used to choose one.  Either PMIx grows a way to name a scheduler by
+these, or the parameters should go; they are registered and reported by
+``prte_info`` today, which is a promise neither can keep.
+
+**``ras/pmix`` forwards allocation requests to a scheduler and never gives
+anything back.**  The component (``src/mca/ras/pmix/``) exists to relay a
+runtime ``PMIx_Allocation_request`` to a host PMIx server acting as the system
+scheduler, and it does that — but three things around it are unfinished, and
+they became visible only once ``ras`` selection went single-owner.
+
+Its ``allocate()`` returns ``PRTE_ERR_TAKE_NEXT_OPTION``: it discovers no
+initial allocation at all.  While every component that answered the query was
+kept, the next one down did that job.  Now the component that answers *is* the
+allocator, so pointing a DVM at a PMIx scheduler — a ``ras_pmix_uri``, an
+``ras_pmix_server_host``, ``ras_pmix_system_scheduler`` — makes this the
+allocator and leaves the base falling through to its one-slot local-node
+fabrication, with any ``--hostfile`` unread.  Asking the scheduler for the
+DVM's own allocation is the missing piece; until it exists, this component is
+only usable on a DVM whose initial nodes came from somewhere the user does not
+mind being ignored.
+
+It declares ``scheduler_owned = true`` and implements neither
+``release_allocation`` nor ``shrink_complete`` — the two module hooks the
+framework offers precisely so an RM learns when a reservation is torn down or
+a shrink has drained.  ``ras/slurm`` implements both.  So nodes a PMIx
+scheduler grants are never handed back to it, and stay charged to the DVM for
+its lifetime.
+
+And a request the scheduler *grants* but PRRTE then fails to apply locally is
+not compensated: ``passthru`` reports the local failure to the requester and
+nothing issues the ``PMIX_ALLOC_RELEASE`` that would return the nodes.  The
+self-inflicted version of this is fixed — the answer is now merged into the
+request rather than substituted for it, so the routing directives the local
+completion needs are still there — but a genuinely malformed request still
+reaches the scheduler before it is refused here.
 
 **Mixed allocators are not supported, and would need more than the ``ras``
 framework.**  The motivating case is a cloud/local combination: an allocation
@@ -44,6 +106,30 @@ properly is a larger piece of work than re-admitting multiple ``ras`` modules:
 which nodes, and the daemon-launch path would have to fan out through more
 than one.  At minimum it needs a launcher affinity recorded per node and
 honored by ``prte_plm_base_setup_virtual_machine``.
+
+**``register_nspace()`` checks the list it is building, not the entries it
+puts in it.**  ``prte_pmix_server_register_nspace``
+(``src/prted/pmix/pmix_server_register_fns.c``) makes roughly forty
+``PMIX_INFO_LIST_ADD`` calls and reads the status of three of them.  The
+review checked the two that decide whether the registration is coherent at
+all — that the list handle exists, and that the final conversion into the
+array handed to ``PMIx_server_register_nspace`` succeeded — and left the
+rest, on the argument that ``PMIx_Info_list_add`` fails only on a NULL list
+or out of memory, and that forty checks would treble the length of an
+already very long function to report a condition under which the daemon is
+failing everywhere at once.  The consequence if that argument is wrong is a
+job registered with a key silently missing.  What would settle it properly
+is not forty checks but an accumulator — one status the adds fold into,
+tested once — which is a change to the macro, not to this file.
+
+**A session control addressed to every session answers with no session id.**
+``apply_to_all`` (``src/prted/pmix/pmix_server_session.c``) applies the
+operation to each session the requestor controls and then builds one answer
+carrying the request's control id and nothing else.  It used to report
+whichever session happened to be served last, which was worse; but the PMIx
+description of a ``UINT32_MAX`` session id does not say what the answer
+should carry, and an array of per-session results is the other plausible
+reading.  Naming none of them is a choice, not a settled question.
 
 **The bootstrap configuration parses one option it deliberately does not
 publish.**  ``SessionTmpDir`` is read into the bootstrap configuration and
@@ -122,6 +208,32 @@ mechanism, scoped to a signature and driven by releases rather than by
 failures.  That is a wire change plus a memo that holds a counter, and it
 needs the dockerswarm harness to validate, so it has not been attempted.
 
+**A connected job's teardown costs one DVM-wide broadcast per process.**
+`PMIx_Connect` obliges the host to tell an assemblage about every member
+that leaves without disconnecting first, and PRRTE keeps that promise in
+``notify_assemblage()`` (``src/prted/pmix/pmix_server_connect.c``): one
+``PMIX_ERR_PROC_TERM_WO_SYNC`` per departing proc, each broadcast to every
+daemon in the DVM with a ``PMIX_EVENT_CUSTOM_RANGE`` naming the membership,
+so that PMIx delivers it to exactly the members that registered for it.
+
+Running to completion is not a disconnect, and a spawned child is connected
+to its parent by default, so an ``MPI_Comm_spawn``\ ed job of N ranks ends by
+issuing N broadcasts across the whole DVM.  Nothing pays for this unless an
+assemblage exists — the registry is empty in the ordinary case and the check
+is the first thing every one of those entry points makes — but where one
+does exist the cost grows with the product of the job size and the DVM.
+
+Coalescing them is not simply an optimization to write.  The event is per
+proc by definition: a member is entitled to know *which* peer went, and the
+exit code travels with it.  A batched event would have to carry a list and
+every consumer would have to learn to read one, which is a PMIx interface
+question rather than a PRRTE one.  What could be done here without touching
+the definition is to stop broadcasting: the membership is held on the master
+and the daemons hosting those members are derivable from it, so the
+notification could be sent to those daemons rather than xcast to all of
+them.  That trades a broadcast for a proc-to-daemon walk on the master, and
+it needs the dockerswarm harness to show it delivers the same events.
+
 **A job cannot ask for a transport.**  The network allocation request the
 odls builds for each job names ``<nspace>.net`` and a security key and
 otherwise takes whatever transport the resource manager offers by default
@@ -129,6 +241,95 @@ otherwise takes whatever transport the resource manager offers by default
 ``src/mca/odls/base/odls_base_default_fns.c``).  There is no command-line
 surface for saying which one, and the note there is the record that one was
 always intended.
+
+**Event registration is accepted and discarded.**  PMIx offers the host a
+pair of hooks — ``register_events``/``deregister_events`` — through which it
+reports which status codes its local clients have asked to hear about, so
+that a host can stop distributing the ones nobody wants.  PRRTE takes both
+(``_register_events``/``_deregister_events``,
+``src/prted/pmix/pmix_server_notify.c``), thread-shifts them, and answers
+success without recording anything: every notification a daemon originates is
+xcast to the whole DVM and every daemon hands it to its own PMIx server,
+which filters it against its clients' registrations there.
+
+That is correct — no event is lost, and none is delivered to a process that
+did not ask — and it is why the arms have been empty for as long as they have
+existed.  What it costs is a broadcast per event whether or not any process
+in the DVM wants the code.  Using the registrations would mean each daemon
+keeping the union of its clients' codes, propagating that set on change, and
+consulting it before the xcast in ``_notify_event()`` — a DVM-wide replicated
+set that has to be right under grow, shrink and daemon loss, which is
+considerably more machinery than the broadcast it saves.  It has not been
+judged worth it, and the empty arms are the record of the decision rather
+than of an oversight.
+
+**A launcher's fork/exec agent directive is read and dropped.**  A tool that
+launches ``prte`` through PMIx may hand it launch directives, and the one
+``prte()`` (``src/prted/prte.c``) ever looked for was
+``PMIX_FORKEXEC_AGENT``: it did the ``PMIx_Get``, released the value, and
+carried on, so the directive had no effect and nothing said so.  The ``Get``
+has been removed, since keeping it made the code read as though the
+directive were honored.
+
+Honoring it is more than restoring the call.  The agent is used by whichever
+daemon forks the process, and each daemon reads its own from its own MCA
+state (``odls_base_exec_agent``, ``prte_odls_globals.exec_agent``) — so a
+value learned by the HNP has to be propagated, either into the daemons'
+environment at launch or as an attribute on the daemon job object that the
+odls consults ahead of its MCA value.  There is already a per-job
+``PRTE_JOB_EXEC_AGENT`` for the application job, which is the shape to
+follow; what is absent is the DVM-wide equivalent and the decision about
+which of the two should win.
+
+**A tool forwards signals from the signal handler itself, which is not
+async-signal-safe.**  Every forwardable signal is forwarded by default, and
+both tool bodies take them with ``signal()`` and do the work in the handler:
+``signal_forward_callback()`` in ``src/prted/prun_common.c`` calls
+``PMIx_Job_control``, and its counterpart in ``src/prted/prte.c`` calls
+``PMIx_Job_control_nb``.  Neither is async-signal-safe - both take locks,
+allocate, and write to a socket - and neither is the ``fprintf`` beside
+them.
+
+Note what the non-blocking form did and did not fix.  Moving ``prte.c`` to
+``PMIx_Job_control_nb`` removed a *different* deadlock: the blocking call
+was made from the thread that drives ``prte_event_base``, and waited for a
+completion only that thread could produce.  This one is still open, and it
+is open in both files.  Neither PMIx nor PRRTE blocks signals in its
+progress threads, so the kernel may deliver to any thread - including one
+already inside PMIx holding the lock the handler is about to want.  The
+window is real rather than theoretical: the main thread is inside PMIx for
+the whole of ``PMIx_Spawn``, which covers mapping and launching the job.
+
+The fix is not a smaller call.  It is to stop doing the work in the
+handler: the handler should ``write()`` a byte to a self-pipe - which is
+async-signal-safe and is already the pattern ``prte.c``'s
+``abort_signal_callback()`` uses for ctrl-c, via ``term_pipe`` - and the
+forwarding should happen on a thread that can safely make the call.  That
+is easy in ``prte.c``, which drives an event base and can take a signal
+event on it.  It is the harder half in ``prun_common.c``, whose main thread
+spends the job parked in ``PRTE_PMIX_WAIT_THREAD``: it has no event base of
+its own, so it needs either one or a thread whose job is to drain that
+pipe.  Because the answer differs between the two files and changes how
+every PRRTE tool takes a signal, it is recorded here rather than done
+alongside an unrelated fix.
+
+**Two resource-usage queries are recognized and answer nothing.**
+``PMIX_QUERY_PROC_RESOURCE_USAGE`` and ``PMIX_QUERY_NODE_RESOURCE_USAGE``
+have arms of their own in ``_query()``
+(``src/prted/pmix/pmix_server_queries.c``) and both arms are empty.  PRRTE
+collects no resource usage: the odls knows a child's pid and its exit code
+and nothing about what it consumed while it ran, and a daemon samples
+nothing about its node beyond the topology it discovered at startup.
+
+Having the arms rather than not having them changes what the caller is
+told, and for the worse.  The default arm answers
+``PMIX_ERR_NOT_SUPPORTED``, which is the truth; falling into an empty arm
+that adds no result makes the query come back ``PMIX_ERR_NOT_FOUND``,
+which says the DVM looked and found nothing.  Whoever implements these
+should either fill them in or delete them, and until then the honest
+reading of them is that they are placeholders for a sampling path that was
+never built - one that would need a per-proc collector in the odls and a
+node-level one in each daemon, plus a decision about how often either runs.
 
 Test coverage
 -------------
@@ -203,6 +404,30 @@ topology file instead.  Nor is ``prte_hwloc_print()`` exercised against a
 machine of a few thousand PUs, which is the width its cpuset buffer is sized
 for (``src/hwloc/AGENTS.md``).
 
+**Session control over every session, relayed from a non-master daemon.**
+That combination is the one path through ``pmix_server_session.c`` that runs
+``apply_to_session`` more than once per request, and it is what made a
+use-after-free possible there: the answer for the second session was built
+out of strings pointing into the info array the first answer had already
+freed.  ``contrib/dockerswarm``'s ``test_session`` covers a relayed request
+and covers operations on one named session, but never the two together, so
+the fix is argued rather than demonstrated.  The case is cheap —
+``examples/sessionctrl.c`` already takes a session id, so it needs a
+``UINT32_MAX`` spelling, two sessions instantiated by the same requestor,
+and the request issued from a node that is not the master.
+
+**``prte_pmix_server_register_tool()`` past its early returns.**  The unit
+test (``test_tool_registration``) pins the three decisions the function
+makes before it needs a live PMIx server: the rank screen, the refusal of a
+namespace PRRTE will not file, and the already-registered short circuit.
+Everything after that — including the missing-command-line case, where PMIx
+sent no ``PMIX_CMD_LINE`` because it could not read its own argv — ends in
+``PMIx_server_register_nspace`` and so cannot be reached from
+``test/unit/prted``, which initializes no server.  Nor does the harness
+produce it: PMIx on Linux always finds ``/proc/self/cmdline``, so the tool
+always sends one.  What would cover it is a client that attaches with
+``PMIx_tool_init`` and composes its own connection info array.
+
 **The XML arm, and the copy constructors.**  In
 ``src/runtime/data_type_support/``, the print functions' XML output has no
 test, and ``prte_job_copy`` / ``prte_proc_copy`` have no callers to be tested
@@ -232,6 +457,12 @@ the marker is stale.
      - one bootstrap option is parsed and not plumbed
    * - ``mca/ras/flux/ras_flux_module.c``, ``modify``
      - ``ras/flux`` has no ``modify()``
+   * - ``prted/pmix/pmix_server_notify.c``, ``_register_events``,
+       ``_deregister_events``
+     - event registration is accepted and discarded
+   * - ``prted/pmix/pmix_server_queries.c``, ``_query``,
+       ``PMIX_QUERY_*_RESOURCE_USAGE``
+     - two resource-usage queries are recognized and answer nothing
 
 Two families of marker are **not** ours, and are deliberately absent from
 that table: the ``TODO`` comments in ``hostfile_lex.c`` and
@@ -270,6 +501,28 @@ does.
    * - subsystem
      - last reviewed
      - since
+   * - ``src/grpcomm``
+     - 2026-08-25 (round 4)
+     - nothing
+   * - ``src/prted/pmix``
+     - 2026-08-25
+     - nothing
+   * - ``src/prted`` (excluding ``pmix/``)
+     - 2026-08-25
+     - nothing.  All four of ``prte.c``, ``prted_comm.c``,
+       ``prte_app_parse.c`` and ``prun_common.c``; with the row above it,
+       the directory is now reviewed end to end.
+   * - ``src/mca/ras/base``
+     - 2026-08-26
+     - nothing.  The framework's own four files only — the driver, the
+       node insert, the framework hooks and the selector.  The ``ras``
+       *components* are not covered by this and stay in the table below.
+   * - ``src/mca/ras/pmix``
+     - 2026-08-26
+     - nothing.  Both files.  Note that nothing automated exercises this
+       component's one real path: there is no PMIx scheduler in any
+       harness, so the review is a reading plus what ``make check`` can
+       reach through the module vtable.
    * - ``src/event``
      - 2026-07-31
      - nothing
@@ -307,19 +560,7 @@ is not a marginal case.
    * - subsystem
      - last reviewed
      - since
-   * - ``src/grpcomm``
-     - 2026-08-02 (round 3)
-     - The subsystem was then taken out of MCA and rebuilt at a new path
-       (``src/mca/grpcomm`` became ``src/grpcomm``), collective movements
-       were added and most of them removed again, and the xcast was
-       reworked twice.  Every line is now at an address the review never
-       saw.  **Re-review this one first.**
-   * - ``src/prted``
-     - 2026-07-30
-     - 43 commits, +3,187/-482.  The PMIx server host module
-       (``src/prted/pmix``) absorbed most of the launch-message work, the
-       lazy proc-data derivation, and the tool-connection data server.
-   * - ``src/mca/ras``
+   * - ``src/mca/ras`` (components only; see ``base/`` above)
      - 2026-07-26
      - 44 commits, +2,093/-494.  Elastic extend/release, the SLURM
        ``--json`` parser and its version gate, node reservation.
@@ -657,7 +898,8 @@ takes more off this traffic than aggregating it ever would have.
 **Lazy proc-data registration: the withholding half.**  The *deriving*
 half is in: ``dmodex_req`` answers a request for one of the placement keys
 out of ``jdata->procs[rank]`` rather than going to the hosting daemon
-(``prte_pmix_lazy_procdata``, on by default).  The *withholding* half is not,
+(unconditionally — the MCA parameter that used to gate it is gone, having
+only ever controlled the requesting side).  The *withholding* half is not,
 and not by omission from the design — the commit that landed the derivation
 does not touch ``pmix_server_register_fns.c`` at all.  That file's per-proc
 loop still emits a ``PMIX_PROC_INFO_ARRAY`` for **every** proc in the job on
@@ -678,8 +920,7 @@ anyone spends effort on the other half.  Measured with
 job where it is — at eight ranks over four nodes, with
 ``--prtemca prte_pmix_server_verbose 2``, the twenty-four peer lookups split
 six answered by the derivation and eighteen by a wire round trip to the
-hosting daemon; with ``prte_pmix_lazy_procdata 0`` it is zero and
-twenty-four.  Every one of the six is on the master, and every one is for
+hosting daemon.  Every one of the six is on the master, and every one is for
 ``PMIX_RANK``.  That is the only key PMIx never has: it consumes the rank
 entry as the array's identifier rather than storing it.  Everything else the
 eager registration publishes is found locally and never reaches the

@@ -204,11 +204,12 @@ pmix_status_t prte_ds_lookup(pmix_proc_t *sender, int room_number,
                 wait = true;
             } else if (PMIx_Check_key(info[n].key, PMIX_RANGE)) {
                 range = info[n].value.data.range;
-            } else if (PMIx_Check_key(info[n].key, PMIX_REQUESTOR)) {
-                /* a relay looking up on behalf of a process in its own DVM */
-                prte_ds_check_requestor(&requestor, &info[n]);
             }
         }
+        /* a relay looking up on behalf of a process in its own DVM.  After
+         * the scan: the uid PMIx appended is the RELAY's, and the access
+         * rules have to be answered about the process actually asking. */
+        prte_ds_check_requestor(&requestor, &uid, &gid, info, ninfo);
         /* ignore anything else for now */
         PMIX_INFO_FREE(info, ninfo);
     }
@@ -276,9 +277,34 @@ pmix_status_t prte_ds_lookup(pmix_proc_t *sender, int room_number,
                                         "%s data server: adding %s to data from %s",
                                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), ds1->info.key,
                                         PRTE_NAME_PRINT(&data->owner));
+                    /* it was of use to somebody, so the retention timeout
+                     * starts again from here.  Both places that answer a
+                     * lookup have to do this - the other is ds_publish.c,
+                     * where a publish satisfies a parked request */
+                    data->last_access = time(NULL);
                     if (PMIX_PERSIST_FIRST_READ == data->persistence) {
                         pmix_list_remove_item(&data->info, &ds1->super);
                         PMIX_RELEASE(ds1);
+                        /* An item that has given up its last key is no
+                         * longer holding anything, and has to leave the
+                         * store rather than sit in it empty.  The publish
+                         * side has always done this where it satisfies a
+                         * parked request; here the object was left behind,
+                         * so a FIRST_READ item that was read by an ordinary
+                         * lookup stayed in the store as an empty shell -
+                         * matching nothing, answering nothing, and removed
+                         * only by a purge.
+                         *
+                         * "data" is the loop variable of the enclosing scan
+                         * over the store, so nothing may touch it after
+                         * this; the break below is what makes that safe. */
+                        if (0 == pmix_list_get_size(&data->info)) {
+                            prte_ds_drop(data);
+                            data = NULL;
+                        } else {
+                            /* it shrank: recharge what is left of it */
+                            prte_ds_charge(data);
+                        }
                     }
                     pmix_list_append(&answers, &rinfo->super);
                     // can only find it once - keys are required to be globally unique

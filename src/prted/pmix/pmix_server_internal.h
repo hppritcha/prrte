@@ -40,6 +40,7 @@
 #endif
 #include <pmix_server.h>
 
+#include "src/class/pmix_bitmap.h"
 #include "src/class/pmix_hotel.h"
 #include "src/event/event-internal.h"
 #include "src/mca/base/pmix_base.h"
@@ -49,6 +50,7 @@
 #include "src/util/proc_info.h"
 #include "types.h"
 
+#include "src/rml/rml_types.h"
 #include "src/runtime/prte_globals.h"
 #include "src/threads/pmix_threads.h"
 
@@ -76,6 +78,9 @@ typedef struct {
     bool launcher;
     bool scheduler;
     bool copy;  // info array has been copied and must be released
+    /* this request cleared prte_dvm_ready and parked the requesting job, so
+     * whoever fails it owes both back - see prte_ras_base_modify() */
+    bool dvm_held;
     bool moncopy;  // monitor was allocated and must be released
     bool dircopy;   // directives array has been copied and must be released
     uid_t uid;
@@ -92,6 +97,22 @@ typedef struct {
     size_t sz;
     uint32_t ndaemons;
     uint32_t nreported;
+    uint32_t nsuccess;
+    /* Which daemons a fan-out-and-count operation is waiting on, and which
+     * of them have been accounted for.  Both are indexed by daemon vpid and
+     * are used only by the monitor collective; every other request leaves
+     * them as the constructor makes them, which costs nothing - a bitmap is
+     * usable empty and set_bit grows it from nothing.
+     *
+     * Two sets rather than a counter because a daemon failure has to be
+     * accounted exactly once, and a bare count cannot say whether the daemon
+     * that just died had already reported (in which case there is nothing to
+     * adjust) or had not (in which case it never will).  Recording the
+     * identity also makes the accounting idempotent, which it has to be: the
+     * routing tree's fault handler fires twice for every death, once at
+     * LOCAL scope and again at GLOBAL. */
+    pmix_bitmap_t expected_dmns;
+    pmix_bitmap_t reported_dmns;
     pmix_data_range_t range;
     pmix_proc_t proxy;
     pmix_proc_t target;
@@ -110,6 +131,16 @@ typedef struct {
     pmix_info_cbfunc_t infocbfunc;
     void *cbdata;
     void *rlcbdata;
+    /* A PMIx query relayed to the DVM master because this daemon does not
+     * hold the state it asks for - see pmix_server_queries.c.  On the asking
+     * daemon these carry the client's caddy, the results already gathered
+     * locally (a PMIx info list the master's reply is merged into), and the
+     * number of keys the client asked for, which is what partial success is
+     * measured against.  On the master, qcaddy holds the caddy whose unpacked
+     * query array must be freed once the answer has been sent. */
+    void *qcaddy;
+    void *qresults;
+    size_t nkeys;
 } prte_pmix_server_req_t;
 PMIX_CLASS_DECLARATION(prte_pmix_server_req_t);
 
@@ -269,6 +300,12 @@ PRTE_EXPORT extern pmix_status_t pmix_server_dmodex_req_fn(const pmix_proc_t *pr
                                                            const pmix_info_t info[], size_t ninfo,
                                                            pmix_modex_cbfunc_t cbfunc,
                                                            void *cbdata);
+/* Attach to the data server named by prte_data_server_uri, if that has not
+ * already happened.  Idempotent.  The master needs this even when it has no
+ * publishing client of its own: it is the only daemon holding the tool
+ * connection every other daemon's request is relayed over. */
+PRTE_EXPORT int prte_pmix_server_init_pubsub(void);
+
 PRTE_EXPORT extern pmix_status_t pmix_server_publish_fn(const pmix_proc_t *proc,
                                                         const pmix_info_t info[], size_t ninfo,
                                                         pmix_op_cbfunc_t cbfunc, void *cbdata);
@@ -350,6 +387,11 @@ PRTE_EXPORT extern pmix_status_t pmix_server_stdin_fn(const pmix_proc_t *source,
                                                       const pmix_byte_object_t *bo,
                                                       pmix_op_cbfunc_t cbfunc, void *cbdata);
 
+/* Account a daemon departure against every outstanding monitor collective.
+ * Called from the routing tree's fault handler, on the PRRTE progress thread,
+ * once at LOCAL scope and again at GLOBAL for the same death. */
+PRTE_EXPORT void prte_pmix_server_fault_handler(const prte_rml_recovery_status_t *status);
+
 PRTE_EXPORT extern pmix_status_t pmix_server_group_fn(pmix_group_operation_t op, char *gpid,
                                                       const pmix_proc_t procs[], size_t nprocs,
                                                       const pmix_info_t directives[], size_t ndirs,
@@ -399,6 +441,16 @@ PRTE_EXPORT extern void pmix_server_tconn_return(int status, pmix_proc_t *sender
                                                  pmix_data_buffer_t *buffer, prte_rml_tag_t tg,
                                                  void *cbdata);
 
+/* A query a daemon cannot answer, relayed to the DVM master, and the answer
+ * coming back - see the block comment in pmix_server_queries.c */
+PRTE_EXPORT extern void pmix_server_query_request(int status, pmix_proc_t *sender,
+                                                  pmix_data_buffer_t *buffer, prte_rml_tag_t tg,
+                                                  void *cbdata);
+
+PRTE_EXPORT extern void pmix_server_query_resp(int status, pmix_proc_t *sender,
+                                               pmix_data_buffer_t *buffer, prte_rml_tag_t tg,
+                                               void *cbdata);
+
 PRTE_EXPORT extern int prte_pmix_server_register_tool(prte_pmix_server_req_t *cd,
                                                       pmix_op_cbfunc_t cbfunc, void *cbdata);
 
@@ -415,6 +467,21 @@ PRTE_EXPORT extern void pmix_server_alloc_request_resp(int status, pmix_proc_t *
                                                 void *cbdata);
 
 PRTE_EXPORT extern pmix_status_t prte_pmix_set_scheduler(void);
+
+/* Record the directives to hand PMIx_tool_attach_to_server when we go looking
+ * for the scheduler.  Takes ownership of the array, which must have been
+ * built with PMIX_INFO_CREATE; replaces anything recorded before.
+ *
+ * This exists because the knowledge and the call live on opposite sides of a
+ * boundary that only crosses one way.  The parameters that say where the
+ * scheduler is belong to the ras/pmix component, which may be a run-time
+ * loadable plugin - so nothing in libprrte may name its symbols - while the
+ * attach belongs here, is made once for the whole daemon, and is triggered by
+ * whichever of allocation, session control or tool connection needs a
+ * scheduler first.  The component pushes what it knows at selection time
+ * instead. */
+PRTE_EXPORT void prte_pmix_set_scheduler_directives(pmix_info_t *directives,
+                                                    size_t ndirs);
 
 /* Designate an attached server as the primary one, so that the client-side
  * PMIx calls that follow go to it.  Only one server can be primary at a
@@ -456,6 +523,14 @@ pmix_server_session_ctrl_fn(const pmix_proc_t *requestor,
                             uint32_t sessionID,
                             const pmix_info_t directives[], size_t ndirs,
                             pmix_info_cbfunc_t cbfunc, void *cbdata);
+
+/* Apply a PMIX_GROUP_LEFT notification to this daemon's copy of the group
+ * registry, dropping the departing proc from the membership we hold. The
+ * info array is the generating client's own and is validated here. Runs on
+ * the PRRTE progress thread; exported so the unit test can reach it. */
+PRTE_EXPORT extern void prte_pmix_server_group_member_left(pmix_status_t code,
+                                                           const pmix_proc_t *source,
+                                                           pmix_info_t *info, size_t ninfo);
 
 /* Interpret a PMIX_ALLOC_TIME session time limit -
  * "[[[[months:]days:]hours:]minutes:]seconds", scanned from the right - and
@@ -570,6 +645,13 @@ typedef struct {
     /* we have already looked for a scheduler to attach to and found none - do
      * not look again. See prte_pmix_set_scheduler(). */
     bool scheduler_lookup_done;
+    /* Where to look for the scheduler, as told to us by whichever component
+     * knows - ras/pmix, out of its own MCA parameters.  Empty when nobody has
+     * said anything, which is the ordinary case and leaves the attach exactly
+     * the bare rendezvous scan it has always been.  See
+     * prte_pmix_set_scheduler_directives(). */
+    pmix_info_t *scheduler_directives;
+    size_t nscheddirs;
     bool remote_connections;
     bool tool_support;
     bool require_pid_match;
@@ -591,7 +673,6 @@ typedef struct {
      * them through the direct-modex upcall.  Registering every proc in the job
      * on every daemon costs a table that grows with the total process count on
      * a node that will run a fixed slice of it. */
-    bool lazy_procdata;
     pmix_list_t psets;
     pmix_list_t groups;
     /* assemblages formed by PMIx_Connect - see prte_pmix_server_connection_t.
