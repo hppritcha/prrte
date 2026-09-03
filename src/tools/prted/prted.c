@@ -834,11 +834,35 @@ bootstrap_wait:
     }
     ret = PRTE_SUCCESS;
 
-    /* if we daemonized, then the parent from the fork is blocked
-     * waiting to hear that we are up and running - release it */
-    if (0 <= prte_state_base.parent_fd) {
-        char ok = 'K';
-        pmix_fd_write(prte_state_base.parent_fd, 1, &ok);
+    /* If we daemonized, then the parent from the fork is blocked
+     * waiting to hear that we are up and running - release it.
+     * HOWEVER: do not notify the parent if we are running under
+     * SLURM PLM. When using srun --external-launcher, srun expects
+     * to exit immediately after launching the daemon, and notifying
+     * the parent causes RML communication failures between the daemon
+     * and HNP. For SLURM, we simply close the pipe without writing
+     * to it, which allows the parent to exit when the pipe receives
+     * EOF. This works correctly because srun has already done its job
+     * of placing the daemon on the node.
+     *
+     * We detect SLURM by checking for SLURM_NODEID or SLURMD_NODENAME,
+     * which are set by srun when launching daemons. This is the same
+     * detection method used by ess/slurm component.
+     *
+     * For non-SLURM launches (SSH, etc.), the notification allows the
+     * parent process and its ssh session to exit promptly rather than
+     * waiting for the daemon's entire lifetime. */
+     if (0 <= prte_state_base.parent_fd) {
+        char *slurm_nodeid = getenv("SLURM_NODEID");
+        char *slurmd_nodename = getenv("SLURMD_NODENAME");
+
+        /* Skip parent notification if launched by SLURM */
+        if (NULL == slurm_nodeid && NULL == slurmd_nodename) {
+            /* Not SLURM - notify parent that daemon is ready */
+            char ok = 'K';
+            pmix_fd_write(prte_state_base.parent_fd, 1, &ok);
+        }
+        /* Always close the fd whether we wrote to it or not */
         close(prte_state_base.parent_fd);
         prte_state_base.parent_fd = -1;
     }
