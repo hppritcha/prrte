@@ -449,10 +449,20 @@ static void vm_ready(int fd, short args, void *cbdata)
         }
     }
     if (PMIX_CHECK_NSPACE(PRTE_PROC_MY_NAME->nspace, caddy->jdata->nspace)) {
+        bool first_ready = !prte_dvm_started;
+
         prte_dvm_ready = true;
-        /* notify that the vm is ready */
+        /* and latch that we have started at least once - unlike the flag
+         * above, this one is never cleared.  prte_dvm_ready goes false again
+         * on every grow, session instantiate and teardown, so it says "is a
+         * size change in flight", not "have we started" */
+        prte_dvm_started = true;
+        /* notify that the vm is ready - once.  This state is re-entered at
+         * the end of every grow, and a persistent DVM announcing itself ready
+         * again each time a node is added is noise on a terminal the user is
+         * no longer watching for startup */
         if (0 > prte_state_base.parent_fd) {
-            if (prte_state_base.ready_msg && prte_persistent) {
+            if (first_ready && prte_state_base.ready_msg && prte_persistent) {
                 fprintf(stdout, "DVM ready\n");
                 fflush(stdout);
             }
@@ -779,9 +789,6 @@ static void check_complete_resume(int fd, short args, void *cbdata)
     prte_job_map_t *map;
     int32_t index;
     pmix_proc_t pname;
-    uint8_t command = PRTE_PMIX_PURGE_PROC_CMD;
-    size_t ninfo;
-    pmix_data_buffer_t *buf;
     pmix_pointer_array_t procs;
     prte_app_context_t *app;
     hwloc_obj_t obj;
@@ -876,48 +883,13 @@ static void check_complete_resume(int fd, short args, void *cbdata)
         return;
     }
 
-    if (NULL != prte_data_server_uri) {
-        /* tell the data server to purge any data from this nspace */
-        PMIX_DATA_BUFFER_CREATE(buf);
-        /* room number is ignored, but has to be included for pack sequencing */
-        i = 0;
-        rc = PMIx_Data_pack(NULL, buf, &i, 1, PMIX_INT);
-        if (PMIX_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
-            PMIX_DATA_BUFFER_RELEASE(buf);
-            goto release;
-        }
-        rc = PMIx_Data_pack(NULL, buf, &command, 1, PMIX_UINT8);
-        if (PMIX_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
-            PMIX_DATA_BUFFER_RELEASE(buf);
-            goto release;
-        }
-        /* pack the nspace to be purged */
-        pname.rank = PMIX_RANK_WILDCARD;
-        rc = PMIx_Data_pack(NULL, buf, &pname, 1, PMIX_PROC);
-        if (PMIX_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
-            PMIX_DATA_BUFFER_RELEASE(buf);
-            goto release;
-        }
-        /* no directives of our own - the count still has to be there, as
-         * the command carries one and the reader unpacks it
-         * unconditionally */
-        ninfo = 0;
-        rc = PMIx_Data_pack(NULL, buf, &ninfo, 1, PMIX_SIZE);
-        if (PMIX_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
-            PMIX_DATA_BUFFER_RELEASE(buf);
-            goto release;
-        }
-        /* send it to the data server */
-        PRTE_RML_RELIABLE_SEND(rc, PRTE_PROC_MY_NAME->rank, buf, PRTE_RML_TAG_DATA_SERVER);
-        if (PRTE_SUCCESS != rc) {
-            PRTE_ERROR_LOG(rc);
-            PMIX_DATA_BUFFER_RELEASE(buf);
-        }
-    }
+    /* Tell the data server the namespace is over, so it can drop what this
+     * job published that was not to outlive it.  This used to be an
+     * open-coded copy of the same call, sent only when an external data
+     * server was configured; the built-in one - the usual case - was
+     * therefore never told a job had ended, and nothing was ever reclaimed
+     * from it short of the DVM shutting down. */
+    prte_state_base_purge_nspace(jdata->nspace);
 
 release:
     /* Release the resources used by this job. Since some errmgrs may want

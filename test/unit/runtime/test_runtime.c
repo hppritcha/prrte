@@ -1157,7 +1157,24 @@ static int test_data_server_objects(void)
           PMIX_RANK_UNDEF == obj->owner.rank && 0 == strlen(obj->owner.nspace));
     CHECK("ds: a new data object defaults to session range",
           PMIX_RANGE_SESSION == obj->range);
+    /* PMIx adds no persistence of its own before handing a publish to the
+     * host, so the constructor's value is the one that governs.  It is
+     * deliberately NOT the Standard's default of PMIX_PERSIST_APP: APP
+     * means the publishing process's APPLICATION, and an MPMD job's
+     * applications need not end together, so applying that literally would
+     * shorten the retention every unmarked publish has been getting.
+     * NSPACE is that same lifetime, said out loud. */
+    CHECK("ds: a new data object defaults to nspace persistence",
+          PMIX_PERSIST_NSPACE == obj->persistence);
     CHECK("ds: a new data object has no uid", UINT32_MAX == obj->uid);
+    /* neither of the two lifetimes a proc name cannot express is known
+     * until a publisher is resolved against its own job */
+    CHECK("ds: a new data object has no application", UINT32_MAX == obj->app_idx);
+    CHECK("ds: a new data object has no session", UINT32_MAX == obj->session_id);
+    /* the retention timeout reads this, and PMIX_NEW does not zero what it
+     * hands back - an unstamped item would be arbitrarily old or arbitrarily
+     * young depending on the heap */
+    CHECK("ds: a new data object has a stamped access time", 0 != obj->last_access);
     PMIX_RELEASE(obj);
 
     req = PMIX_NEW(prte_data_req_t);
@@ -1168,6 +1185,93 @@ static int test_data_server_objects(void)
     CHECK("ds: a new request has no keys", NULL == req->keys);
     /* the destructor free()s keys - it must not free garbage */
     PMIX_RELEASE(req);
+
+    return failures;
+}
+
+/* The persistence ordering ds_purge applies when a lifetime ends.  Worth
+ * pinning down because the values are NOT a usable numeric ladder:
+ * PMIX_PERSIST_INDEF is 0 and outlives every other value, so any attempt to
+ * decide this with a comparison gets it exactly backwards. */
+static int test_data_server_persistence(void)
+{
+    int failures = 0;
+
+    /* no horizon: an explicit PMIx_Unpublish(NULL, ...) takes everything
+     * the caller published, however long it asked for it to be kept */
+    CHECK("persist: no horizon takes INDEF",
+          prte_data_server_expires_by(PMIX_PERSIST_INDEF, PMIX_PERSIST_INVALID));
+    CHECK("persist: no horizon takes SESSION",
+          prte_data_server_expires_by(PMIX_PERSIST_SESSION, PMIX_PERSIST_INVALID));
+
+    CHECK("persist: no horizon takes FIRST_READ",
+          prte_data_server_expires_by(PMIX_PERSIST_FIRST_READ, PMIX_PERSIST_INVALID));
+
+    /* a process ended */
+    CHECK("persist: PROC goes at the PROC horizon",
+          prte_data_server_expires_by(PMIX_PERSIST_PROC, PMIX_PERSIST_PROC));
+    CHECK("persist: APP stays at the PROC horizon",
+          !prte_data_server_expires_by(PMIX_PERSIST_APP, PMIX_PERSIST_PROC));
+    CHECK("persist: SESSION stays at the PROC horizon",
+          !prte_data_server_expires_by(PMIX_PERSIST_SESSION, PMIX_PERSIST_PROC));
+
+    /* an application ended - what a terminating job reports */
+    CHECK("persist: PROC goes at the APP horizon",
+          prte_data_server_expires_by(PMIX_PERSIST_PROC, PMIX_PERSIST_APP));
+    CHECK("persist: APP goes at the APP horizon",
+          prte_data_server_expires_by(PMIX_PERSIST_APP, PMIX_PERSIST_APP));
+    CHECK("persist: SESSION stays at the APP horizon",
+          !prte_data_server_expires_by(PMIX_PERSIST_SESSION, PMIX_PERSIST_APP));
+    CHECK("persist: INDEF stays at the APP horizon",
+          !prte_data_server_expires_by(PMIX_PERSIST_INDEF, PMIX_PERSIST_APP));
+
+    /* a namespace ended - every application of one job */
+    CHECK("persist: PROC goes at the NSPACE horizon",
+          prte_data_server_expires_by(PMIX_PERSIST_PROC, PMIX_PERSIST_NSPACE));
+    CHECK("persist: APP goes at the NSPACE horizon",
+          prte_data_server_expires_by(PMIX_PERSIST_APP, PMIX_PERSIST_NSPACE));
+    CHECK("persist: NSPACE goes at the NSPACE horizon",
+          prte_data_server_expires_by(PMIX_PERSIST_NSPACE, PMIX_PERSIST_NSPACE));
+    CHECK("persist: SESSION stays at the NSPACE horizon",
+          !prte_data_server_expires_by(PMIX_PERSIST_SESSION, PMIX_PERSIST_NSPACE));
+    CHECK("persist: INDEF stays at the NSPACE horizon",
+          !prte_data_server_expires_by(PMIX_PERSIST_INDEF, PMIX_PERSIST_NSPACE));
+
+    /* ...and one application of it ending does NOT take the job's own data.
+     * This is the distinction the NSPACE policy exists for: an MPMD job's
+     * apps share a namespace and need not end together. */
+    CHECK("persist: NSPACE stays at the APP horizon",
+          !prte_data_server_expires_by(PMIX_PERSIST_NSPACE, PMIX_PERSIST_APP));
+    CHECK("persist: NSPACE stays at the PROC horizon",
+          !prte_data_server_expires_by(PMIX_PERSIST_NSPACE, PMIX_PERSIST_PROC));
+    CHECK("persist: no horizon takes NSPACE",
+          prte_data_server_expires_by(PMIX_PERSIST_NSPACE, PMIX_PERSIST_INVALID));
+
+    /* the session ended */
+    CHECK("persist: NSPACE goes at the SESSION horizon",
+          prte_data_server_expires_by(PMIX_PERSIST_NSPACE, PMIX_PERSIST_SESSION));
+    CHECK("persist: SESSION goes at the SESSION horizon",
+          prte_data_server_expires_by(PMIX_PERSIST_SESSION, PMIX_PERSIST_SESSION));
+    CHECK("persist: APP goes at the SESSION horizon",
+          prte_data_server_expires_by(PMIX_PERSIST_APP, PMIX_PERSIST_SESSION));
+    /* the one value no lifetime reclaims */
+    CHECK("persist: INDEF stays at the SESSION horizon",
+          !prte_data_server_expires_by(PMIX_PERSIST_INDEF, PMIX_PERSIST_SESSION));
+
+    /* ...and the other one.  FIRST_READ's criterion is the first access,
+     * which no lifetime ending satisfies: an item published for a reader
+     * that has not started yet must survive its publisher, or a handover
+     * from one generation of a job to the next cannot work at all.  A
+     * publisher wanting its data gone when it goes away says PROC or APP.
+     * This is issue #2733, and every horizon used to take it. */
+    CHECK("persist: FIRST_READ stays at the PROC horizon",
+          !prte_data_server_expires_by(PMIX_PERSIST_FIRST_READ, PMIX_PERSIST_PROC));
+    CHECK("persist: FIRST_READ stays at the APP horizon",
+          !prte_data_server_expires_by(PMIX_PERSIST_FIRST_READ, PMIX_PERSIST_APP));
+    CHECK("persist: FIRST_READ stays at the SESSION horizon",
+          !prte_data_server_expires_by(PMIX_PERSIST_FIRST_READ, PMIX_PERSIST_SESSION));
+    CHECK("persist: FIRST_READ stays at the NSPACE horizon",
+          !prte_data_server_expires_by(PMIX_PERSIST_FIRST_READ, PMIX_PERSIST_NSPACE));
 
     return failures;
 }
@@ -1413,12 +1517,80 @@ static int test_data_server_search_range(void)
  * another DVM attached to us as a tool (see ds_relay.c); an application
  * process making the same claim is trying to publish - or unpublish - under
  * a peer's identity, so the claim has to be dropped rather than honored. */
+/* Who may REMOVE an item.  Ownership is the publishing user, which is a
+ * different question from access - see the two directions asserted below. */
+static int test_data_server_ownership(void)
+{
+    int failures = 0;
+    prte_data_object_t *data;
+
+    data = PMIX_NEW(prte_data_object_t);
+    PMIX_LOAD_PROCID(&data->owner, "publisher.job", 2);
+    data->uid = 500;
+    data->gid = 20;
+
+    CHECK("owns: the publishing uid and gid may remove",
+          prte_data_server_owns(500, 20, data));
+
+    /* The point of keying on the user rather than the process: the
+     * publisher itself is gone, and a later job of the same user - a
+     * different namespace entirely - has to be able to take the name back.
+     * There is no process identity in this call at all. */
+    CHECK("owns: another process of the same user may remove",
+          prte_data_server_owns(500, 20, data));
+
+    CHECK("owns: a different uid may not remove",
+          !prte_data_server_owns(501, 20, data));
+    CHECK("owns: a different gid may not remove",
+          !prte_data_server_owns(500, 21, data));
+
+    /* The gid took an openpmix change to be handed over at all, and where
+     * it is missing both sides read UINT32_MAX.  Degrade to uid alone
+     * rather than locking the owner out of its own data. */
+    CHECK("owns: an unknown requestor gid degrades to uid alone",
+          prte_data_server_owns(500, UINT32_MAX, data));
+    data->gid = UINT32_MAX;
+    CHECK("owns: an unknown stored gid degrades to uid alone",
+          prte_data_server_owns(500, 20, data));
+    CHECK("owns: ...and the uid still has to match",
+          !prte_data_server_owns(501, 20, data));
+
+    /* An identity we do not have is not an identity that matches: two
+     * unknowns comparing equal would let anybody remove anybody's data. */
+    data->uid = UINT32_MAX;
+    CHECK("owns: an unknown stored uid matches nobody",
+          !prte_data_server_owns(UINT32_MAX, UINT32_MAX, data));
+    CHECK("owns: ...not even a real uid",
+          !prte_data_server_owns(500, 20, data));
+    data->uid = 500;
+    CHECK("owns: an unknown requestor uid owns nothing",
+          !prte_data_server_owns(UINT32_MAX, 20, data));
+
+    /* Ownership and access are different questions.  An accessor list
+     * widens who may READ and confers no removal; and the sharper case,
+     * an owner whose own list excludes it may still remove what it cannot
+     * read.  Both are asserted here by the absence of any accessor list
+     * from this predicate at all: it reads data->uid and data->gid, never
+     * data->auids or data->agids. */
+    data->auids = (uint32_t *) malloc(sizeof(uint32_t));
+    data->auids[0] = 501;
+    data->nauids = 1;
+    CHECK("owns: a uid on the accessor list still may not remove",
+          !prte_data_server_owns(501, 20, data));
+    CHECK("owns: an owner its own accessor list excludes may still remove",
+          prte_data_server_owns(500, 20, data));
+
+    PMIX_RELEASE(data);
+    return failures;
+}
+
 static int test_data_server_requestor(void)
 {
     int failures = 0;
     prte_job_t *toolj, *appj;
     pmix_proc_t owner, behalf;
-    pmix_info_t info;
+    pmix_info_t info[3];
+    uint32_t uid, gid, claim;
 
     reset_globals();
 
@@ -1432,35 +1604,65 @@ static int test_data_server_requestor(void)
 
     /* a tool may act for somebody else */
     PMIX_LOAD_PROCID(&owner, "relay.tool", 0);
-    PMIX_INFO_LOAD(&info, PMIX_REQUESTOR, &behalf, PMIX_PROC);
-    prte_ds_check_requestor(&owner, &info);
+    PMIX_INFO_LOAD(&info[0], PMIX_REQUESTOR, &behalf, PMIX_PROC);
+    prte_ds_check_requestor(&owner, NULL, NULL, info, 1);
     CHECK("requestor: a tool's claim is honored", PMIX_CHECK_PROCID(&owner, &behalf));
-    PMIX_INFO_DESTRUCT(&info);
+    PMIX_INFO_DESTRUCT(&info[0]);
 
     /* an application process may not */
     PMIX_LOAD_PROCID(&owner, "some.app", 1);
-    PMIX_INFO_LOAD(&info, PMIX_REQUESTOR, &behalf, PMIX_PROC);
-    prte_ds_check_requestor(&owner, &info);
+    PMIX_INFO_LOAD(&info[0], PMIX_REQUESTOR, &behalf, PMIX_PROC);
+    prte_ds_check_requestor(&owner, NULL, NULL, info, 1);
     CHECK("requestor: an application's claim is refused",
           PMIX_CHECK_NSPACE(owner.nspace, "some.app") && 1 == owner.rank);
-    PMIX_INFO_DESTRUCT(&info);
+    PMIX_INFO_DESTRUCT(&info[0]);
 
     /* neither may a namespace we have never heard of - a job object is what
      * says what the caller is, and without one there is nothing to trust */
     PMIX_LOAD_PROCID(&owner, "unknown.job", 4);
-    PMIX_INFO_LOAD(&info, PMIX_REQUESTOR, &behalf, PMIX_PROC);
-    prte_ds_check_requestor(&owner, &info);
+    PMIX_INFO_LOAD(&info[0], PMIX_REQUESTOR, &behalf, PMIX_PROC);
+    prte_ds_check_requestor(&owner, NULL, NULL, info, 1);
     CHECK("requestor: an unknown namespace's claim is refused",
           PMIX_CHECK_NSPACE(owner.nspace, "unknown.job"));
-    PMIX_INFO_DESTRUCT(&info);
+    PMIX_INFO_DESTRUCT(&info[0]);
 
     /* a directive of the wrong type is ignored rather than dereferenced */
     PMIX_LOAD_PROCID(&owner, "relay.tool", 0);
-    PMIX_INFO_LOAD(&info, PMIX_REQUESTOR, "not-a-procid", PMIX_STRING);
-    prte_ds_check_requestor(&owner, &info);
+    PMIX_INFO_LOAD(&info[0], PMIX_REQUESTOR, "not-a-procid", PMIX_STRING);
+    prte_ds_check_requestor(&owner, NULL, NULL, info, 1);
     CHECK("requestor: a mistyped directive is ignored",
           PMIX_CHECK_NSPACE(owner.nspace, "relay.tool"));
-    PMIX_INFO_DESTRUCT(&info);
+    PMIX_INFO_DESTRUCT(&info[0]);
+
+    /* The identity a relay claims includes the uid and gid, and has to:
+     * ownership is decided by the publishing user, and what PMIx appends to
+     * a relayed request is the RELAYING daemon's identity, not the
+     * originating process's. */
+    claim = 4242;
+    PMIX_LOAD_PROCID(&owner, "relay.tool", 0);
+    uid = 7; gid = 9;
+    PMIX_INFO_LOAD(&info[0], PMIX_REQUESTOR, &behalf, PMIX_PROC);
+    PMIX_INFO_LOAD(&info[1], PRTE_PUBLISH_REQ_UID, &claim, PMIX_UINT32);
+    PMIX_INFO_LOAD(&info[2], PRTE_PUBLISH_REQ_GID, &claim, PMIX_UINT32);
+    prte_ds_check_requestor(&owner, &uid, &gid, info, 3);
+    CHECK("requestor: a tool's claimed uid is honored", 4242 == uid);
+    CHECK("requestor: a tool's claimed gid is honored", 4242 == gid);
+    PMIX_INFO_DESTRUCT(&info[0]);
+    PMIX_INFO_DESTRUCT(&info[1]);
+    PMIX_INFO_DESTRUCT(&info[2]);
+
+    /* ...and an application process claiming a uid is refused it, which is
+     * the half that matters: a uid it could assert is a uid whose published
+     * data it could remove */
+    PMIX_LOAD_PROCID(&owner, "some.app", 1);
+    uid = 7; gid = 9;
+    PMIX_INFO_LOAD(&info[0], PRTE_PUBLISH_REQ_UID, &claim, PMIX_UINT32);
+    PMIX_INFO_LOAD(&info[1], PRTE_PUBLISH_REQ_GID, &claim, PMIX_UINT32);
+    prte_ds_check_requestor(&owner, &uid, &gid, info, 2);
+    CHECK("requestor: an application's claimed uid is refused", 7 == uid);
+    CHECK("requestor: an application's claimed gid is refused", 9 == gid);
+    PMIX_INFO_DESTRUCT(&info[0]);
+    PMIX_INFO_DESTRUCT(&info[1]);
 
     reset_globals();
     return failures;
@@ -1759,9 +1961,11 @@ int main(void)
     failures += test_session_teardown();
     failures += test_exit_status();
     failures += test_data_server_objects();
+    failures += test_data_server_persistence();
     failures += test_data_server_range();
     failures += test_data_server_search_range();
     failures += test_data_server_access();
+    failures += test_data_server_ownership();
     failures += test_data_server_requestor();
     failures += test_progress_thread_cpus();
     failures += test_progress_thread_lifecycle();

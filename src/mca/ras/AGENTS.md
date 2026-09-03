@@ -432,7 +432,24 @@ input list.** Walk it carefully before touching allocation code:
   `PRTE_JOB_DO_NOT_LAUNCH` (offline mapper tests), a synthetic
   `prte_proc_t` daemon is attached to each node so the mapper sees a
   daemon without a live launch.
-- Bumps `prte_ras_base.total_slots_alloc` by each node's slots.
+- Bumps `prte_ras_base.total_slots_alloc` by each node's slots — but only
+  for a node it actually adds. A node the pool already held is skipped, so a
+  `PRTE_NODE_ADD_SLOTS` adjust applied in place does not reach the total.
+  That matters less than it looks, and it is worth knowing why before
+  "fixing" it: **the framework total is not what a job reports.**
+  `prte_ras_base_allocate` copies it into `jdata->total_slots_alloc` at
+  `ALLOCATION_COMPLETE`, and `prte_plm_base_daemons_reported` then
+  *recomputes* that field from the job's own session nodes at
+  `DAEMONS_REPORTED` — which is before anything reads it, so
+  `PMIX_UNIV_SIZE` / `PMIX_MAX_PROCS` and the packed launch message all
+  carry the recomputed figure. `prte_ras_base.total_slots_alloc` is the
+  framework's running description of the pool and nothing else.
+- **An error return does not drain the list.** The contract is "removes all
+  items", and it holds only on success: an error leaves what it had not
+  reached still on the list, so a caller must `PMIX_LIST_DESTRUCT` rather
+  than `PMIX_DESTRUCT`. The node in hand is released by `node_insert`
+  itself, since by then it is off the list and not yet in the pool and no
+  one else could.
 
 ---
 
@@ -447,6 +464,11 @@ input list.** Walk it carefully before touching allocation code:
   `SLOTS_GIVEN`, `NONUSABLE`) for that display.
 - `prte_ras_base_display_cpus(jdata, nodelist)` prints available
   processors per package for the requested nodes (`--display-cpus`).
+  It resolves each requested name with `prte_node_match()`, which is the one
+  place that knows how a name reaches a pool entry — the local-host aliases,
+  the per-node alias list, and the fact that an entry may carry no name at
+  all. It used to spell that walk out for itself and had already drifted:
+  it compared `node->name` with no NULL check.
   **Its parseable form has to parse.** It used to emit
   `<processors node=x>` — an unquoted attribute value — wrapping
   `<pkg=0 cpus=0-7>`, which is not an element at all, while
@@ -476,8 +498,101 @@ elastic-DVM or PMIx_Allocation code:
 | `prte_ras_base_complete_request()` | The heavy reservation router. For `PMIX_ALLOC_NEW`/`EXTEND` it resolves the destination `prte_session_t` (honoring `PMIX_ALLOC_TARGET`/`SHARE`/`INHERITANCE`/`ID`/`REQ_ID`), parses `PMIX_ALLOC_NODE_LIST`, inserts the nodes, and attaches them to the reservation (`add_nodes_to_session`). For `PMIX_ALLOC_RELEASE` it tears down a named reservation or xcasts a `PRTE_DAEMON_SHRINK_CMD`. Marks `PRTE_JOB_EXTEND_DVM` and re-launches daemons for grows. |
 | `prte_ras_base_release_allocation()` | Session-destruct hook: cycles modules whose `release_allocation` matches `session->alloc_module`. |
 | `prte_ras_base_shrink_complete()` | Offers a drained `prte_shrink_campaign_t` to every module's `shrink_complete`. |
-| `prte_ras_base_teardown_reservation()` | Drop a reservation's hold on its nodes (clear `node->session` back to the default pool), deregister it, and — if `return_to_scheduler` — shrink its daemon-carrying nodes out of the DVM. |
+| `prte_ras_base_teardown_reservation()` | Drop a reservation's hold on its nodes (clear `node->session` back to the default pool), deregister it, release the registry's reference on it, and — if `return_to_scheduler` — shrink its daemon-carrying nodes out of the DVM. |
 | `prte_ras_base_check_reservations_on_term()` | On namespace termination, fire each reservation's inheritance disposition (`PMIX_ALLOC_INHERIT_NONE`/`CHILD`/`CHILD_DEFAULT`/`DEFAULT`). |
+
+### A request's directives arrive from a client and are typed by a client
+
+`req->info` is the requester's own array: `pmix_server_alloc_fn` hands the
+client's `pmix_info_t[]` straight through, and nothing between there and here
+inspects it. So **never read `value.data.<member>` without first establishing
+the type**. A `PMIX_ALLOC_ID` sent as an integer, taken as `.string`, is a
+wild pointer, and the first `strdup`/`strcmp`/`PMIX_LOAD_NSPACE` of it faults
+the **HNP** — i.e. any process or tool that can connect to the DVM could take
+it down with a one-line allocation request. `ras_base_get_string()` is the
+string reader every directive in `ras_base_allocate.c` goes through, and it
+answers `PMIX_ERR_BAD_PARAM` rather than ignoring a mistyped key, because a
+caller that mistyped one needs to be told and not quietly handed a
+reservation it cannot name. `prte_ras_base_parse_node_list()` does the same
+for `PMIX_ALLOC_NODE_LIST`.
+
+`PMIX_ALLOC_INHERITANCE` has **two** legitimate spellings and both must be
+accepted: `PMIX_ALLOC_INHERIT`, the attribute's own type and the one the PMIx
+documentation's example uses, and a plain integer of some width.
+`PMIx_Value_get_number()` takes either — name `PMIX_ALLOC_INHERIT` as the
+destination type and it writes the `uint8_t` the disposition is. Read it that
+way and never off a fixed union member: the disposition decides whether a
+reservation's nodes go back to the scheduler, so it must be the one the caller
+sent and not one a type confusion produced. PRRTE carried its own reader for
+this until openpmix#4198 taught `PMIx_Value_get_number` the named integer
+types; a PMIx older than that refuses the documented spelling.
+
+### What a failed request must leave behind
+
+- **A `PMIX_ALLOC_NEW` that fails after `ras_base_prepare_grow()` created its
+  reservation unwinds it** (`prte_ras_base_teardown_reservation`, exactly as
+  `pmix_server_session.c` unwinds a half-built session — teardown drops the
+  registry's reference, which for a reservation that never launched anything
+  is the only one it has). Otherwise the requester is told the request failed,
+  never learns the allocation id, and can therefore never release a
+  reservation that is still registered and still holding a reference on the
+  owner job. Nodes an earlier `PMIX_ALLOC_NODE_LIST` already contributed stay
+  in the pool — a pool index is a `PMIX_NODEID` and is never reused — and
+  revert to the general pool still marked `PRTE_NODE_STATE_ADDED`, so the
+  next grow adopts them, which is the right answer for nodes the allocator
+  did grant.
+- **A request that parked the DVM must give it back.**
+  `prte_ras_base_add_hosts()` clears `prte_dvm_ready` and its caller parks the
+  requesting job in `prte_cache`; only the grow's `VM_READY` re-entry
+  (`state_dvm.c`) sets the flag again and drains the cache. A request that
+  fails before it ever reaches a grow therefore left that job — and every job
+  cached behind it — waiting on a DVM that would never be ready again, and
+  nothing times that out. A mistyped `--add-hostfile` path was enough. Such a
+  request is marked `dvm_held`, and `prte_ras_base_modify()`'s respond tail
+  fails the requesting job and restores the flag. The marker lives on the
+  request rather than being inferred from `prte_dvm_ready`, because that flag
+  is also false while somebody *else's* grow is in flight and this must not
+  cut that short. This is the same invariant the add-host refusal above is
+  placed to protect, on the other side of the decision: refusing before
+  posting keeps a request nothing will answer out of the machinery, and
+  `dvm_held` covers the one that was posted and then failed.
+- **A shrink that names no daemon is never broadcast.** A release may
+  legitimately name only nodes that carry none — one a previous shrink handed
+  back, one the DVM was never extended onto. Sending the command anyway is
+  not harmless: the receiver sizes its target array from the packed count and
+  PMIx refuses an unpack of zero values, so *every* daemon in the DVM logs
+  `PMIX_ERR_UNPACK_INADEQUATE_SPACE` for a command that asked nothing of it.
+  The guard lives in `ras_base_send_dvm_shrink`, which is the one place every
+  caller passes through.
+
+### Tearing a reservation down releases it — which is why the job side counts
+
+`prte_ras_base_teardown_reservation()` gives the nodes back, drops the owners
+and the retained owner job, disarms the session's time limit, removes the
+session from `prte_sessions`, **and releases it**. The release has to happen
+here: deregistering puts the object beyond `prte_finalize`'s sweep over
+`prte_sessions`, so nothing later would ever reclaim it.
+
+That is only safe because the job-side pointers into a session —
+`prte_job_t::session` and every entry of `::target_sessions` — are **counted**
+references (`prte_set_job_session()` takes them; `prte_job_destruct` gives
+them back). A reservation is routinely torn down while jobs are still running
+in it: `prte_ras_base_check_reservations_on_term()` fires the disposition when
+the *owning* namespace terminates, and jobs spawned into the reservation by
+someone else can still be alive. Those jobs keep the object valid for as long
+as they can read it, and the last one to go is what frees it. Both halves are
+pinned by `test_teardown_reservation()` in `test/unit/ras/test_ras.c`.
+
+Two consequences worth knowing. The release is conditioned on the session
+still being registered, which makes teardown idempotent — a second teardown
+drops no second reference. And a caller that reads the session *after*
+teardown must hold its own reference across the call: `reclaim_session()` does
+exactly that, because it still has to report completion to the scheduler.
+
+Disarming the timer is load-bearing for the same lifetime reason: the limit is
+on a lifetime that has just ended, and a timer left armed fires
+`session_timeout_cb()` on a reservation that no longer exists and terminates
+whatever jobs are still recorded in `session->jobs`.
 
 **A reservation requested by a tool lives and dies with that tool**, and
 that hangs on the daemon being told when the tool goes. It is not a child,
@@ -538,7 +653,6 @@ deviation*.)
 | `total_slots_alloc` | Sum of `slots` across the pool. |
 | `multiplier` | `ras_base_multiplier` — fabricate N daemons/node to simulate scale (default 1). |
 | `launch_orted_on_hn` | `ras_base_launch_orted_on_hn` — run a daemon on the head node. |
-| `simulated` | Set when the simulator is in play. |
 | `allocation_established` | Latched true once the first allocation completes; drives the reuse guard. |
 
 MCA params: `prte_ras_base_multiplier`,
@@ -585,6 +699,11 @@ documented in each component's guide.
   (a node just added by a grow, or the whole allocation before
   `LAUNCH_DAEMONS`). Both `--display-topo` and `--display-cpus` are pool
   walks.
+- **`PMIx_Argv_split()` answers "nothing" with NULL, not with an empty
+  array.** A string that is empty or all delimiters — `""`, `";;"` — splits
+  to a NULL `char**`, so every caller must check before indexing it. This is
+  reachable from user input: `--display topo=';'` used to fault the HNP in
+  `prte_ras_base_allocate`'s topology dump.
 - **A parser reading an RM's file or env must tolerate malformed input.**
   These run on the HNP, so a NULL deref on a blank line takes the whole
   DVM down. `strtok_r` returns NULL for a short line; `fgets` does not
@@ -675,7 +794,7 @@ prototype here compiles and then mismatches the real library.
 | Layer | What it covers |
 |-------|----------------|
 | [`test/unit/ras/test_ras.c`](../../../test/unit/ras/) (`make check`) | `prte_ras_base_node_insert` (dedup, drain, slot accounting, `ADD_SLOTS` clamping, FQDN normalization, HNP dedup, pre-assigned pool slots), the module vtable contract for every static component, `prte_ras_base_select` priority ordering, `prte_ras_base_flag_string`, and `ras/slurm`'s detect-and-report half — query gating on `SLURM_JOBID` at priority 50, then `allocate()` expanding a compressed `SLURM_NODELIST` and refusing a tainted jobid or an over-length nodelist. That last part is driven **through the framework** (find the component, query it, call the module it returns) rather than by naming its symbols, because `ras-slurm` is a plugin and has none in `libprrte`; keep it that way. It skips with a printed reason when the component is not there to be found. |
-| [`contrib/dockerswarm/run-tests.sh`](../../../contrib/dockerswarm/) (`linux`) | The multi-node paths: grow/shrink/re-grow leaving exactly one daemon per node (a duplicated pool entry launches two), `--add-hostfile` growing a live DVM through `add_hosts → ras/pmix defer → ras/hosts` including the `slots=+N` in-place adjust, `--activate` bringing an allocated-but-idle node into the DVM (one left out by `prte_max_vm_size`, and two a shrink handed back, named through `file=`) while refusing a host the allocation does not contain and refusing to apply the hostfile's `slots=`, the same operation asked for through `PMIX_ALLOC_ACTIVATE` (`elastic activate`, both the `PMIX_HOST` and the `PMIX_HOSTFILE` form, including its two-phase completion), and **`ras/slurm`'s whole modify surface** against a faked scheduler (below). |
+| [`contrib/dockerswarm/run-tests.sh`](../../../contrib/dockerswarm/) (`linux`) | The multi-node paths: grow/shrink/re-grow leaving exactly one daemon per node (a duplicated pool entry launches two), `--add-hostfile` growing a live DVM through `add_hosts → ras/hosts` (there is no scheduler in the swarm, so `ras/hosts` is the selected module and is asked directly) including the `slots=+N` in-place adjust, `--activate` bringing an allocated-but-idle node into the DVM (one left out by `prte_max_vm_size`, and two a shrink handed back, named through `file=`) while refusing a host the allocation does not contain and refusing to apply the hostfile's `slots=`, the same operation asked for through `PMIX_ALLOC_ACTIVATE` (`elastic activate`, both the `PMIX_HOST` and the `PMIX_HOSTFILE` form, including its two-phase completion), and **`ras/slurm`'s whole modify surface** against a faked scheduler (below). |
 | Live RM | PBS/LSF/Flux discovery still needs a real scheduler; there is no substitute. |
 
 **`ras/slurm`'s `modify` surface is covered in `contrib/dockerswarm`, not
@@ -741,5 +860,4 @@ Each component directory has its own `AGENTS.md`:
 - [`bootstrap/AGENTS.md`](bootstrap/AGENTS.md) — launcher-less bootstrap DVM.
 - [`simulator/AGENTS.md`](simulator/AGENTS.md) — synthetic allocation for testing.
 - [`testrm/AGENTS.md`](testrm/AGENTS.md) — fixed-hostfile fake RM.
-</content>
 </invoke>

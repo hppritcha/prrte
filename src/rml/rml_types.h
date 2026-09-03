@@ -148,6 +148,12 @@ typedef void (*prte_rml_buffer_callback_fn_t)(int status, pmix_proc_t *peer,
 /* support data store/lookup */
 #define PRTE_RML_TAG_DATA_SERVER 27
 #define PRTE_RML_TAG_DATA_CLIENT 28
+/* ...and the same request, but for THIS daemon's own store rather than the
+ * DVM's.  A PMIX_RANGE_LOCAL item never leaves the daemon that relayed it,
+ * so a request about one must not be handed to an external data server -
+ * which is what the tag tells the receive, since by then the range is
+ * buried in the payload.  See src/runtime/data_server/AGENTS.md. */
+#define PRTE_RML_TAG_DATA_SERVER_LOCAL 84
 
 /* collectives */
 #define PRTE_RML_TAG_FENCE_RELEASE     31
@@ -221,6 +227,18 @@ typedef void (*prte_rml_buffer_callback_fn_t)(int status, pmix_proc_t *peer,
 /* the membership of a PMIx_Connect assemblage, on its way to the DVM master,
  * which is where it is held - see src/prted/pmix/pmix_server_connect.c */
 #define PRTE_RML_TAG_CONNECTED            83
+
+/* A PMIx query a daemon cannot answer, on its way to the DVM master, and the
+ * master's answer coming back.  A prted holds only the identity half of the
+ * node pool - the nidmap ships names, aliases, daemon vpids and pool slots,
+ * never slot counts or node state - and holds no session but the default
+ * one, so a query that reads either has to be asked where those live.  See
+ * pmix_server_queries.c.  Distinct from PRTE_RML_TAG_SCHED, which is the
+ * scheduler command channel: a query is not a scheduler request, and
+ * pmix_server_sched() demultiplexes on a command byte a query has no value
+ * for. */
+#define PRTE_RML_TAG_QUERY                85
+#define PRTE_RML_TAG_QUERY_RESP           86
 
 #define PRTE_RML_TAG_MAX                 100
 
