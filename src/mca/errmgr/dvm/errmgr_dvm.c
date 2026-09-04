@@ -11,7 +11,8 @@
  *                         All rights reserved.
  * Copyright (c) 2014-2020 Intel, Inc.  All rights reserved.
  * Copyright (c) 2017      IBM Corporation.  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2026      Sandia National Laboratories  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -38,20 +39,23 @@
 #include "src/util/pmix_printf.h"
 
 #include "src/mca/ess/ess.h"
-#include "src/mca/grpcomm/grpcomm.h"
+#include "src/grpcomm/grpcomm.h"
 #include "src/mca/iof/base/base.h"
 #include "src/mca/odls/base/base.h"
 #include "src/mca/plm/base/base.h"
+#include "src/mca/ras/base/base.h"
 #include "src/mca/rmaps/rmaps_types.h"
 #include "src/rml/rml.h"
-#include "src/mca/state/state.h"
+#include "src/mca/state/base/base.h"
 
 #include "src/threads/pmix_threads.h"
 #include "src/util/error_strings.h"
 #include "src/util/name_fns.h"
 #include "src/util/proc_info.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 
+#include "src/prted/pmix/pmix_server_internal.h"
 #include "src/runtime/prte_globals.h"
 #include "src/runtime/prte_locks.h"
 #include "src/runtime/prte_quit.h"
@@ -59,6 +63,7 @@
 #include "src/mca/errmgr/base/base.h"
 #include "src/mca/errmgr/base/errmgr_private.h"
 #include "src/mca/errmgr/errmgr.h"
+#include "src/mca/plm/base/plm_private.h"
 
 #include "errmgr_dvm.h"
 
@@ -103,10 +108,30 @@ static int finalize(void)
     return PRTE_SUCCESS;
 }
 
+/* Every path into here is a failure taking a job down - job_errors and the
+ * unrecoverable arms of proc_errors - which is exactly the event a connected
+ * assemblage is defined by: the host is to treat its members as one
+ * application, so a failure that costs this job its life costs every job
+ * connected to it too.  Doing it here rather than at each call site is what
+ * keeps the two from drifting apart. */
 static void _terminate_job(pmix_nspace_t jobid)
 {
     pmix_pointer_array_t procs;
     prte_proc_t pobj;
+
+    /* An empty namespace is PMIx's WILDCARD, and this function's whole
+     * output is a {nspace, RANK_WILDCARD} kill sent to every daemon in the
+     * DVM.  prte_odls_base_default_kill_local_procs() skips its namespace
+     * filter for an invalid nspace, so such a command does not terminate
+     * nothing - it terminates every application process on every node.
+     * There is no job here to terminate; say so rather than aiming at all of
+     * them. */
+    if (PMIX_NSPACE_INVALID(jobid)) {
+        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+        return;
+    }
+
+    prte_pmix_server_connection_job_failed(jobid);
 
     PMIX_CONSTRUCT(&procs, pmix_pointer_array_t);
     pmix_pointer_array_init(&procs, 1, 1, 1);
@@ -132,12 +157,20 @@ static void job_errors(int fd, short args, void *cbdata)
      * if prte is trying to shutdown, just let it
      */
     if (prte_finalizing) {
+        PMIX_RELEASE(caddy);
         return;
     }
 
     /* if the jdata is NULL, then it is referencing the daemon job */
     if (NULL == caddy->jdata) {
         caddy->jdata = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
+        if (NULL == caddy->jdata) {
+            /* we are too far gone to have a daemon job - there is nothing
+             * this handler can do, and every line below dereferences it */
+            PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
+            PMIX_RELEASE(caddy);
+            return;
+        }
         PMIX_RETAIN(caddy->jdata);
     }
 
@@ -146,16 +179,69 @@ static void job_errors(int fd, short args, void *cbdata)
     jobstate = caddy->job_state;
     jdata->state = jobstate;
 
-    PMIX_OUTPUT_VERBOSE((1, prte_errmgr_base_framework.framework_output,
+    pmix_output_verbose(1, prte_errmgr_base_framework.framework_output,
                          "%s errmgr:dvm: job %s reported state %s",
                          PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_JOBID_PRINT(jdata->nspace),
-                         prte_job_state_to_str(jobstate)));
+                         prte_job_state_to_str(jobstate));
+
+    /* A job that failed before it was given a namespace has never launched:
+     * nothing is running under it and nothing downstream can address it.  It
+     * must not go any further into the machine, because an empty namespace is
+     * PMIx's WILDCARD - PMIX_CHECK_NSPACE answers true against anything - so
+     * the daemon test below takes such a job for the DAEMON job, and that arm
+     * ends in PRTE_JOB_STATE_DAEMONS_TERMINATED, which is prte_quit.  One
+     * application's failure would take the whole DVM down with it.
+     *
+     * Testing the namespace properly is not the fix on its own, either: the
+     * arm below that hands _terminate_job() the same empty namespace, which
+     * every daemon's odls reads as "every local proc".  Both arms are wrong
+     * for a job with no name.
+     *
+     * All that is owed here is an answer to whoever asked for it, and
+     * prte_plm_base_spawn_response() delivers that by the job's originator
+     * and room number rather than by its name.  prte_plm_base_spawn_alloc_failed()
+     * reaches for it directly for exactly the same reason.
+     *
+     * The window this guards is now closed at its source: the HNP names a
+     * job the moment prte_plm_base_recv() unpacks it, rather than when it
+     * reaches INIT, so nothing should arrive here unnamed.  This stays as a
+     * backstop - it costs one comparison, and it is all that stands between
+     * a future unnamed job and the daemon arm below. */
+    if (PMIX_NSPACE_INVALID(jdata->nspace)) {
+        rc = prte_pmix_convert_job_state_to_error(jobstate);
+        rc = prte_plm_base_spawn_response(rc, jdata);
+        if (PRTE_SUCCESS != rc) {
+            PRTE_ERROR_LOG(rc);
+        }
+        PMIX_RELEASE(caddy);
+        return;
+    }
 
     if (PMIX_CHECK_NSPACE(jdata->nspace, PRTE_PROC_MY_NAME->nspace)) {
         if (PRTE_JOB_STATE_FAILED_TO_START == jdata->state
             || PRTE_JOB_STATE_NEVER_LAUNCHED == jdata->state
             || PRTE_JOB_STATE_FAILED_TO_LAUNCH == jdata->state
             || PRTE_JOB_STATE_CANNOT_LAUNCH == jdata->state) {
+            /* We tried to start daemons and they did not come up: say so.
+             * This is where the plm lands when it gives that verdict, and it
+             * used to exit in silence, leaving the user with a tool that
+             * returned non-zero and printed nothing.  (The
+             * "failed-daemon-launch" topic was emitted from proc_errors'
+             * application-proc switch, on a branch asking whether the proc
+             * was a daemon - which it never is there, because the daemon
+             * branch above that switch always exits first.  So the text has
+             * been unreachable.)
+             *
+             * Only the two "we tried" states get the message.  NEVER_LAUNCHED
+             * and CANNOT_LAUNCH mean we never got as far as launching, and
+             * whoever made that decision has already said why - plm/ssh's
+             * agent-not-found, for one - so a generic checklist of reasons
+             * daemons fail to start would only bury it. */
+            if (PRTE_JOB_STATE_FAILED_TO_START == jdata->state
+                || PRTE_JOB_STATE_FAILED_TO_LAUNCH == jdata->state) {
+                prte_show_help("help-errmgr-base.txt", "failed-daemon-launch",
+                               true, prte_tool_basename);
+            }
             prte_routing_is_enabled = false;
             PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_DAEMONS_TERMINATED);
             PMIX_RELEASE(caddy);
@@ -168,7 +254,7 @@ static void job_errors(int fd, short args, void *cbdata)
          * likely already output an error message */
         if (PRTE_JOB_STATE_ABORTED == jobstate && jdata->num_procs != jdata->num_reported) {
             prte_routing_is_enabled = false;
-            pmix_show_help("help-errmgr-base.txt", "failed-daemon", true);
+            prte_show_help("help-errmgr-base.txt", "failed-daemon", true);
         }
         /* there really isn't much else we can do since the problem
          * is in the DVM itself, so best just to terminate */
@@ -200,16 +286,40 @@ static void job_errors(int fd, short args, void *cbdata)
     /* ensure we terminate any processes left running in the DVM */
     _terminate_job(jdata->nspace);
 
-    /* if the job never launched, then we need to let the
-     * state machine know this job failed - it has no
-     * other means of being alerted since no proc states
-     * will be triggered */
-    if (PRTE_JOB_STATE_FAILED_TO_START == jdata->state
-        || PRTE_JOB_STATE_NEVER_LAUNCHED == jdata->state
-        || PRTE_JOB_STATE_FAILED_TO_LAUNCH == jdata->state
+    /* If the job never got as far as a process, nothing else will ever tell
+     * the state machine it is over: no proc state can be triggered for a proc
+     * that was never handed to a daemon, so the completion accounting has
+     * nothing to count down and the job object would sit here forever.  Say
+     * so directly for the states that mean exactly that - the job stopped
+     * before any daemon was given anything to run.
+     *
+     * The two launch failures are NOT among them, and the difference matters.
+     * They mean the daemons DID receive the job and act on it, so every one
+     * of its procs is already accounted for or shortly will be: proc_errors
+     * force-marks a failed proc WAITPID_FIRED and IOF_COMPLETE, and the
+     * _terminate_job() above brings down whichever ones did start.  Declaring
+     * the job TERMINATED here instead runs check_job_complete, which releases
+     * the job object - and on a multi-node launch that routinely happens with
+     * ranks still alive on the other nodes, because a job whose executable is
+     * missing on ONE node has already started every rank on the others.  Their
+     * deaths then arrive with no job to account them to, which is the
+     * orphaned-proc path in state/base: an internal-inconsistency banner
+     * asking the user to file a bug, for a mistyped path.
+     *
+     * So take the shortcut for those two only once every proc really has been
+     * counted, and otherwise leave it to the ordinary accounting, which is
+     * already driving.  Nothing is lost by waiting: the exit code and the
+     * aborted-proc attribute are set above, before either arm.
+     */
+    if (PRTE_JOB_STATE_NEVER_LAUNCHED == jdata->state
         || PRTE_JOB_STATE_ALLOC_FAILED == jdata->state
         || PRTE_JOB_STATE_MAP_FAILED == jdata->state
+        || PRTE_JOB_STATE_FILES_POSN_FAILED == jdata->state
         || PRTE_JOB_STATE_CANNOT_LAUNCH == jdata->state) {
+        PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_TERMINATED);
+    } else if ((PRTE_JOB_STATE_FAILED_TO_START == jdata->state
+                || PRTE_JOB_STATE_FAILED_TO_LAUNCH == jdata->state)
+               && jdata->num_terminated >= jdata->num_procs) {
         PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_TERMINATED);
     }
 
@@ -222,23 +332,40 @@ static void proc_errors(int fd, short args, void *cbdata)
     prte_state_caddy_t *caddy = (prte_state_caddy_t *) cbdata;
     prte_job_t *jdata;
     prte_proc_t *pptr, *proct;
-    pmix_proc_t *proc = &caddy->name;
-    prte_proc_state_t state = caddy->proc_state;
+    pmix_proc_t *proc;
+    prte_proc_state_t state;
     int i;
     int32_t i32, *i32ptr;
     bool flag;
     PRTE_HIDE_UNUSED_PARAMS(fd, args);
 
+    /* nothing in the caddy may be read before this: it is the barrier
+     * pairing with the PMIX_POST_OBJECT on whichever thread activated the
+     * state, and on a weakly-ordered machine a read hoisted above it can
+     * see the field as the constructor left it rather than as the activator
+     * set it */
     PMIX_ACQUIRE_OBJECT(caddy);
+    proc = &caddy->name;
+    state = caddy->proc_state;
 
-    PMIX_OUTPUT_VERBOSE((1, prte_errmgr_base_framework.framework_output,
+    pmix_output_verbose(1, prte_errmgr_base_framework.framework_output,
                          "%s errmgr:dvm: for proc %s state %s",
                          PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                         PRTE_NAME_PRINT(proc), prte_proc_state_to_str(state)));
+                         PRTE_NAME_PRINT(proc), prte_proc_state_to_str(state));
 
     /* get the job object */
-    if (prte_finalizing || NULL == (jdata = prte_get_job_data_object(proc->nspace))) {
-        /* could be a race condition */
+    if (prte_finalizing) {
+        PMIX_RELEASE(caddy);
+        return;
+    }
+    if (NULL == (jdata = prte_get_job_data_object(proc->nspace))) {
+        /* This proc has died and we hold nothing to account it against, so
+         * nothing below can run.  Dropping it silently - which is what "could
+         * be a race condition" amounted to - is what leaves the DVM waiting
+         * forever on a job it can no longer see.  Note the error states land
+         * HERE rather than in track_procs, so this is the arrival point for a
+         * proc that exited non-zero or died on a signal. */
+        prte_state_base_orphaned_proc(proc, state);
         PMIX_RELEASE(caddy);
         return;
     }
@@ -250,11 +377,51 @@ static void proc_errors(int fd, short args, void *cbdata)
 
     if (PMIX_CHECK_NSPACE(jdata->nspace, PRTE_PROC_MY_NAME->nspace)) {
         /* NOTE: this is a daemon process that had the error */
+
+        /* Failing to send to a daemon that has never reported for duty says
+         * nothing about that daemon: it has been recorded and launched, and
+         * has simply not started listening yet.  Answering that as a comm
+         * failure takes the whole DVM down - PEER_UNKNOWN is not even among
+         * the states handled below, so it reaches the "unsupported" fallback,
+         * which forces DAEMONS_TERMINATED.
+         *
+         * Any job that terminates while daemons are being added produces
+         * exactly this: the job's completion notice is xcast over a routing
+         * tree that already holds them, because the tree is built from the
+         * expected daemon count precisely so wireup can route to them.  An
+         * `elastic extend` is the reliable way to see it, since it returns to
+         * its caller as soon as the scheduler answers, so the tool exits (and
+         * its job terminates) while the launch is still in flight.
+         *
+         * The test for "has not reported" is that we hold no contact info for
+         * it, which is both exact and the very reason the send failed - there
+         * was no address to send to.  Neither PRTE_PROC_FLAG_ALIVE nor a
+         * RUNNING state can serve: plm/ssh sets both when it *records* the
+         * launch, long before the daemon says anything.  rml_uri is written
+         * only by prte_plm_base_daemon_callback, i.e. only by the daemon
+         * itself reporting in.
+         *
+         * Only send failures are swallowed here.  A daemon that genuinely
+         * fails to come up reports FAILED_TO_START and is handled below, and
+         * a daemon that has departed still carries the contact info it
+         * reported with, so it does not land here either. */
+        if ((PRTE_PROC_STATE_UNABLE_TO_SEND_MSG == state ||
+             PRTE_PROC_STATE_PEER_UNKNOWN == state ||
+             PRTE_PROC_STATE_NO_PATH_TO_TARGET == state) &&
+            NULL == pptr->rml_uri) {
+            PMIX_OUTPUT_VERBOSE((5, prte_errmgr_base_framework.framework_output,
+                                 "%s Comm failure for daemon %s, not yet reported - ignoring it",
+                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                                 PRTE_NAME_PRINT(proc)));
+            goto cleanup;
+        }
+
         /* we MUST handle a communication failure with special care to
          * avoid normal termination issues */
         if (PRTE_PROC_STATE_COMM_FAILED == state ||
             PRTE_PROC_STATE_HEARTBEAT_FAILED == state ||
             PRTE_PROC_STATE_UNABLE_TO_SEND_MSG == state ||
+            PRTE_PROC_STATE_FAILED_TO_CONNECT == state ||
             PRTE_PROC_STATE_FAILED_TO_START == state) {
             /* if this is my own connection, ignore it */
             if (PRTE_PROC_MY_NAME->rank == proc->rank) {
@@ -263,12 +430,50 @@ static void proc_errors(int fd, short args, void *cbdata)
                                      PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
                 goto cleanup;
             }
+            /* If we have already torn this daemon out of the DVM, a later
+             * comm-failure for it is a harmless echo and must be ignored: acting
+             * on it again would double-decrement num_daemons and could re-drive
+             * the abort logic below.  This is the fall-through the collective
+             * DVM-shrink path relies on — its completion handler proactively
+             * marks each target not-alive and sets its state to TERMINATED (see
+             * ras_base_allocate.c), so the target's eventual real departure
+             * arrives here already handled.  The state test keeps this from
+             * swallowing a FAILED_TO_START daemon (never alive, but its recorded
+             * state is still below TERMINATED at this point) so that genuine
+             * start failures are still handled below.  Gated on elastic mode so
+             * the default fault-handling path is unchanged when no collective
+             * shrink can be in flight. */
+            if (prte_elastic_mode &&
+                !PRTE_FLAG_TEST(pptr, PRTE_PROC_FLAG_ALIVE) &&
+                PRTE_PROC_STATE_TERMINATED <= pptr->state) {
+                PMIX_OUTPUT_VERBOSE((5, prte_errmgr_base_framework.framework_output,
+                                     "%s Comm failure for already-departed daemon %s - ignoring it",
+                                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                                     PRTE_NAME_PRINT(proc)));
+                goto cleanup;
+            }
             /* mark the daemon as gone */
             PRTE_FLAG_UNSET(pptr, PRTE_PROC_FLAG_ALIVE);
             /* update the state */
             pptr->state = state;
             /* adjust our num_procs */
             --prte_process_info.num_daemons;
+            /* if this daemon was the target of an in-progress grow campaign,
+             * resolve its rank against the launch fence (failure).  Only the
+             * specific ranks being launched affect the fence, so an unrelated
+             * daemon loss during a grow no longer consumes the fence.  When it
+             * was a grow target the campaign is rolled back out of the DVM and
+             * the loss is fully handled here, so skip the general daemon-loss
+             * handling below — that path would otherwise abort the whole DVM
+             * over a failure the grow rollback has already absorbed. */
+            if (prte_plm_base_grow_target_failed(proc->rank)) {
+                goto cleanup;
+            }
+            /* NOTE: a daemon departing as part of a DVM *shrink* is not handled
+             * here.  The collective shrink-completion handler tears each target
+             * out of the DVM proactively when the shrink broadcast completes, so
+             * by the time the target's real comm-failure arrives it has already
+             * been marked not-alive and is caught by the guard above. */
             /* if we have ordered prteds to terminate or abort
              * is in progress, record it */
             if (prte_prteds_term_ordered || prte_abnormal_term_ordered) {
@@ -278,11 +483,11 @@ static void proc_errors(int fd, short args, void *cbdata)
                 /* remove from dependent routes, if it is one */
                 prte_rml_route_lost(proc->rank);
                 /* if all my routes and local children are gone, then terminate ourselves */
-                if (0 == pmix_list_get_size(&prte_rml_base.children)) {
+                if (0 == prte_rml_base.n_children) {
                     for (i = 0; i < prte_local_children->size; i++) {
                         proct = (prte_proc_t *) pmix_pointer_array_get_item(prte_local_children, i);
                         if (NULL != proct &&
-                            PRTE_FLAG_TEST(pptr, PRTE_PROC_FLAG_ALIVE) &&
+                            PRTE_FLAG_TEST(proct, PRTE_PROC_FLAG_ALIVE) &&
                             proct->state < PRTE_PROC_STATE_UNTERMINATED) {
                             /* at least one is still alive */
                             PMIX_OUTPUT_VERBOSE((5, prte_errmgr_base_framework.framework_output,
@@ -301,7 +506,7 @@ static void proc_errors(int fd, short args, void *cbdata)
                     PMIX_OUTPUT_VERBOSE((5, prte_errmgr_base_framework.framework_output,
                                          "%s Comm failure: %d routes remain alive",
                                          PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                                         (int) pmix_list_get_size(&prte_rml_base.children)));
+                                         prte_rml_base.n_children));
                 }
                 goto cleanup;
             }
@@ -311,11 +516,54 @@ static void proc_errors(int fd, short args, void *cbdata)
             /* record the first one to fail */
             if (!PRTE_FLAG_TEST(jdata, PRTE_JOB_FLAG_ABORTED)) {
                 if (PRTE_PROC_STATE_FAILED_TO_START != state) {
-                    /* output an error message so the user knows what happened */
-                    pmix_show_help("help-errmgr-base.txt", "node-died", true,
+                    /* output an error message so the user knows what happened.
+                     * A daemon we have never placed has no node, and this
+                     * message is the last thing that should turn a lost
+                     * daemon into a segfault in the HNP */
+                    prte_show_help("help-errmgr-base.txt", "node-died", true,
                                    PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), prte_process_info.nodename,
-                                   PRTE_NAME_PRINT(proc), pptr->node->name);
+                                   PRTE_NAME_PRINT(proc),
+                                   NULL == pptr->node ? "unknown" : pptr->node->name);
                 }
+
+                if (PRTE_SUCCESS == prte_rml_route_lost(proc->rank)) {
+                    /* Mark all procs on the lost daemon's node as gone.  This
+                     * used to be guarded by "am I rank 0", standing in for "am
+                     * I the HNP" - which this component always is, so the test
+                     * bought nothing, and it is not even a reliable spelling
+                     * of the question: prte_plm_base_set_hnp_name() takes the
+                     * HNP's rank from PMIX_SERVER_RANK when PRRTE comes up
+                     * under an existing PMIx server, and any value but 0 there
+                     * silently skipped this sweep - leaving the job waiting
+                     * forever on processes whose node was already gone. */
+                    for (int ji = 0; ji < prte_job_data->size; ji++) {
+                        prte_job_t *j = (prte_job_t *)
+                            pmix_pointer_array_get_item(prte_job_data, ji);
+                        if (NULL == j || NULL == j->procs) {
+                            continue;
+                        }
+                        if (PMIX_CHECK_NSPACE(j->nspace, proc->nspace)) {
+                            continue;
+                        }
+                        for (int pi = 0; pi < j->procs->size; pi++) {
+                            prte_proc_t *p = (prte_proc_t *)
+                                pmix_pointer_array_get_item(j->procs, pi);
+                            if (NULL == p || NULL == p->node) {
+                                continue;
+                            }
+                            if (NULL == p->node->daemon) {
+                                continue;
+                            }
+                            if (p->node->daemon->name.rank != proc->rank) {
+                                continue;
+                            }
+                            PRTE_ACTIVATE_PROC_STATE(&p->name,
+                                                     PRTE_PROC_STATE_TERM_WO_SYNC);
+                        }
+                    }
+                    goto cleanup;
+                }
+
                 /* mark the daemon job as failed */
                 jdata->state = PRTE_JOB_STATE_COMM_FAILED;
                 /* point to the lowest rank to cause the problem */
@@ -354,22 +602,27 @@ static void proc_errors(int fd, short args, void *cbdata)
      * any of our routes or local children remain alive - if not, then
      * terminate ourselves. */
     if (prte_prteds_term_ordered) {
-        for (i = 0; i < prte_local_children->size; i++) {
-            proct = (prte_proc_t*)pmix_pointer_array_get_item(prte_local_children, i);
-            if (NULL != proct) {
-                if (PRTE_FLAG_TEST(proct, PRTE_PROC_FLAG_ALIVE)) {
-                    goto keep_going;
-                }
-            }
+        /* ask the base rather than scanning prte_local_children inline: the
+         * obvious loop variable here is "pptr", the proc whose error we are
+         * handling, and clobbering it corrupts everything below */
+        if (prte_errmgr_base_any_live_children(NULL)) {
+            goto keep_going;
         }
         /* if all my routes and children are gone, then terminate
            ourselves nicely (i.e., this is a normal termination) */
-        if (0 == pmix_list_get_size(&prte_rml_base.children)) {
-            PMIX_OUTPUT_VERBOSE((2, prte_errmgr_base_framework.framework_output,
+        if (0 == prte_rml_base.n_children) {
+            pmix_output_verbose(2, prte_errmgr_base_framework.framework_output,
                                  "%s errmgr:default:dvm all routes gone - exiting",
-                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME));
             PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_DAEMONS_TERMINATED);
         }
+        /* nothing below is worth doing once the DVM has been ordered down and
+         * this node is empty: the per-state policy would record an abort,
+         * notify survivors there are none of, and order the termination of a
+         * job that is already going away.  The daemon-side handler has always
+         * stopped here ("no need to alert the HNP - we are already on our way
+         * out"); this one fell through and did the work anyway. */
+        goto cleanup;
     }
 
 keep_going:
@@ -392,9 +645,9 @@ keep_going:
      */
     switch (state) {
     case PRTE_PROC_STATE_KILLED_BY_CMD:
-        PMIX_OUTPUT_VERBOSE((5, prte_errmgr_base_framework.framework_output,
+        pmix_output_verbose(5, prte_errmgr_base_framework.framework_output,
                              "%s errmgr:dvm: proc %s killed by cmd",
-                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(proc)));
+                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(proc));
         /* we ordered this proc to die, so it isn't an abnormal termination
          * and we don't flag it as such
          */
@@ -404,16 +657,20 @@ keep_going:
         } else if (flag) {
             /* at least one proc survives - send out a notification if one is requested */
             check_send_notification(jdata, pptr, PMIX_ERR_PROC_KILLED_BY_CMD);
+            // recover the resources used by this proc
+            prte_state_base_recover_resources(jdata, pptr);
         }
         break;
 
     case PRTE_PROC_STATE_ABORTED_BY_SIG:
-        PMIX_OUTPUT_VERBOSE((5, prte_errmgr_base_framework.framework_output,
+        pmix_output_verbose(5, prte_errmgr_base_framework.framework_output,
                              "%s errmgr:dvm: proc %s aborted by signal",
-                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(proc)));
+                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(proc));
         if (flag) {
             /* send out a notification if one is requested */
             check_send_notification(jdata, pptr, PMIX_ERR_PROC_ABORTED_BY_SIG);
+            // recover the resources used by this proc
+            prte_state_base_recover_resources(jdata, pptr);
         } else {
             if (!PRTE_FLAG_TEST(jdata, PRTE_JOB_FLAG_ABORTED)) {
                 jdata->state = PRTE_JOB_STATE_ABORTED_BY_SIG;
@@ -430,12 +687,14 @@ keep_going:
         break;
 
     case PRTE_PROC_STATE_TERM_WO_SYNC:
-        PMIX_OUTPUT_VERBOSE((5, prte_errmgr_base_framework.framework_output,
+        pmix_output_verbose(5, prte_errmgr_base_framework.framework_output,
                              "%s errmgr:dvm: proc %s terminated without sync",
-                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(proc)));
+                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(proc));
         if (flag) {
             /* send out a notification if one is requested */
             check_send_notification(jdata, pptr, PMIX_ERR_PROC_TERM_WO_SYNC);
+            // recover the resources used by this proc
+            prte_state_base_recover_resources(jdata, pptr);
         } else {
             if (!PRTE_FLAG_TEST(jdata, PRTE_JOB_FLAG_ABORTED)) {
                 jdata->state = PRTE_JOB_STATE_ABORTED_WO_SYNC;
@@ -446,8 +705,12 @@ keep_going:
                 PMIX_RETAIN(pptr);
                 PRTE_FLAG_SET(jdata, PRTE_JOB_FLAG_ABORTED);
                 jdata->exit_code = pptr->exit_code;
-                /* send out a notification is one is requested */
-                check_send_notification(jdata, pptr, PMIX_ERR_PROC_TERM_WO_SYNC);
+                /* NOTE: no notification here.  This arm has just flagged the
+                 * job ABORTED, and check_send_notification() declines to say
+                 * anything about a proc in a job that is already aborting -
+                 * so the call that used to sit here could never send. The
+                 * notification for this state belongs to the recoverable arm
+                 * above, which is the one that keeps the job running. */
                 /* now treat a special case - if the proc exit'd without a required
                  * sync, it may have done so with a zero exit code. We want to ensure
                  * that the user realizes there was an error, so in this -one- case,
@@ -462,13 +725,47 @@ keep_going:
         }
         break;
 
+    /* This proc's node was released from the DVM and the departing daemon
+     * killed it.  Planned for the DVM, not for the job, so it is handled like
+     * the loss of a daemon - except that the cause is known and can be named. */
+    case PRTE_PROC_STATE_KILLED_BY_RELEASE:
+        pmix_output_verbose(5, prte_errmgr_base_framework.framework_output,
+                             "%s errmgr:dvm: proc %s killed by the release of node %s",
+                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(proc),
+                             (NULL == pptr->node) ? "unknown" : pptr->node->name);
+        if (flag) {
+            /* a job that can absorb the loss is told and keeps running */
+            check_send_notification(jdata, pptr, PMIX_ERR_PROC_KILLED_BY_RELEASE);
+            // recover the resources used by this proc
+            prte_state_base_recover_resources(jdata, pptr);
+        } else {
+            if (!PRTE_FLAG_TEST(jdata, PRTE_JOB_FLAG_ABORTED)) {
+                jdata->state = PRTE_JOB_STATE_KILLED_BY_RELEASE;
+                /* point to the first rank to cause the problem */
+                prte_set_attribute(&jdata->attributes, PRTE_JOB_ABORTED_PROC, PRTE_ATTR_LOCAL, pptr,
+                                   PMIX_POINTER);
+                /* retain the object so it doesn't get free'd */
+                PMIX_RETAIN(pptr);
+                PRTE_FLAG_SET(jdata, PRTE_JOB_FLAG_ABORTED);
+                /* the proc was killed, so it reported no exit code of its
+                 * own - without one the termination reads as success */
+                jdata->exit_code = pptr->exit_code;
+                if (0 == jdata->exit_code) {
+                    jdata->exit_code = PRTE_ERROR_DEFAULT_EXIT_CODE;
+                }
+                /* kill what is left of the job */
+                _terminate_job(jdata->nspace);
+            }
+        }
+        break;
+
     case PRTE_PROC_STATE_FAILED_TO_START:
     case PRTE_PROC_STATE_FAILED_TO_LAUNCH:
-        PMIX_OUTPUT_VERBOSE((5, prte_errmgr_base_framework.framework_output,
+        pmix_output_verbose(5, prte_errmgr_base_framework.framework_output,
                              "%s errmgr:dvm: proc %s %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                             PRTE_NAME_PRINT(proc), prte_proc_state_to_str(state)));
+                             PRTE_NAME_PRINT(proc), prte_proc_state_to_str(state));
         if (!PRTE_FLAG_TEST(jdata, PRTE_JOB_FLAG_ABORTED)) {
-            if (PRTE_PROC_STATE_FAILED_TO_START) {
+            if (PRTE_PROC_STATE_FAILED_TO_START == state) {
                 jdata->state = PRTE_JOB_STATE_FAILED_TO_START;
             } else {
                 jdata->state = PRTE_JOB_STATE_FAILED_TO_LAUNCH;
@@ -490,23 +787,23 @@ keep_going:
             _terminate_job(jdata->nspace);
             PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_FAILED_TO_START);
         }
-        /* if this was a daemon, report it */
-        if (PMIX_CHECK_NSPACE(jdata->nspace, PRTE_PROC_MY_NAME->nspace)) {
-            /* output a message indicating we failed to launch a daemon */
-            pmix_show_help("help-errmgr-base.txt", "failed-daemon-launch",
-                           true, prte_tool_basename);
-        }
+        /* NOTE: there is no "and if this was a daemon, say so" arm here.
+         * A daemon proc never reaches this switch - the daemon-job branch
+         * at the top of this function handles FAILED_TO_START and exits.
+         * The daemon-launch diagnostic is emitted from job_errors instead. */
         break;
 
     case PRTE_PROC_STATE_CALLED_ABORT:
-        PMIX_OUTPUT_VERBOSE((5, prte_errmgr_base_framework.framework_output,
+        pmix_output_verbose(5, prte_errmgr_base_framework.framework_output,
                              "%s errmgr:dvm: proc %s called abort with exit code %d",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(proc),
-                             pptr->exit_code));
+                             pptr->exit_code);
         /* this proc ordered the job to abort */
         if (flag) {
             /* send out a notification if one is requested */
             check_send_notification(jdata, pptr, PMIX_ERR_PROC_REQUESTED_ABORT);
+            // recover the resources used by this proc
+            prte_state_base_recover_resources(jdata, pptr);
         } else {
             if (!PRTE_FLAG_TEST(jdata, PRTE_JOB_FLAG_ABORTED)) {
                 jdata->state = PRTE_JOB_STATE_CALLED_ABORT;
@@ -524,13 +821,12 @@ keep_going:
         break;
 
     case PRTE_PROC_STATE_TERM_NON_ZERO:
-        PMIX_OUTPUT_VERBOSE((5, prte_errmgr_base_framework.framework_output,
+        pmix_output_verbose(5, prte_errmgr_base_framework.framework_output,
                              "%s errmgr:dvm: proc %s exited with non-zero status %d",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(proc),
-                             pptr->exit_code));
+                             pptr->exit_code);
         jdata->exit_code = pptr->exit_code;
         PRTE_FLAG_UNSET(pptr, PRTE_PROC_FLAG_ALIVE);
-        jdata->num_terminated++;
         /* track the number of non-zero exits */
         i32 = 0;
         i32ptr = &i32;
@@ -539,11 +835,10 @@ keep_going:
         ++i32;
         prte_set_attribute(&jdata->attributes, PRTE_JOB_NUM_NONZERO_EXIT, PRTE_ATTR_LOCAL, i32ptr,
                            PMIX_INT32);
-        if (jdata->num_terminated >= jdata->num_procs) {
-            /* this job has terminated */
-            PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_TERMINATED);
-        } else if (flag && prte_get_attribute(&jdata->attributes, PRTE_JOB_ERROR_NONZERO_EXIT, NULL, PMIX_BOOL)) {
+        if (flag && prte_get_attribute(&jdata->attributes, PRTE_JOB_ERROR_NONZERO_EXIT, NULL, PMIX_BOOL)) {
             check_send_notification(jdata, pptr, PMIX_ERR_EXIT_NONZERO_TERM);
+            // recover the resources used by this proc
+            prte_state_base_recover_resources(jdata, pptr);
         } else {
             if (!PRTE_FLAG_TEST(jdata, PRTE_JOB_FLAG_ABORTED)) {
                 jdata->state = PRTE_JOB_STATE_NON_ZERO_TERM;
@@ -565,7 +860,11 @@ keep_going:
                              "%s errmgr:dvm: proc %s default error %s",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(proc),
                              prte_proc_state_to_str(state)));
-        if (jdata->num_terminated == jdata->num_procs) {
+        /* >=, not ==: this is the last chance an unrecognized state has to
+         * end a job whose procs are all gone, and an exact-equality test
+         * that the count has already stepped past never fires again.  The
+         * KILLED_BY_CMD arm above tests it the same way. */
+        if (jdata->num_terminated >= jdata->num_procs) {
             PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_TERMINATED);
         }
         break;
@@ -586,7 +885,7 @@ static void check_send_notification(prte_job_t *jdata,
     pmix_data_buffer_t pbkt;
     pmix_data_range_t range = PMIX_RANGE_CUSTOM;
 
-    pmix_output_verbose(5, prte_state_base_framework.framework_output,
+    pmix_output_verbose(5, prte_errmgr_base_framework.framework_output,
                         "%s errmgr:dvm:sending notification %s affected proc %s",
                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                         PMIx_Error_string(event),
@@ -674,7 +973,7 @@ static void check_send_notification(prte_job_t *jdata,
     PMIX_INFO_FREE(info, ninfo);
 
     /* xcast it to everyone */
-    if (PRTE_SUCCESS != (rc = prte_grpcomm.xcast(PRTE_RML_TAG_NOTIFICATION, &pbkt))) {
+    if (PRTE_SUCCESS != (rc = prte_grpcomm_xcast(PRTE_RML_TAG_NOTIFICATION, &pbkt))) {
         PRTE_ERROR_LOG(rc);
     }
     PMIX_DATA_BUFFER_DESTRUCT(&pbkt);

@@ -11,7 +11,7 @@
  *                         All rights reserved.
  * Copyright (c) 2011-2020 Cisco Systems, Inc.  All rights reserved
  * Copyright (c) 2018-2020 Intel, Inc.  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -47,7 +47,10 @@
 #include "src/mca/rmaps/base/base.h"
 #include "src/mca/rmaps/base/rmaps_private.h"
 
-#define PRTE_RMAPS_PRINT_MAX_SIZE 50
+/* long enough for the longest policy word plus every qualifier that can
+ * accompany it - "BYHWTHREAD:NO_USE_LOCAL:NOOVERSUBSCRIBE:SPAN:ORDERED"
+ * is 52 characters and used to come back truncated */
+#define PRTE_RMAPS_PRINT_MAX_SIZE 80
 #define PRTE_RMAPS_PRINT_NUM_BUFS 16
 
 static bool fns_init = false;
@@ -68,6 +71,7 @@ static void buffer_cleanup(void *value)
         for (i = 0; i < PRTE_RMAPS_PRINT_NUM_BUFS; i++) {
             free(ptr->buffers[i]);
         }
+        free(ptr);
     }
 }
 
@@ -154,8 +158,8 @@ char *prte_rmaps_base_print_mapping(prte_mapping_policy_t mapping)
     case PRTE_MAPPING_BYUSER:
         map = "BYUSER";
         break;
-    case PRTE_MAPPING_BYDIST:
-        map = "MINDIST";
+    case PRTE_MAPPING_BYDEVICE:
+        map = "BYDEVICE";
         break;
     case PRTE_MAPPING_PELIST:
         map = "PE-LIST";
@@ -168,23 +172,23 @@ char *prte_rmaps_base_print_mapping(prte_mapping_policy_t mapping)
     }
 
     if (PRTE_MAPPING_NO_USE_LOCAL & PRTE_GET_MAPPING_DIRECTIVE(mapping)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&qls, "NO_USE_LOCAL");
+        PMIx_Argv_append_nosize(&qls, "NO_USE_LOCAL");
     }
     if (PRTE_MAPPING_NO_OVERSUBSCRIBE & PRTE_GET_MAPPING_DIRECTIVE(mapping)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&qls, "NOOVERSUBSCRIBE");
+        PMIx_Argv_append_nosize(&qls, "NOOVERSUBSCRIBE");
     } else if (PRTE_MAPPING_SUBSCRIBE_GIVEN & PRTE_GET_MAPPING_DIRECTIVE(mapping)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&qls, "OVERSUBSCRIBE");
+        PMIx_Argv_append_nosize(&qls, "OVERSUBSCRIBE");
     }
     if (PRTE_MAPPING_SPAN & PRTE_GET_MAPPING_DIRECTIVE(mapping)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&qls, "SPAN");
+        PMIx_Argv_append_nosize(&qls, "SPAN");
     }
     if (PRTE_MAPPING_ORDERED & PRTE_GET_MAPPING_DIRECTIVE(mapping)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&qls, "ORDERED");
+        PMIx_Argv_append_nosize(&qls, "ORDERED");
     }
 
     if (NULL != qls) {
-        tmp = PMIX_ARGV_JOIN_COMPAT(qls, ':');
-        PMIX_ARGV_FREE_COMPAT(qls);
+        tmp = PMIx_Argv_join(qls, ':');
+        PMIx_Argv_free(qls);
         pmix_asprintf(&mymap, "%s:%s", map, tmp);
         free(tmp);
     } else {

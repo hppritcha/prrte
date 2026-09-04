@@ -17,7 +17,8 @@
  * Copyright (c) 2014-2020 Intel, Inc.  All rights reserved.
  * Copyright (c) 2015-2019 Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2026      Sandia National Laboratories  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -83,11 +84,12 @@
 #include "src/util/name_fns.h"
 #include "src/util/proc_info.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 
 #include "src/mca/errmgr/errmgr.h"
 #include "src/mca/ess/base/base.h"
 #include "src/mca/ess/ess.h"
-#include "src/mca/grpcomm/base/base.h"
+#include "src/grpcomm/grpcomm.h"
 #include "src/mca/rmaps/rmaps.h"
 #include "src/rml/rml_contact.h"
 #include "src/rml/rml.h"
@@ -129,7 +131,7 @@ static void caddy_const(prte_plm_ssh_caddy_t *ptr)
 static void caddy_dest(prte_plm_ssh_caddy_t *ptr)
 {
     if (NULL != ptr->argv) {
-        PMIX_ARGV_FREE_COMPAT(ptr->argv);
+        PMIx_Argv_free(ptr->argv);
     }
     if (NULL != ptr->daemon) {
         PMIX_RELEASE(ptr->daemon);
@@ -191,14 +193,14 @@ static int ssh_init(void)
         }
         free(tmp);
         /* automatically add -inherit and grid engine PE related flags */
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&ssh_agent_argv, "-inherit");
+        PMIx_Argv_append_nosize(&ssh_agent_argv, "-inherit");
         /* Don't use the "-noshell" flag as qrsh would have a problem
          * swallowing a long command */
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&ssh_agent_argv, "-nostdin");
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&ssh_agent_argv, "-V");
+        PMIx_Argv_append_nosize(&ssh_agent_argv, "-nostdin");
+        PMIx_Argv_append_nosize(&ssh_agent_argv, "-V");
         if (0 < pmix_output_get_verbosity(prte_plm_base_framework.framework_output)) {
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&ssh_agent_argv, "-verbose");
-            tmp = PMIX_ARGV_JOIN_COMPAT(ssh_agent_argv, ' ');
+            PMIx_Argv_append_nosize(&ssh_agent_argv, "-verbose");
+            tmp = PMIx_Argv_join(ssh_agent_argv, ' ');
             pmix_output_verbose(1, prte_plm_base_framework.framework_output,
                                 "%s plm:ssh: using \"%s\" for launching\n",
                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), tmp);
@@ -213,6 +215,16 @@ static int ssh_init(void)
         pmix_output_verbose(1, prte_plm_base_framework.framework_output,
                             "%s plm:ssh: using \"%s\" for launching\n",
                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), ssh_agent_path);
+
+    } else if (prte_mca_plm_ssh_component.using_tmrsh) {
+        // transfer the argv across
+        ssh_agent_argv = PMIx_Argv_copy(prte_mca_plm_ssh_component.agent_argv);
+        ssh_agent_path = strdup(prte_mca_plm_ssh_component.agent_argv[0]);
+        pmix_output_verbose(1, prte_plm_base_framework.framework_output,
+                            "%s plm:ssh: using \"%s\" for launching\n",
+                            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), ssh_agent_path);
+
+
     } else {
         /* not using qrsh or llspawn - use MCA-specified agent */
         if (PRTE_SUCCESS != (rc = launch_agent_setup(prte_mca_plm_ssh_component.agent, NULL))) {
@@ -240,6 +252,12 @@ static int ssh_init(void)
     /* we assign daemon nodes at launch */
     prte_plm_globals.daemon_nodes_assigned_at_launch = true;
 
+    /* tell the base whether or not to replicate the MCA params found in our
+     * environment onto the prted command line - dropping them is the
+     * documented remedy for the "cmd-line-too-long" error */
+    prte_plm_globals.pass_environ_mca_params
+        = prte_mca_plm_ssh_component.pass_environ_mca_params;
+
     return rc;
 }
 
@@ -253,6 +271,7 @@ static void ssh_wait_daemon(int sd, short flags, void *cbdata)
     prte_plm_ssh_caddy_t *caddy = (prte_plm_ssh_caddy_t *) t2->cbdata;
     prte_proc_t *daemon = caddy->daemon;
     pmix_status_t rc;
+    int32_t xstat;
     PRTE_HIDE_UNUSED_PARAMS(sd, flags);
 
     if (prte_prteds_term_ordered || prte_abnormal_term_ordered) {
@@ -284,7 +303,14 @@ static void ssh_wait_daemon(int sd, short flags, void *cbdata)
                 PMIX_RELEASE(t2);
                 return;
             }
-            rc = PMIx_Data_pack(NULL, buf, &daemon->exit_code, 1, PMIX_INT32);
+            /* send a plain exit status - the HNP records what it is given.
+             * daemon->exit_code is a raw waitpid() status here, so decode it
+             * rather than putting a wait status on the wire (remote_spawn's
+             * failure report on this same tag sends a PRTE error code, so the
+             * receiver cannot know which it was handed) */
+            xstat = WIFEXITED(daemon->exit_code) ? WEXITSTATUS(daemon->exit_code)
+                                                 : PRTE_ERROR_DEFAULT_EXIT_CODE;
+            rc = PMIx_Data_pack(NULL, buf, &xstat, 1, PMIX_INT32);
             if (PMIX_SUCCESS != rc) {
                 PMIX_ERROR_LOG(rc);
                 PMIX_DATA_BUFFER_RELEASE(buf);
@@ -338,13 +364,18 @@ static void ssh_wait_daemon(int sd, short flags, void *cbdata)
         }
     }
 
-    /* release any delay */
+    /* one fewer ssh in flight - admit the next from the launch list */
     --num_in_progress;
     if (num_in_progress < prte_mca_plm_ssh_component.num_concurrent) {
         /* trigger continuation of the launch */
         prte_event_active(&launch_event, EV_WRITE, 1);
     }
-    /* cleanup */
+    /* cleanup - the caddy was handed to us by process_launch_list and
+     * nobody else owns it (the wait tracker only releases its child), so
+     * releasing it here is what frees the launch argv and the retained
+     * daemon proc. Missing this leaks one copy of the full remote command
+     * line for every daemon we start */
+    PMIX_RELEASE(caddy);
     PMIX_RELEASE(t2);
 }
 
@@ -395,16 +426,16 @@ static int setup_launch(int *argcptr, char ***argvptr, char *nodename, int *node
     /*
      * Build argv array
      */
-    argv = PMIX_ARGV_COPY_COMPAT(ssh_agent_argv);
-    argc = PMIX_ARGV_COUNT_COMPAT(argv);
+    argv = PMIx_Argv_copy(ssh_agent_argv);
+    argc = PMIx_Argv_count(argv);
     /* if any ssh args were provided, now is the time to add them */
     if (NULL != prte_mca_plm_ssh_component.ssh_args) {
         char **ssh_argv;
-        ssh_argv = PMIX_ARGV_SPLIT_COMPAT(prte_mca_plm_ssh_component.ssh_args, ' ');
+        ssh_argv = PMIx_Argv_split(prte_mca_plm_ssh_component.ssh_args, ' ');
         for (i = 0; NULL != ssh_argv[i]; i++) {
             pmix_argv_append(&argc, &argv, ssh_argv[i]);
         }
-        PMIX_ARGV_FREE_COMPAT(ssh_argv);
+        PMIx_Argv_free(ssh_argv);
     }
     *node_name_index1 = argc;
     pmix_argv_append(&argc, &argv, "<template>");
@@ -412,6 +443,7 @@ static int setup_launch(int *argcptr, char ***argvptr, char *nodename, int *node
     /* setup the correct shell info */
     if (PRTE_SUCCESS != (rc = setup_shell(&remote_shell, &local_shell, nodename, &argc, &argv))) {
         PRTE_ERROR_LOG(rc);
+        PMIx_Argv_free(argv);
         return rc;
     }
 
@@ -454,21 +486,21 @@ static int setup_launch(int *argcptr, char ***argvptr, char *nodename, int *node
          * However, we don't need/want a prefix as nothing precedes the orted
          * cmd itself
          */
-        orted_cmd = PMIX_ARGV_JOIN_COMPAT(orted_argv, ' ');
+        orted_cmd = PMIx_Argv_join(orted_argv, ' ');
         orted_prefix = NULL;
     } else {
         /* okay, so the "orted" cmd is somewhere in this array, with
          * something preceding it and perhaps things following it.
          */
         orted_prefix = pmix_argv_join_range(orted_argv, 0, orted_index, ' ');
-        orted_cmd = pmix_argv_join_range(orted_argv, orted_index, PMIX_ARGV_COUNT_COMPAT(orted_argv), ' ');
+        orted_cmd = pmix_argv_join_range(orted_argv, orted_index, PMIx_Argv_count(orted_argv), ' ');
     }
-    PMIX_ARGV_FREE_COMPAT(orted_argv); /* done with this */
+    PMIx_Argv_free(orted_argv); /* done with this */
 
     /* if they asked us to change directory, do so */
     if (NULL != prte_mca_plm_ssh_component.chdir) {
         pmix_asprintf(&tmp, "cd %s", prte_mca_plm_ssh_component.chdir);
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, tmp);
+        PMIx_Argv_append_nosize(&final_argv, tmp);
         free(tmp);
     }
 
@@ -481,13 +513,13 @@ static int setup_launch(int *argcptr, char ***argvptr, char *nodename, int *node
             PRTE_PLM_SSH_SHELL_BASH == remote_shell) {
             if (NULL != prefix_dir) {
                 pmix_asprintf(&tmp, "PRTE_PREFIX=%s", prefix_dir);
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, tmp);
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, "export PRTE_PREFIX");
+                PMIx_Argv_append_nosize(&final_argv, tmp);
+                PMIx_Argv_append_nosize(&final_argv, "export PRTE_PREFIX");
                 free(tmp);
                 if (NULL != pmix_prefix) {
                     pmix_asprintf(&tmp, "PMIX_PREFIX=%s", pmix_prefix);
-                    PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, tmp);
-                    PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, "export PMIX_PREFIX");
+                    PMIx_Argv_append_nosize(&final_argv, tmp);
+                    PMIx_Argv_append_nosize(&final_argv, "export PMIX_PREFIX");
                     free(tmp);
                     pmix_asprintf(&tmp, "LD_LIBRARY_PATH=%s/%s:%s/%s:$LD_LIBRARY_PATH",
                                   prefix_dir, value, pmix_prefix, value2);
@@ -498,14 +530,14 @@ static int setup_launch(int *argcptr, char ***argvptr, char *nodename, int *node
             } else {
                 // pmix_prefix must not be NULL
                 pmix_asprintf(&tmp, "PMIX_PREFIX=%s", pmix_prefix);
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, tmp);
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, "export PMIX_PREFIX");
+                PMIx_Argv_append_nosize(&final_argv, tmp);
+                PMIx_Argv_append_nosize(&final_argv, "export PMIX_PREFIX");
                 free(tmp);
                 pmix_asprintf(&tmp, "LD_LIBRARY_PATH=%s/%s:$LD_LIBRARY_PATH",
                               pmix_prefix, value2);
             }
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, tmp);
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, "export LD_LIBRARY_PATH");
+            PMIx_Argv_append_nosize(&final_argv, tmp);
+            PMIx_Argv_append_nosize(&final_argv, "export LD_LIBRARY_PATH");
             free(tmp);
             if (NULL != prefix_dir) {
                 if (NULL != pmix_prefix) {
@@ -520,8 +552,8 @@ static int setup_launch(int *argcptr, char ***argvptr, char *nodename, int *node
                 pmix_asprintf(&tmp, "DYLD_LIBRARY_PATH=%s/%s:$DYLD_LIBRARY_PATH",
                               pmix_prefix, value2);
             }
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, tmp);
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, "export DYLD_LIBRARY_PATH");
+            PMIx_Argv_append_nosize(&final_argv, tmp);
+            PMIx_Argv_append_nosize(&final_argv, "export DYLD_LIBRARY_PATH");
             free(tmp);
         } else {
             /* [t]csh is a bit more challenging -- we
@@ -538,20 +570,20 @@ static int setup_launch(int *argcptr, char ***argvptr, char *nodename, int *node
              */
             if (NULL != prefix_dir) {
                 pmix_asprintf(&tmp, "setenv PRTE_PREFIX %s", prefix_dir);
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, tmp);
+                PMIx_Argv_append_nosize(&final_argv, tmp);
                 free(tmp);
                 if (NULL != pmix_prefix) {
                     pmix_asprintf(&tmp, "setenv PMIX_PREFIX %s", pmix_prefix);
-                    PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, tmp);
+                    PMIx_Argv_append_nosize(&final_argv, tmp);
                     free(tmp);
                 }
             } else {
                 // pmix_prefix must not be NULL
                 pmix_asprintf(&tmp, "setenv PMIX_PREFIX %s", pmix_prefix);
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, tmp);
+                PMIx_Argv_append_nosize(&final_argv, tmp);
                 free(tmp);
             }
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, "if ( $?LD_LIBRARY_PATH == 1 ) set PRTE_have_llp");
+            PMIx_Argv_append_nosize(&final_argv, "if ( $?LD_LIBRARY_PATH == 1 ) set PRTE_have_llp");
             if (NULL != prefix_dir) {
                 if (NULL != pmix_prefix) {
                     pmix_asprintf(&tmp, "if ( $?LD_LIBRARY_PATH == 0 ) setenv LD_LIBRARY_PATH %s/%s:%s/%s",
@@ -565,7 +597,7 @@ static int setup_launch(int *argcptr, char ***argvptr, char *nodename, int *node
                 pmix_asprintf(&tmp, "if ( $?LD_LIBRARY_PATH == 0 ) setenv LD_LIBRARY_PATH %s/%s",
                               pmix_prefix, value2);
             }
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, tmp);
+            PMIx_Argv_append_nosize(&final_argv, tmp);
             free(tmp);
             if (NULL != prefix_dir) {
                 if (NULL != pmix_prefix) {
@@ -580,7 +612,7 @@ static int setup_launch(int *argcptr, char ***argvptr, char *nodename, int *node
                 pmix_asprintf(&tmp, "if ( $?PRTE_have_llp == 1 ) setenv LD_LIBRARY_PATH %s/%s:$LD_LIBRARY_PATH",
                               pmix_prefix, value2);
             }
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, tmp);
+            PMIx_Argv_append_nosize(&final_argv, tmp);
             free(tmp);
         }
         free(value);
@@ -596,12 +628,12 @@ static int setup_launch(int *argcptr, char ***argvptr, char *nodename, int *node
             PRTE_PLM_SSH_SHELL_ZSH == remote_shell ||
             PRTE_PLM_SSH_SHELL_BASH == remote_shell) {
             pmix_asprintf(&tmp, "LD_LIBRARY_PATH=%s:$LD_LIBRARY_PATH", prte_mca_plm_ssh_component.pass_libpath);
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, tmp);
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, "export LD_LIBRARY_PATH");
+            PMIx_Argv_append_nosize(&final_argv, tmp);
+            PMIx_Argv_append_nosize(&final_argv, "export LD_LIBRARY_PATH");
             free(tmp);
             pmix_asprintf(&tmp, "DYLD_LIBRARY_PATH=%s:$DYLD_LIBRARY_PATH", prte_mca_plm_ssh_component.pass_libpath);
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, tmp);
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, "export DYLD_LIBRARY_PATH");
+            PMIx_Argv_append_nosize(&final_argv, tmp);
+            PMIx_Argv_append_nosize(&final_argv, "export DYLD_LIBRARY_PATH");
             free(tmp);
         } else {
             /* [t]csh is a bit more challenging -- we
@@ -616,12 +648,12 @@ static int setup_launch(int *argcptr, char ***argvptr, char *nodename, int *node
              * assemble the cmd with the orted_cmd at the end. Otherwise,
              * we have to insert the orted_prefix in the right place
              */
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, "if ( $?LD_LIBRARY_PATH == 1 ) set PRTE_have_llp");
+            PMIx_Argv_append_nosize(&final_argv, "if ( $?LD_LIBRARY_PATH == 1 ) set PRTE_have_llp");
             pmix_asprintf(&tmp, "if ( $?LD_LIBRARY_PATH == 0 ) setenv LD_LIBRARY_PATH %s", prte_mca_plm_ssh_component.pass_libpath);
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, tmp);
+            PMIx_Argv_append_nosize(&final_argv, tmp);
             free(tmp);
             pmix_asprintf(&tmp, "if ( $?PRTE_have_llp == 1 ) setenv LD_LIBRARY_PATH %s:$LD_LIBRARY_PATH", prte_mca_plm_ssh_component.pass_libpath);
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, tmp);
+            PMIx_Argv_append_nosize(&final_argv, tmp);
             free(tmp);
         }
     }
@@ -666,26 +698,43 @@ static int setup_launch(int *argcptr, char ***argvptr, char *nodename, int *node
     } else {
         full_orted_cmd = orted_cmd;
     }
+    if (NULL == full_orted_cmd) {
+        /* prte_launch_agent named nothing to run - an empty
+         * --prtemca prte_launch_agent "" gets here. There is no command to
+         * ssh, so say so rather than strdup(NULL) */
+        prte_show_help("help-plm-ssh.txt", "no-launch-agent", true);
+        free(orted_prefix);
+        PMIx_Argv_free(final_argv);
+        PMIx_Argv_free(argv);
+        return PRTE_ERR_SILENT;
+    }
     if (NULL != orted_prefix) {
         pmix_asprintf(&tmp, "%s %s", orted_prefix, full_orted_cmd);
         free(orted_prefix);
     } else {
         tmp = strdup(full_orted_cmd);
     }
-    PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, tmp);
+    PMIx_Argv_append_nosize(&final_argv, tmp);
+    free(tmp); /* the append copied it */
     free(full_orted_cmd);
 
     /* now add the final cmd to the argv array */
-    final_cmd = PMIX_ARGV_JOIN_COMPAT(final_argv, ';');
-    PMIX_ARGV_FREE_COMPAT(final_argv);
+    final_cmd = PMIx_Argv_join(final_argv, ';');
+    PMIx_Argv_free(final_argv);
     pmix_argv_append(&argc, &argv, final_cmd);
     free(final_cmd); /* done with this */
 
-    /* if we are not tree launching or debugging, tell the daemon
-     * to daemonize so we can launch the next group
+    /* Unless we are debugging, tell the daemon to daemonize: an ssh session
+     * held open for the daemon's whole life is one process per node on both
+     * ends and, without tree spawn, a concurrency slot we cannot get back to
+     * launch the next group.  prted forks only when it is told to (see
+     * src/tools/prted/AGENTS.md), so this flag is what makes it happen -
+     * which is exactly why the RM launchers, whose tracked task the daemon
+     * must remain, do not pass it.  Tree spawn wants the release just as much
+     * as a flat launch does; it simply had no concurrency reason to ask, and
+     * used to get the fork regardless.
      */
-    if (prte_mca_plm_ssh_component.no_tree_spawn &&
-        !prte_debug_flag && !prte_debug_daemons_flag &&
+    if (!prte_debug_daemons_flag &&
         !prte_debug_daemons_file_flag && !prte_leave_session_attached &&
         /* Daemonize when not using qrsh.  Or, if using qrsh, only
          * daemonize if told to by user with daemonize_qrsh flag. */
@@ -719,11 +768,12 @@ static int setup_launch(int *argcptr, char ***argvptr, char *nodename, int *node
     /* protect the params */
     prte_plm_base_wrap_args(argv);
 
-    value = PMIX_ARGV_JOIN_COMPAT(argv, ' ');
+    value = PMIx_Argv_join(argv, ' ');
     if (sysconf(_SC_ARG_MAX) < (int) strlen(value)) {
-        pmix_show_help("help-plm-ssh.txt", "cmd-line-too-long", true, strlen(value),
+        prte_show_help("help-plm-ssh.txt", "cmd-line-too-long", true, strlen(value),
                        sysconf(_SC_ARG_MAX));
         free(value);
+        PMIx_Argv_free(argv);
         return PRTE_ERR_SILENT;
     }
     free(value);
@@ -733,7 +783,7 @@ static int setup_launch(int *argcptr, char ***argvptr, char *nodename, int *node
     }
 
     if (0 < pmix_output_get_verbosity(prte_plm_base_framework.framework_output)) {
-        param = PMIX_ARGV_JOIN_COMPAT(argv, ' ');
+        param = PMIx_Argv_join(argv, ' ');
         pmix_output(prte_plm_base_framework.framework_output,
                     "%s plm:ssh: final template argv:\n\t%s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                     (NULL == param) ? "NULL" : param);
@@ -759,7 +809,7 @@ static void ssh_child(int argc, char **argv)
     PRTE_HIDE_UNUSED_PARAMS(argc);
 
     /* setup environment */
-    env = PMIX_ARGV_COPY_COMPAT(prte_launch_environ);
+    env = PMIx_Argv_copy(prte_launch_environ);
 
     /* We don't need to sense an oversubscribed condition and set the sched_yield
      * for the node as we are only launching the daemons at this time. The daemons
@@ -811,7 +861,7 @@ static void ssh_child(int argc, char **argv)
     sigprocmask(SIG_UNBLOCK, &sigs, 0);
 
     /* exec the daemon */
-    var = PMIX_ARGV_JOIN_COMPAT(argv, ' ');
+    var = PMIx_Argv_join(argv, ' ');
     PMIX_OUTPUT_VERBOSE((1, prte_plm_base_framework.framework_output,
                          "%s plm:ssh: executing: (%s) [%s]", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                          exec_path, (NULL == var) ? "NULL" : var));
@@ -839,7 +889,6 @@ static int remote_spawn(void)
     bool failed_launch = true;
     pmix_proc_t target;
     prte_plm_ssh_caddy_t *caddy;
-    prte_routed_tree_t *child;
     pmix_status_t ret;
 
     PMIX_OUTPUT_VERBOSE((1, prte_plm_base_framework.framework_output,
@@ -861,7 +910,7 @@ static int remote_spawn(void)
     pmix_prefix = getenv("PMIX_PREFIX");
 
     /* if I have no children, just return */
-    if (0 == pmix_list_get_size(&prte_rml_base.children)) {
+    if (0 == prte_rml_base.n_children) {
         PMIX_OUTPUT_VERBOSE((1, prte_plm_base_framework.framework_output,
                              "%s plm:ssh: remote spawn - have no children!",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
@@ -879,14 +928,15 @@ static int remote_spawn(void)
     }
 
     PMIX_LOAD_NSPACE(target.nspace, PRTE_PROC_MY_NAME->nspace);
-    PMIX_LIST_FOREACH(child, &prte_rml_base.children, prte_routed_tree_t)
-    {
-        target.rank = child->rank;
+    for(size_t i = 0; i < prte_rml_base.children.size; i++){
+        pmix_rank_t *children = (pmix_rank_t*) prte_rml_base.children.array;
+        if(PMIX_RANK_INVALID == children[i]) continue;
+        target.rank = children[i];
 
         /* get the host where this daemon resides */
         if (NULL == (hostname = prte_get_proc_hostname(&target))) {
             pmix_output(0, "%s unable to get hostname for daemon %s",
-                        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_VPID_PRINT(child->rank));
+                        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_VPID_PRINT(children[i]));
             rc = PRTE_ERR_NOT_FOUND;
             goto cleanup;
         }
@@ -907,7 +957,7 @@ static int remote_spawn(void)
         /* we are in an event, so no need to protect the list */
         caddy = PMIX_NEW(prte_plm_ssh_caddy_t);
         caddy->argc = argc;
-        caddy->argv = PMIX_ARGV_COPY_COMPAT(argv);
+        caddy->argv = PMIx_Argv_copy(argv);
         /* fake a proc structure for the new daemon - will be released
          * upon startup
          */
@@ -931,7 +981,7 @@ static int remote_spawn(void)
 
 cleanup:
     if (NULL != argv) {
-        PMIX_ARGV_FREE_COMPAT(argv);
+        PMIx_Argv_free(argv);
     }
 
     /* check for failed launch */
@@ -986,8 +1036,6 @@ static void process_launch_list(int fd, short args, void *cbdata)
     prte_plm_ssh_caddy_t *caddy;
     PRTE_HIDE_UNUSED_PARAMS(fd, args, cbdata);
 
-    PMIX_ACQUIRE_OBJECT(caddy);
-
     while (num_in_progress < prte_mca_plm_ssh_component.num_concurrent) {
         item = pmix_list_remove_first(&launch_list);
         if (NULL == item) {
@@ -1004,6 +1052,9 @@ static void process_launch_list(int fd, short args, void *cbdata)
         if (pid < 0) {
             PRTE_ERROR_LOG(PRTE_ERR_SYS_LIMITS_CHILDREN);
             prte_wait_cb_cancel(caddy->daemon);
+            /* the callback that would have released this caddy will now
+             * never fire */
+            PMIX_RELEASE(caddy);
             continue;
         }
 
@@ -1079,7 +1130,6 @@ static void launch_daemons(int fd, short args, void *cbdata)
     prte_plm_ssh_caddy_t *caddy;
     char *username, *nname;
     int port, *portptr;
-    prte_routed_tree_t *child;
     PRTE_HIDE_UNUSED_PARAMS(fd, args);
 
     PMIX_ACQUIRE_OBJECT(state);
@@ -1143,7 +1193,7 @@ static void launch_daemons(int fd, short args, void *cbdata)
          * As we cannot run in this situation, pretty print the error
          * and return an error code.
          */
-        pmix_show_help("help-plm-ssh.txt", "deadlock-params", true,
+        prte_show_help("help-plm-ssh.txt", "deadlock-params", true,
                        prte_mca_plm_ssh_component.num_concurrent, map->num_new_daemons);
         PRTE_ERROR_LOG(PRTE_ERR_FATAL);
         rc = PRTE_ERR_SILENT;
@@ -1205,11 +1255,23 @@ static void launch_daemons(int fd, short args, void *cbdata)
             continue;
         }
 
+        /* if the node's daemon has not been defined, then we
+         * have an error! Check this FIRST - the tree-spawn filter
+         * below reads node->daemon->name.rank
+         */
+        if (NULL == node->daemon) {
+            PRTE_ERROR_LOG(PRTE_ERR_FATAL);
+            PMIX_OUTPUT_VERBOSE((1, prte_plm_base_framework.framework_output,
+                                 "%s plm:ssh:launch daemon failed to be defined on node %s",
+                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), node->name));
+            continue;
+        }
+
         /* if we are tree launching, only launch our own children */
         if (!prte_mca_plm_ssh_component.no_tree_spawn) {
-            PMIX_LIST_FOREACH(child, &prte_rml_base.children, prte_routed_tree_t)
-            {
-                if (child->rank == node->daemon->name.rank) {
+            pmix_rank_t *children = (pmix_rank_t*) prte_rml_base.children.array;
+            for(size_t i = 0; i < prte_rml_base.children.size; i++){
+                if (children[i] == node->daemon->name.rank) {
                     goto launch;
                 }
             }
@@ -1226,17 +1288,6 @@ static void launch_daemons(int fd, short args, void *cbdata)
         if (PRTE_FLAG_TEST(node, PRTE_NODE_FLAG_DAEMON_LAUNCHED)) {
             PMIX_OUTPUT_VERBOSE((1, prte_plm_base_framework.framework_output,
                                  "%s plm:ssh:launch daemon already exists on node %s",
-                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), node->name));
-            continue;
-        }
-
-        /* if the node's daemon has not been defined, then we
-         * have an error!
-         */
-        if (NULL == node->daemon) {
-            PRTE_ERROR_LOG(PRTE_ERR_FATAL);
-            PMIX_OUTPUT_VERBOSE((1, prte_plm_base_framework.framework_output,
-                                 "%s plm:ssh:launch daemon failed to be defined on node %s",
                                  PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), node->name));
             continue;
         }
@@ -1274,7 +1325,7 @@ static void launch_daemons(int fd, short args, void *cbdata)
         /* we are in an event, so no need to protect the list */
         caddy = PMIX_NEW(prte_plm_ssh_caddy_t);
         caddy->argc = argc;
-        caddy->argv = PMIX_ARGV_COPY_COMPAT(argv);
+        caddy->argv = PMIx_Argv_copy(argv);
         /* insert the alternate port if any */
         portptr = &port;
         if (prte_get_attribute(&node->attributes, PRTE_NODE_PORT, (void **) &portptr, PMIX_INT)) {
@@ -1307,10 +1358,15 @@ static void launch_daemons(int fd, short args, void *cbdata)
      * function determine they are all alive and trigger the next stage
      */
     PMIX_RELEASE(state);
-    PMIX_ARGV_FREE_COMPAT(argv);
+    PMIx_Argv_free(argv);
+    free(prefix_dir);
+    free(pmix_prefix);
     return;
 
 cleanup:
+    PMIx_Argv_free(argv);
+    free(prefix_dir);
+    free(pmix_prefix);
     PRTE_ACTIVATE_JOB_STATE(state->jdata, PRTE_JOB_STATE_FAILED_TO_START);
     PMIX_RELEASE(state);
 }
@@ -1373,8 +1429,8 @@ static int ssh_finalize(void)
     }
     free(prte_mca_plm_ssh_component.agent_path);
     free(ssh_agent_path);
-    PMIX_ARGV_FREE_COMPAT(prte_mca_plm_ssh_component.agent_argv);
-    PMIX_ARGV_FREE_COMPAT(ssh_agent_argv);
+    PMIx_Argv_free(prte_mca_plm_ssh_component.agent_argv);
+    PMIx_Argv_free(ssh_agent_argv);
 
     return rc;
 }
@@ -1436,7 +1492,7 @@ static int launch_agent_setup(const char *agent, char *path)
                          (NULL == path) ? "NULL" : path));
     ssh_agent_argv = prte_plm_ssh_search(agent, path);
 
-    if (0 == PMIX_ARGV_COUNT_COMPAT(ssh_agent_argv)) {
+    if (0 == PMIx_Argv_count(ssh_agent_argv)) {
         /* nothing was found */
         return PRTE_ERR_NOT_FOUND;
     }
@@ -1446,7 +1502,7 @@ static int launch_agent_setup(const char *agent, char *path)
 
     if (NULL == ssh_agent_path) {
         /* not an error - just report not found */
-        PMIX_ARGV_FREE_COMPAT(ssh_agent_argv);
+        PMIx_Argv_free(ssh_agent_argv);
         return PRTE_ERR_NOT_FOUND;
     }
 
@@ -1454,7 +1510,7 @@ static int launch_agent_setup(const char *agent, char *path)
     if (NULL != bname && 0 == strcmp(bname, "ssh")) {
         /* if xterm option was given, add '-X', ensuring we don't do it twice */
         if (NULL != prte_xterm) {
-            PMIX_ARGV_APPEND_UNIQUE_COMPAT(&ssh_agent_argv, "-X");
+            PMIx_Argv_append_unique_nosize(&ssh_agent_argv, "-X");
         } else if (0 >= pmix_output_get_verbosity(prte_plm_base_framework.framework_output)) {
             /* if debug was not specified, and the user didn't explicitly
              * specify X11 forwarding/non-forwarding, add "-x" if it
@@ -1466,7 +1522,7 @@ static int launch_agent_setup(const char *agent, char *path)
                 }
             }
             if (NULL == ssh_agent_argv[i]) {
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&ssh_agent_argv, "-x");
+                PMIx_Argv_append_nosize(&ssh_agent_argv, "-x");
             }
         }
     }
@@ -1504,6 +1560,8 @@ static int ssh_probe(char *nodename, prte_plm_ssh_shell_t *shell)
         PMIX_OUTPUT_VERBOSE((1, prte_plm_base_framework.framework_output,
                              "%s plm:ssh: fork failed with errno=%d",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), errno));
+        close(fd[0]);
+        close(fd[1]);
         return PRTE_ERR_IN_ERRNO;
     } else if (pid == 0) { /* child */
         if (dup2(fd[1], 1) < 0) {
@@ -1513,8 +1571,8 @@ static int ssh_probe(char *nodename, prte_plm_ssh_shell_t *shell)
             exit(01);
         }
         /* Build argv array */
-        argv = PMIX_ARGV_COPY_COMPAT(prte_mca_plm_ssh_component.agent_argv);
-        argc = PMIX_ARGV_COUNT_COMPAT(prte_mca_plm_ssh_component.agent_argv);
+        argv = PMIx_Argv_copy(prte_mca_plm_ssh_component.agent_argv);
+        argc = PMIx_Argv_count(prte_mca_plm_ssh_component.agent_argv);
         pmix_argv_append(&argc, &argv, nodename);
         pmix_argv_append(&argc, &argv, "echo $SHELL");
 
@@ -1525,6 +1583,7 @@ static int ssh_probe(char *nodename, prte_plm_ssh_shell_t *shell)
         PMIX_OUTPUT_VERBOSE((1, prte_plm_base_framework.framework_output,
                              "%s plm:ssh: close failed with errno=%d",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), errno));
+        close(fd[0]);
         return PRTE_ERR_IN_ERRNO;
     }
 
@@ -1552,6 +1611,11 @@ static int ssh_probe(char *nodename, prte_plm_ssh_shell_t *shell)
         *ptr = '\0';
     }
     close(fd[0]);
+    /* reap the probe so it does not linger as a zombie - our SIGCHLD
+     * handler knows nothing about this child */
+    while (0 > waitpid(pid, NULL, 0) && EINTR == errno) {
+        continue;
+    }
 
     if (outbuf[0] != '\0') {
         char *sh_name = rindex(outbuf, '/');
@@ -1582,7 +1646,7 @@ static int setup_shell(prte_plm_ssh_shell_t *sshell, prte_plm_ssh_shell_t *lshel
                        int *argc, char ***argv)
 {
     prte_plm_ssh_shell_t remote_shell, local_shell;
-    char *param;
+    char *param = NULL;
     int rc;
 
     /* What is our local shell? */
@@ -1652,14 +1716,14 @@ static int setup_shell(prte_plm_ssh_shell_t *sshell, prte_plm_ssh_shell_t *lshel
     if (PRTE_PLM_SSH_SHELL_SH == remote_shell || PRTE_PLM_SSH_SHELL_KSH == remote_shell) {
         int i;
         char **tmp;
-        tmp = PMIX_ARGV_SPLIT_COMPAT("( test ! -r ./.profile || . ./.profile;", ' ');
+        tmp = PMIx_Argv_split("( test ! -r ./.profile || . ./.profile;", ' ');
         if (NULL == tmp) {
             return PRTE_ERR_OUT_OF_RESOURCE;
         }
         for (i = 0; NULL != tmp[i]; ++i) {
             pmix_argv_append(argc, argv, tmp[i]);
         }
-        PMIX_ARGV_FREE_COMPAT(tmp);
+        PMIx_Argv_free(tmp);
     }
 
     /* pass results back */

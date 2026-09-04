@@ -14,7 +14,7 @@
 # Copyright (c) 2011      Los Alamos National Security, LLC.
 #                         All rights reserved.
 # Copyright (c) 2014-2020 Intel, Inc.  All rights reserved.
-# Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+# Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
 # $COPYRIGHT$
 #
 # Additional copyrights may follow
@@ -22,12 +22,6 @@
 # $HEADER$
 #
 # This is the US/English general help file for PRRTE's prun.
-#
-[multi-apps-and-zero-np]
-PRTE found multiple applications to be launched, with
-at least one that failed to specify the number of processes to execute.
-When specifying multiple applications, you must specify how many processes
-of each to launch via the -np argument.
 #
 [prte-rmaps-base:alloc-error]
 There are not enough slots available in the system to satisfy the %d
@@ -95,6 +89,39 @@ mapping operation.
   Binding policy:      %s
 
 #
+[mapper-not-supported]
+The spawn request included a PMIX_MAPPER directive:
+
+  Requested mapper:  %s
+
+PRRTE does not support naming a mapping component. The choice of mapper
+IS the mapping policy - each component claims the policies it knows how
+to perform - so a request that names a component says nothing that
+PMIX_MAPBY has not already said, and the two can contradict each other.
+
+Use PMIX_MAPBY to describe the placement you want and let PRRTE select
+the component that performs it.
+
+#
+[mapper-restricted]
+The requested mapping policy cannot be performed by any of the mapping
+components that are loaded:
+
+  Mapping policy:      %s
+  Binding policy:      %s
+  Application:         %s
+  Loaded mapper(s):    %s
+
+Which components are loaded is decided when the rmaps framework is
+opened, so naming one with an MCA parameter -
+
+  --prtemca rmaps <component>
+
+- restricts PRRTE to that component alone. A mapping policy it does not
+implement then cannot be performed at all. Either drop the restriction,
+or ask for a mapping the named component supports.
+
+#
 [span-packages-multiple]
 Your job failed to map because either a package with sufficient
 available cpus could not be found on the node, or the resulting
@@ -146,6 +173,18 @@ one.
 [rmaps:binding-target-not-found]
 A request was made to bind to %s, but an appropriate target could not
 be found on node %s.
+#
+[rmaps:mapping-target-not-found]
+A request was made to map by a hardware object, but a node in the
+allocation has no object of that type:
+
+  Object type:  %s
+  Node:         %s
+
+Mapping by an object is only done when it has been asked for, so
+there is no other placement that would answer the request. Please
+either map by an object this node provides, or restrict the job to
+nodes that provide the one you asked for.
 #
 [allocation-overload]
 A request was made to bind that would require binding
@@ -287,6 +326,33 @@ requested ones:
 Please specify a mapping level that has more cpus, or else let us
 define a default mapping that will allow multiple cpus-per-proc.
 #
+[conflicting-directives]
+Two qualifiers that contradict each other were given in the same
+directive:
+
+  Qualifier:  %s
+  Qualifier:  %s
+
+Please give only one of them.
+#
+[conflicting-job-qualifiers]
+A qualifier that applies to the entire job was given more than once,
+with conflicting values:
+
+  Qualifier:       %s
+  Given by:        %s
+  Conflicts with:  %s
+
+Qualifiers such as OVERSUBSCRIBE and INHERIT describe the whole job -
+whether a node may hold more processes than it has slots, or whether
+this job takes on its parent's launch directives. Every application in
+the job therefore has to agree about them: it is fine to give such a
+qualifier on one application of several, and it will be applied to the
+job as a whole, but two applications cannot ask for opposite things.
+
+Please give the qualifier only once, or give it the same value
+everywhere.
+#
 [unrecognized-modifier]
 The mapping request contains an unrecognized qualifier:
 
@@ -307,6 +373,16 @@ Please check your request and try again.
 Although we were able to map your job, we are unable to launch
 it at this time due to required resources being busy. Please
 try again later.
+#
+[job-only-modifier]
+A %s modifier was given for a single application context, but it
+describes the whole job:
+
+  Modifier:  %s
+
+There is no way to apply it to one application and not another, so it
+can only be given as a job-level directive - on the first application
+context of the command line, or on a command line with only one.
 #
 [unsupported-default-modifier]
 A %s modifier was provided that is not supported as a default value:
@@ -393,10 +469,10 @@ specification and try again.
 #
 [redefining-policy]
 
-Conflicting directives for binding policy are causing the policy to be
+Conflicting directives for %s policy are causing the policy to be
 redefined:
 
-   New policy:   %s
+   New policy:    %s
    Prior policy:  %s
 
 Please check that only one policy is defined.
@@ -422,3 +498,135 @@ requirements:
   cpus/proc:    %d
 
 Please adjust the request and try again.
+#
+[rmaps:bind-above-device]
+A binding was requested that is coarser than the devices the job was
+mapped against:
+
+  Binding:  %s
+  Device:   %s
+  Node:     %s
+
+Mapping by a device means placing each process near that device, and an
+object that contains the device's locality - and more besides - is not
+near it. Binding there would hand the process cpus the device is not
+local to, which is the thing mapping by device is meant to avoid.
+
+Please either bind to an object at or below the device's locality (numa,
+l3cache, core, hwthread are the usual choices), or map by something other
+than a device.
+#
+[rmaps:device-not-nameable]
+Mapping by a device was requested, but the devices on this node carry no
+identity that can be given to the vendor's runtime:
+
+  Device class: %s
+  Node:         %s
+  Device:       %s
+
+A GPU can only be named to the library that will compute on it by the
+vendor's own identifier - NVIDIA's GPU-<uuid>, AMD's equivalent, and so
+on. hwloc records that identifier only when it is built with the vendor's
+backend (NVML for NVIDIA, RSMI for AMD, Level Zero for Intel). Built
+without them, hwloc still reports the GPUs and PRRTE can still place
+processes next to them, but neither can tell a process which one it got
+in terms the process can use.
+
+PRRTE refuses the request rather than mapping and saying nothing, because
+the two are indistinguishable while the job runs: the placement looks
+correct, and the only symptom is that every process on the node uses the
+same device.
+
+To use this option, rebuild hwloc with the vendor backend enabled and
+rebuild PRRTE against it - it is the hwloc PRRTE itself was built with
+that matters, since each daemon discovers its own node. Otherwise, map by
+a cpu object (numa or package are usually closest in effect) and let the
+application select its device.
+#
+[rmaps:degenerate-device-locality]
+All of the requested devices on a node are equally close to every cpu on
+it, so binding cannot express "near this device":
+
+  Device:   %s
+  Node:     %s
+  Found:    %d devices sharing one locality
+
+The job will run, and each process is still assigned its own device - on
+this node that assignment is the whole of what mapping by device buys
+you, and it is reported to each process. But the binding will be no more
+specific than it would have been without the directive.
+
+This is a property of the machine, not of the request: it happens when
+every device hangs off one PCI complex rather than off individual NUMA
+domains or packages.
+#
+[rmaps:bad-interleave-level]
+The "interleave" qualifier was given a level that is not recognized:
+
+  Level: %s
+
+Accepted levels are "package", "numa", "l3cache", "l2cache" and
+"l1cache". The level defaults to "package" when none is given.
+
+Note that "node" is deliberately not accepted. Interleaving across nodes
+is what the "SPAN" qualifier already expresses; "interleave" reorders the
+devices within each node.
+#
+[rmaps:interleave-needs-device]
+The "interleave" qualifier was given with a mapping policy it cannot
+apply to:
+
+  Mapping policy: %s
+
+"interleave" reorders the list of devices a job is mapped against, so it
+is meaningful only in combination with "--map-by device=<class|name>".
+#
+[rmaps:too-few-devices]
+More processes were requested than there are devices to map them
+against:
+
+  Processes requested: %d
+  Device:              %s
+  Processes placeable: %d
+
+("Processes placeable" counts assignments, not devices: with the "ndev"
+qualifier each process takes several devices, so the number of processes
+that fit is smaller than the number of devices present.)
+
+A device is assigned to a process rather than subdivided between
+processes, so by default each device takes one process and a job asking
+for more than there are devices cannot be mapped.
+
+If sharing the devices is what you intended, say so with the "shared"
+qualifier:
+
+  --map-by device=<class>:shared
+
+Otherwise reduce the number of processes, or map by something other than
+a device.
+
+Note this is a separate question from the "overload-allowed" qualifier
+on "--bind-to", which concerns running more processes than there are
+CPUs. Sharing a device and overloading a CPU are different resources and
+different decisions.
+#
+[rmaps:shared-needs-device]
+The "shared" qualifier was given with a mapping policy it cannot apply
+to:
+
+  Mapping policy: %s
+
+"shared" says that several processes may be assigned the same device, so
+it is meaningful only in combination with
+"--map-by device=<class|name>".
+
+If you meant to run more processes than there are CPUs, that is the
+"overload-allowed" qualifier on "--bind-to" instead.
+#
+[rmaps:ndev-needs-device]
+The "ndev" qualifier was given with a mapping policy it cannot apply to:
+
+  Mapping policy: %s
+
+"ndev" says how many devices each process is to be assigned, so it is
+meaningful only in combination with "--map-by device=<class|name>".

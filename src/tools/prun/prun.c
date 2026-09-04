@@ -19,7 +19,7 @@
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2020      Geoffroy Vallee. All rights reserved.
  * Copyright (c) 2020      IBM Corporation.  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * Copyright (c) 2021      Amazon.com, Inc. or its affiliates.  All Rights
  *                         reserved.
  * $COPYRIGHT$
@@ -80,6 +80,7 @@
 #include "src/util/pmix_printf.h"
 #include "src/util/pmix_environ.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 #include "src/util/pmix_string_copy.h"
 
 #include "src/class/pmix_pointer_array.h"
@@ -95,16 +96,10 @@
 #include "src/runtime/runtime.h"
 #include "src/prted/pmix/pmix_server.h"
 #include "src/prted/pmix/pmix_server_internal.h"
-typedef struct {
-    prte_pmix_lock_t lock;
-    pmix_info_t *info;
-    size_t ninfo;
-} mylock_t;
 
 int prun(int argc, char *argv[])
 {
-    int rc = 1, i;
-    pmix_list_t apps;
+    int rc = 1;
     char **pargv;
     int pargc;
     prte_schizo_base_module_t *schizo;
@@ -114,38 +109,49 @@ int prun(int argc, char *argv[])
     pmix_cli_item_t *opt;
     FILE *fp;
     char *mypidfile = NULL;
-    bool first;
-    char **split;
     char *param;
-    int n;
 
     /* init the globals */
-    PMIX_CONSTRUCT(&apps, pmix_list_t);
     prte_tool_basename = pmix_basename(argv[0]);
     prte_tool_actual = "prun";
     pargc = argc;
     pargv = pmix_argv_copy_strip(argv);  // strip any quoted arguments
     gethostname(hostname, sizeof(hostname));
 
-    rc = prte_init_minimum();
-    if (PRTE_SUCCESS != rc) {
-        return rc;
-    }
+    /* every failure from here to the end of setup exits with 1: a PRRTE
+     * error code is negative, and main() can only hand the shell the low
+     * eight bits of whatever it returns */
 
     /* because we have to use the schizo framework and init our hostname
      * prior to parsing the incoming argv for cmd line options, do a hacky
-     * search to support passing of impacted options (e.g., verbosity for schizo) */
+     * search to support passing of impacted options (e.g., verbosity for schizo).
+     *
+     * This MUST precede prte_init_minimum(): that is where
+     * prte_register_params() runs, and an MCA variable evaluates its
+     * environment only on its first registration - so a "--prtemca" value
+     * pushed into the environment after it has run is simply never seen.
+     * prte and prted order it this way for the same reason. */
     rc = prte_schizo_base_parse_prte(pargc, 0, pargv, NULL);
     if (PRTE_SUCCESS != rc) {
-        return rc;
+        return 1;
     }
     rc = prte_schizo_base_parse_pmix(pargc, 0, pargv, NULL);
     if (PRTE_SUCCESS != rc) {
-        return rc;
+        return 1;
     }
 
-    /* init the tiny part of PRTE we use */
-    prte_init_util(PRTE_PROC_TYPE_NONE);
+    rc = prte_init_minimum();
+    if (PRTE_SUCCESS != rc) {
+        return 1;
+    }
+
+    /* init the tiny part of PRTE we use - if that fails we have no
+     * output system and no install dirs, so there is nothing to be
+     * gained by pressing on into the schizo framework */
+    rc = prte_init_util(PRTE_PROC_TYPE_NONE);
+    if (PRTE_SUCCESS != rc) {
+        return 1;
+    }
 
     /* setup an event base */
     rc = prte_event_base_open();
@@ -159,42 +165,46 @@ int prun(int argc, char *argv[])
                                       PMIX_MCA_BASE_OPEN_DEFAULT);
     if (PRTE_SUCCESS != rc) {
         PRTE_ERROR_LOG(rc);
-        return rc;
+        return 1;
     }
 
     if (PRTE_SUCCESS != (rc = prte_schizo_base_select())) {
         PRTE_ERROR_LOG(rc);
-        return rc;
+        return 1;
     }
 
-    /* look for any personality specification */
-    personality = NULL;
-    for (i = 0; NULL != argv[i]; i++) {
-        if (0 == strcmp(argv[i], "--personality")) {
-            personality = argv[i + 1];
-            break;
-        }
-    }
+    /* normalize deprecated option spellings and look for any personality
+     * specification */
+    personality = prte_schizo_base_normalize_argv(pargv);
 
     /* detect if we are running as a proxy and select the active
      * schizo module for this tool */
     schizo = prte_schizo_base_detect_proxy(personality);
     if (NULL == schizo) {
-        pmix_show_help("help-schizo-base.txt", "no-proxy", true, prte_tool_basename, personality);
+        prte_show_help("help-schizo-base.txt", "no-proxy", true, prte_tool_basename, personality);
         return 1;
     }
     if (NULL == personality) {
         personality = schizo->name;
     }
 
-    /* Register all global MCA Params */
-    if (PRTE_SUCCESS != (rc = prte_register_params())) {
-        if (PRTE_ERR_SILENT != rc) {
-            pmix_show_help("help-prte-runtime", "prte_init:startup:internal-failure", true,
-                           "prte register params",
-                           PRTE_ERROR_NAME(rc), rc);
+    // check for bozo case
+    if (1 == argc) {
+        // prun cannot run without arguments
+        char *str;
+        param = prte_util_make_version_string("all", PRTE_MAJOR_VERSION, PRTE_MINOR_VERSION,
+                                              PRTE_RELEASE_VERSION, PRTE_GREEK_VERSION, NULL);
+        str = pmix_show_help_string("help-prun.txt", "usage", false,
+                                    prte_tool_basename, "PRRTE",
+                                    param,
+                                    prte_tool_basename,
+                                    "Report bugs to: https://github.com/openpmix/prrte");
+        if (NULL != str) {
+            printf("%s\n", str);
+            fflush(stdout);
+            free(str);
         }
-        return 1;
+        exit(1);
     }
 
     /* parse the input argv to get values, including everyone's MCA params */
@@ -212,7 +222,9 @@ int prun(int argc, char *argv[])
             if (PRTE_ERR_SILENT != rc) {
                 fprintf(stderr, "%s: command line error (%s)\n", prte_tool_basename, prte_strerror(rc));
             }
-            return rc;
+            /* a PRRTE error code is negative, and would reach the shell as
+             * a meaningless 8-bit remainder */
+            return 1;
         }
     }
 
@@ -271,35 +283,19 @@ int prun(int argc, char *argv[])
     opt = pmix_cmd_line_get_param(&results, PRTE_CLI_APPFILE);
     if (NULL != opt) {
         // parse the file and add its context to the argv array
-        fp = fopen(opt->values[0], "r");
-        if (NULL == fp) {
-            pmix_show_help("help-prun.txt", "appfile-failure", true, opt->values[0]);
-            if (NULL != mypidfile) {
-                free(mypidfile);
-            }
-            return 1;
+        rc = prte_load_appfile(opt->values[0], &pargv);
+        if (PRTE_SUCCESS != rc) {
+            prte_show_help("help-prun.txt", "appfile-failure", true, opt->values[0]);
+            PRTE_UPDATE_EXIT_STATUS(1);
+            goto DONE;
         }
-        first = true;
-        while (NULL != (param = pmix_getline(fp))) {
-            if (!first) {
-                // add a colon delimiter
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&pargv, ":");
-                ++pargc;
-            }
-            // break the line down into parts
-            split = PMIX_ARGV_SPLIT_COMPAT(param, ' ');
-            for (n=0; NULL != split[n]; n++) {
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&pargv, split[n]);
-                ++pargc;
-            }
-            PMIX_ARGV_FREE_COMPAT(split);
-            first = false;
-        }
-        fclose(fp);
+        pargc = PMIx_Argv_count(pargv);
     }
 
     // open the ess framework so it can init the signal forwarding
-    // list - we don't actually need the components
+    // list - we don't actually need the components.  prun_common()
+    // closes it, because it has to be closed before PMIx_tool_finalize
+    // unloads our components with its own; see the note there.
     rc = pmix_mca_base_framework_open(&prte_ess_base_framework,
                                       PMIX_MCA_BASE_OPEN_DEFAULT);
     if (PMIX_SUCCESS != rc) {
@@ -307,15 +303,18 @@ int prun(int argc, char *argv[])
         goto DONE;
     }
 
- 
+
     rc = prun_common(&results, schizo, pargc, pargv);
+    /* reflect the job's outcome in our exit status */
+    PRTE_UPDATE_EXIT_STATUS(rc);
 
 DONE:
-    // cleanup and leave
+    // cleanup and leave.  The ess framework is NOT closed here: a path that
+    // reached prun_common() has had it closed there, and every other path to
+    // this label either never opened it or is the open's own failure.
     if (NULL != mypidfile) {
         unlink(mypidfile);
     }
-    (void) pmix_mca_base_framework_close(&prte_ess_base_framework);
 
     exit(prte_exit_status);
 }

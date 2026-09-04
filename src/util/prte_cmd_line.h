@@ -15,7 +15,7 @@
  * Copyright (c) 2016-2017 Los Alamos National Security, LLC. All rights
  *                         reserved.
  * Copyright (c) 2017-2022 IBM Corporation.  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -30,6 +30,12 @@
 
 #ifdef HAVE_UNISTD_H
 #    include <unistd.h>
+#endif
+#ifdef HAVE_SYS_TYPES_H
+#    include <sys/types.h>
+#endif
+#ifdef HAVE_SYS_STAT_H
+#    include <sys/stat.h>
 #endif
 #include <ctype.h>
 #include <stdio.h>
@@ -70,13 +76,16 @@ BEGIN_C_DECLS
 #define PRTE_CLI_SET_SID                "set-sid"                   // none
 #define PRTE_CLI_REPORT_PID             "report-pid"                // required
 #define PRTE_CLI_REPORT_URI             "report-uri"                // required
-#define PRTE_CLI_TEST_SUICIDE           "test-suicide"              // none
 #define PRTE_CLI_DEFAULT_HOSTFILE       "default-hostfile"          // required
 #define PRTE_CLI_SINGLETON              "singleton"                 // required
 #define PRTE_CLI_KEEPALIVE              "keepalive"                 // required
 #define PRTE_CLI_LAUNCH_AGENT           "launch-agent"              // required
 #define PRTE_CLI_MAX_VM_SIZE            "max-vm-size"               // required
-#define PRTE_CLI_DEBUG                  "debug"                     // none
+/* NOTE: "--debug" is accepted only as a deprecated no-op (the option
+ * tables carry it as a literal in their deprecated sections, and
+ * convert_deprecated_cli warns and drops it).  There is deliberately no
+ * PRTE_CLI_DEBUG here: a canonical name would invite a new consumer for
+ * an option no tool acts on. */
 #define PRTE_CLI_DEBUG_DAEMONS          "debug-daemons"             // none
 #define PRTE_CLI_DEBUG_DAEMONS_FILE     "debug-daemons-file"        // none
 #define PRTE_CLI_LEAVE_SESSION_ATTACHED "leave-session-attached"    // none
@@ -90,7 +99,7 @@ BEGIN_C_DECLS
 #define PRTE_CLI_RUN_AS_ROOT            "allow-run-as-root"         // none
 #define PRTE_CLI_STREAM_BUF             "stream-buffering"          // required
 #define PRTE_CLI_BOOTSTRAP              "bootstrap"                 // none
-#define PRTE_CLI_HETERO_NODES           "hetero-nodes"              // none
+#define PRTE_CLI_HOMO_NODES             "uniform-nodes"             // none
 
 // Application options
 #define PRTE_CLI_NP                     "np"                        // required
@@ -102,6 +111,7 @@ BEGIN_C_DECLS
 #define PRTE_CLI_ADDHOSTFILE            "add-hostfile"              // required
 #define PRTE_CLI_HOST                   "host"                      // required
 #define PRTE_CLI_ADDHOST                "add-host"                  // required
+#define PRTE_CLI_ACTIVATE               "activate"                  // required
 #define PRTE_CLI_PATH                   "path"                      // required
 #define PRTE_CLI_PSET                   "pset"                      // required
 #define PRTE_CLI_PRELOAD_FILES          "preload-files"             // required
@@ -114,14 +124,17 @@ BEGIN_C_DECLS
 #define PRTE_CLI_DISABLE_RECOVERY       "disable-recovery"          // none
 #define PRTE_CLI_MEM_ALLOC_KIND			"memory-alloc-kinds"        // required
 #define PRTE_CLI_GPU_SUPPORT			"gpu-support"				// required
+#define PRTE_CLI_TARGET_ALLOC           "alloc-id"                  // required
+#define PRTE_CLI_ALLOC_REFID            "alloc-refid"               // required
+#define PRTE_CLI_SESSION_ID             "session-id"                // required
 
 // Placement options
-#define PRTE_CLI_MAPBY                  "map-by"                    // required
-#define PRTE_CLI_RANKBY                 "rank-by"                   // required
-#define PRTE_CLI_BINDTO                 "bind-to"                   // required
+#define PRTE_CLI_MAPBY                  "mapby"                     // required
+#define PRTE_CLI_RANKBY                 "rankby"                    // required
+#define PRTE_CLI_BINDTO                 "bindto"                    // required
 
 // Runtime options
-#define PRTE_CLI_RTOS                   "runtime-options"           // required
+#define PRTE_CLI_RTOS                   "rtos"           			// required
 
 // Debug options
 #define PRTE_CLI_DO_NOT_LAUNCH          "do-not-launch"             // none
@@ -141,7 +154,7 @@ BEGIN_C_DECLS
 #define PRTE_CLI_DVM                    "dvm"                       // optional
 
 // Daemon-specific CLI options
-#define PRTE_CLI_PUBSUB_SERVER          "prte-server"               // required
+#define PRTE_CLI_PUBSUB_SERVER          "pubsub-server"             // required
 #define PRTE_CLI_CONTROLLER_URI         "dvm-master-uri"            // required
 #define PRTE_CLI_PARENT_URI             "parent-uri"                // required
 #define PRTE_CLI_TREE_SPAWN             "tree-spawn"                // required
@@ -168,7 +181,7 @@ BEGIN_C_DECLS
 #define PRTE_CLI_PACKAGE    "package"
 #define PRTE_CLI_NODE       "node"
 #define PRTE_CLI_SEQ        "seq"
-#define PRTE_CLI_DIST       "dist"
+#define PRTE_CLI_DEVICE     "device="
 #define PRTE_CLI_PPR        "ppr"
 #define PRTE_CLI_RANKFILE   "rankfile"
 #define PRTE_CLI_NONE       "none"
@@ -204,6 +217,7 @@ BEGIN_C_DECLS
 // Runtime directives
 #define PRTE_CLI_ERROR_NZ           "error-nonzero-status"          // optional arg
 #define PRTE_CLI_NOLAUNCH           "donotlaunch"                   // no arg
+#define PRTE_CLI_NOSPAWN            "donotspawn"                    // no arg
 #define PRTE_CLI_SHOW_PROGRESS      "show-progress"                 // optional arg
 #define PRTE_CLI_RECOVERABLE        "recoverable"                   // optional arg
 #define PRTE_CLI_AUTORESTART        "autorestart"                   // optional arg
@@ -219,7 +233,12 @@ BEGIN_C_DECLS
 #define PRTE_CLI_REPORT_STATE       "report-state-on-timeout"       // optional arg
 #define PRTE_CLI_STACK_TRACES       "get-stack-traces"              // optional arg
 #define PRTE_CLI_REPORT_CHILD_SEP   "report-child-jobs-separately"  // optional arg
-#define PRTE_CLI_AGG_HELP           "aggregate-help"                // optional arg
+// the full name is what the runtime-options help text and the MCA param
+// description both document; the option matcher accepts any unambiguous
+// prefix, so the shorter "aggregate-help" still works. Naming the SHORT
+// form here had the opposite effect - a directive longer than the name
+// matches no prefix of it, so the documented spelling was rejected.
+#define PRTE_CLI_AGG_HELP           "aggregate-help-messages"       // optional arg
 #define PRTE_CLI_NOTIFY_ERRORS      "notifyerrors"                  // optional flag
 #define PRTE_CLI_OUTPUT_PROCTABLE   "output-proctable"              // optional arg
 
@@ -234,7 +253,6 @@ BEGIN_C_DECLS
 #define PRTE_CLI_NOLOCAL    "nolocal"
 // PRTE_CLI_HWTCPUS reused here
 #define PRTE_CLI_CORECPUS   "corecpus"
-#define PRTE_CLI_DEVICE     "device="
 #define PRTE_CLI_INHERIT    "inherit"
 #define PRTE_CLI_NOINHERIT  "noinherit"
 #define PRTE_CLI_QDIR       "dir="
@@ -243,6 +261,9 @@ BEGIN_C_DECLS
 #define PRTE_CLI_NOOVERLOAD "no-overload"
 #define PRTE_CLI_IF_SUPP    "if-supported"
 #define PRTE_CLI_ORDERED    "ordered"
+#define PRTE_CLI_INTERLEAVE "interleave"
+#define PRTE_CLI_SHARED     "shared"
+#define PRTE_CLI_NDEV       "ndev"
 #define PRTE_CLI_REPORT     "report"
 #define PRTE_CLI_DISPALLOC  "displayalloc"
 // PRTE_CLI_DISPLAY reused here
@@ -250,9 +271,116 @@ BEGIN_C_DECLS
 #define PRTE_CLI_LIMIT      "limit="
 
 // Output qualifiers
+#define PRTE_CLI_COPY       "copy"
 #define PRTE_CLI_NOCOPY     "nocopy"
 #define PRTE_CLI_RAW        "raw"
 #define PRTE_CLI_PATTERN    "pattern"
+
+/*
+ * The value of a qualifier declared above with a trailing '=' - PE=2,
+ * FILE=path, LIMIT=4 - is read with pmix_cli_qualifier_value(), which comes
+ * from PMIx alongside PMIX_CHECK_CLI_OPTION: the two belong together,
+ * because the matcher accepts any unambiguous prefix of a qualifier's name
+ * and the caller therefore cannot know how long the name it matched was.
+ * Never index past the qualifier's full spelling to reach its value.
+ *
+ * There is deliberately no local fallback for a PMIx that lacks it.  A
+ * second implementation of a rule this easy to get wrong is a second thing
+ * to keep right; configure refuses such a PMIx instead.
+ */
+
+/*
+ * Interpreters for option values that more than one tool accepts.  These
+ * live here, and not in a tool's main(), because a tool's main() cannot be
+ * unit tested - see test/unit/tools.
+ */
+
+/**
+ * Interpret the optional value carried by a boolean directive or qualifier.
+ *
+ * Every boolean directive of "--output", "--display" and "--rtos" may be
+ * written bare ("tag") or with a value ("tag=0", "tag=false", "tag=no").
+ * The bare form is the assertion; the value form says the same thing out
+ * loud, and is the only way to say the opposite.
+ *
+ * A value that is neither true nor false is REFUSED rather than read as
+ * false.  The truth test underneath reports anything it does not recognize
+ * as false, so "tag=maybe" would otherwise mean "no tags" - and "tag=0"
+ * used to mean "tags", since the value was not looked at at all.  The
+ * caller reports the error, since only the caller knows which directive of
+ * which option was being written.
+ *
+ * @param value  the text after the '=' - NULL or empty for the bare form
+ * @param flag   the truth the directive carries; bare == true
+ *
+ * @retval PRTE_SUCCESS
+ * @retval PRTE_ERR_BAD_PARAM  the value is not a truth value
+ */
+PRTE_EXPORT int prte_cli_bool_value(const char *value, bool *flag);
+
+/**
+ * Interpret the value of "--pid": either a decimal PID, or "file:<path>"
+ * naming a file whose first token is one.
+ *
+ * @param value     the option's value
+ * @param pid       filled in on success
+ * @param filename  if non-NULL, set to the path within @c value when the
+ *                  "file:" form was used (borrowed, not a copy), else NULL.
+ *                  Callers use it to name the file in an error message.
+ *
+ * @retval PRTE_SUCCESS
+ * @retval PRTE_ERR_BAD_PARAM          neither form, or out of range
+ * @retval PRTE_ERR_FILE_OPEN_FAILURE  the named file could not be opened
+ * @retval PRTE_ERR_FILE_READ_FAILURE  the file held no readable PID
+ */
+PRTE_EXPORT int prte_parse_pid_option(const char *value, pid_t *pid,
+                                      const char **filename);
+
+/**
+ * Append the contents of an appfile to an argument vector, one app
+ * context per line, ':'-delimited as if they had been typed.
+ *
+ * @param filename  the appfile
+ * @param argv      argv to append to - may already hold the tool's own
+ *                  arguments, and is created if it points at NULL
+ *
+ * @retval PRTE_SUCCESS
+ * @retval PRTE_ERR_FILE_OPEN_FAILURE
+ */
+PRTE_EXPORT int prte_load_appfile(const char *filename, char ***argv);
+
+/**
+ * Interpret an octal umask string, as handed to a daemon in
+ * PRTE_DAEMON_UMASK_VALUE.
+ *
+ * @return true (and fills @c mask) only for a complete, in-range octal
+ *         value - an empty or trailing-garbage string is refused rather
+ *         than silently read as 0, which would leave every file the
+ *         daemon creates world-writable.
+ */
+PRTE_EXPORT bool prte_parse_umask(const char *value, mode_t *mask);
+
+/**
+ * Interpret a command-line option value that has to be a non-negative
+ * decimal number.
+ *
+ * strtoul() reports a perfectly successful zero for a string with no
+ * digits in it, and zero is meaningful almost everywhere PRRTE asks for a
+ * number - "no timeout", "let the mapping policy compute the count",
+ * "rank 0".  So a misspelled value does not fail; it quietly means
+ * something else.  This refuses anything that is not a complete run of
+ * digits, and anything that does not fit the field the caller is going
+ * to store it in.
+ *
+ * @param value   the option's value
+ * @param limit   the largest value the caller's field can hold
+ * @param result  filled in on success, zero otherwise
+ *
+ * @retval PRTE_SUCCESS
+ * @retval PRTE_ERR_BAD_PARAM  not a number, or larger than @c limit
+ */
+PRTE_EXPORT int prte_parse_uint_option(const char *value, unsigned long limit,
+                                       unsigned long *result);
 
 END_C_DECLS
 

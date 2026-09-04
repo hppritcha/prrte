@@ -16,7 +16,7 @@
  * Copyright (c) 2014-2020 Intel, Inc.  All rights reserved.
  * Copyright (c) 2017-2019 Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * Copyright (c) 2023-2024 Triad National Security, LLC. All rights
  *                         reserved.
  * $COPYRIGHT$
@@ -74,6 +74,7 @@
 #include "src/threads/pmix_threads.h"
 #include "src/util/name_fns.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 
 #include "plm_pals.h"
 #include "src/mca/plm/base/base.h"
@@ -123,7 +124,6 @@ static int plm_pals_init(void)
 
     if (PRTE_SUCCESS != (rc = prte_plm_base_comm_start())) {
         PRTE_ERROR_LOG(rc);
-	fprintf(stderr, "OOPS prte_plm_base_comm_start returned error\n");
         return rc;
     }
 
@@ -180,13 +180,20 @@ static void launch_daemons(int fd, short args, void *cbdata)
     char *vpid_string;
     char **custom_strings;
     int num_args, i;
-    char *cur_prefix, *pmix_prefix;
+    char *cur_prefix = NULL, *pmix_prefix = NULL;
     int proc_vpid_index;
     prte_job_t *daemons;
     prte_state_caddy_t *state = (prte_state_caddy_t *) cbdata;
     PRTE_HIDE_UNUSED_PARAMS(fd, args);
 
     PMIX_ACQUIRE_OBJECT(state);
+
+    /* arm the failure flag for THIS launch. It is a file-static (rather than
+     * a local, as in the other components) because pals_wait_cb consults it
+     * to tell "aprun never started the daemons" from "a daemon died after
+     * launch" - but that means it must be re-armed on every launch, else the
+     * cleanup path below can never report a failure */
+    failed_launch = true;
 
     /* start by setting up the virtual machine */
     daemons = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
@@ -254,12 +261,12 @@ static void launch_daemons(int fd, short args, void *cbdata)
 
     /* Append user defined arguments to aprun */
     if (NULL != prte_mca_plm_pals_component.custom_args) {
-        custom_strings = PMIX_ARGV_SPLIT_COMPAT(prte_mca_plm_pals_component.custom_args, ' ');
-        num_args = PMIX_ARGV_COUNT_COMPAT(custom_strings);
+        custom_strings = PMIx_Argv_split(prte_mca_plm_pals_component.custom_args, ' ');
+        num_args = PMIx_Argv_count(custom_strings);
         for (i = 0; i < num_args; ++i) {
             pmix_argv_append(&argc, &argv, custom_strings[i]);
         }
-        PMIX_ARGV_FREE_COMPAT(custom_strings);
+        PMIx_Argv_free(custom_strings);
     }
 
     /* number of processors needed */
@@ -298,13 +305,13 @@ static void launch_daemons(int fd, short args, void *cbdata)
              */
             pmix_argv_append(&nodelist_argc, &nodelist_argv, node->name);
         }
-        if (0 == PMIX_ARGV_COUNT_COMPAT(nodelist_argv)) {
-            pmix_show_help("help-plm-pals.txt", "no-hosts-in-list", true);
+        if (0 == PMIx_Argv_count(nodelist_argv)) {
+            prte_show_help("help-plm-pals.txt", "no-hosts-in-list", true);
             rc = PRTE_ERR_FAILED_TO_START;
             goto cleanup;
         }
-        nodelist_flat = PMIX_ARGV_JOIN_COMPAT(nodelist_argv, ',');
-        PMIX_ARGV_FREE_COMPAT(nodelist_argv);
+        nodelist_flat = PMIx_Argv_join(nodelist_argv, ',');
+        PMIx_Argv_free(nodelist_argv);
 
         pmix_argv_append(&argc, &argv, "-L");
         pmix_argv_append(&argc, &argv, nodelist_flat);
@@ -336,7 +343,7 @@ static void launch_daemons(int fd, short args, void *cbdata)
     free(vpid_string);
 
     if (prte_mca_plm_pals_component.debug) {
-        param = PMIX_ARGV_JOIN_COMPAT(argv, ' ');
+        param = PMIx_Argv_join(argv, ' ');
         if (NULL != param) {
             pmix_output(0, "plm:pals: final top-level argv:");
             pmix_output(0, "plm:pals:     %s", param);
@@ -363,10 +370,10 @@ static void launch_daemons(int fd, short args, void *cbdata)
 
     /* setup environment - this is the pristine version that PRRTE
      * has already stripped of all PRTE_ and PMIX_ prefixed values */
-    env = PMIX_ARGV_COPY_COMPAT(prte_launch_environ);
+    env = PMIx_Argv_copy(prte_launch_environ);
 
     if (0 < pmix_output_get_verbosity(prte_plm_base_framework.framework_output)) {
-        param = PMIX_ARGV_JOIN_COMPAT(argv, ' ');
+        param = PMIx_Argv_join(argv, ' ');
         PMIX_OUTPUT_VERBOSE((1, prte_plm_base_framework.framework_output,
                              "%s plm:pals: final top-level argv:\n\t%s",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), (NULL == param) ? "NULL" : param));
@@ -389,11 +396,13 @@ static void launch_daemons(int fd, short args, void *cbdata)
 
 cleanup:
     if (NULL != argv) {
-        PMIX_ARGV_FREE_COMPAT(argv);
+        PMIx_Argv_free(argv);
     }
     if (NULL != env) {
-        PMIX_ARGV_FREE_COMPAT(env);
+        PMIx_Argv_free(env);
     }
+    free(cur_prefix);
+    free(pmix_prefix);
 
     /* check for failed launch - if so, force terminate */
     if (failed_launch) {
@@ -522,12 +531,17 @@ static int plm_pals_start_proc(int argc, char **argv, char **env,
         return PRTE_ERR_SYS_LIMITS_CHILDREN;
     }
 
-    palsrun = PMIX_NEW(prte_proc_t);
-    palsrun->pid = pals_pid;
-    /* be sure to mark it as alive so we don't instantly fire */
-    PRTE_FLAG_SET(palsrun, PRTE_PROC_FLAG_ALIVE);
-    /* setup the waitpid so we can find out if pals succeeds! */
-    prte_wait_cb(palsrun, pals_wait_cb, NULL);
+    if (0 < pals_pid) { /* parent */
+        /* track the launcher process - do this ONLY in the parent: in the
+         * child pals_pid is 0, so we would register a waitpid callback on
+         * a bogus proc moments before execve replaces us anyway */
+        palsrun = PMIX_NEW(prte_proc_t);
+        palsrun->pid = pals_pid;
+        /* be sure to mark it as alive so we don't instantly fire */
+        PRTE_FLAG_SET(palsrun, PRTE_PROC_FLAG_ALIVE);
+        /* setup the waitpid so we can find out if pals succeeds! */
+        prte_wait_cb(palsrun, pals_wait_cb, NULL);
+    }
 
     if (0 == pals_pid) { /* child */
         char *bin_base = NULL, *lib_base = NULL;
@@ -550,7 +564,7 @@ static int plm_pals_start_proc(int argc, char **argv, char **env,
             } else {
                 pmix_asprintf(&newenv, "%s/%s", prefix, bin_base);
             }
-            PMIX_SETENV_COMPAT("PATH", newenv, true, &env);
+            PMIx_Setenv("PATH", newenv, true, &env);
             if (prte_mca_plm_pals_component.debug) {
                 pmix_output(0, "plm:pals: reset PATH: %s", newenv);
             }
@@ -563,13 +577,13 @@ static int plm_pals_start_proc(int argc, char **argv, char **env,
             } else {
                 pmix_asprintf(&newenv, "%s/%s", prefix, lib_base);
             }
-            PMIX_SETENV_COMPAT("LD_LIBRARY_PATH", newenv, true, &env);
+            PMIx_Setenv("LD_LIBRARY_PATH", newenv, true, &env);
             if (prte_mca_plm_pals_component.debug) {
                 pmix_output(0, "plm:pals: reset LD_LIBRARY_PATH: %s", newenv);
             }
             free(newenv);
             // add the prefix itself to the environment
-            PMIX_SETENV_COMPAT("PRTE_PREFIX", prefix, true, &env);
+            PMIx_Setenv("PRTE_PREFIX", prefix, true, &env);
         }
 
         /* for pmix_prefix, we only have to modify the library path.
@@ -585,13 +599,13 @@ static int plm_pals_start_proc(int argc, char **argv, char **env,
                 pmix_asprintf(&newenv, "%s/%s", pmix_prefix, p);
             }
             free(p);
-            PMIX_SETENV_COMPAT("LD_LIBRARY_PATH", newenv, true, &env);
+            PMIx_Setenv("LD_LIBRARY_PATH", newenv, true, &env);
             if (prte_mca_plm_pals_component.debug) {
                 pmix_output(0, "plm:pals: reset LD_LIBRARY_PATH: %s", newenv);
             }
             free(newenv);
             // add the prefix itself to the environment
-            PMIX_SETENV_COMPAT("PMIX_PREFIX", pmix_prefix, true, &env);
+            PMIx_Setenv("PMIX_PREFIX", pmix_prefix, true, &env);
         }
 
         fd = open("/dev/null", O_CREAT | O_WRONLY | O_TRUNC, 0666);

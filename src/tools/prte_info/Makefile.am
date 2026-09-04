@@ -14,7 +14,7 @@
 # Copyright (c) 2016-2020 Intel, Inc.  All rights reserved.
 # Copyright (c) 2017      Research Organization for Information Science
 #                         and Technology (RIST). All rights reserved.
-# Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+# Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
 # $COPYRIGHT$
 #
 # Additional copyrights may follow
@@ -36,19 +36,14 @@ AM_CFLAGS = \
 			-DPRTE_CC_ABSOLUTE="\"@PRTE_CC_ABSOLUTE@\"" \
 			-DPRTE_GREEK_VERSION="\"@PRTE_GREEK_VERSION@\"" \
 			-DPRTE_REPO_REV="\"@PRTE_REPO_REV@\"" \
-			-DPMIX_RELEASE_DATE="\"@PMIX_RELEASE_DATE@\""
+			-DPRTE_RELEASE_DATE="\"@PRTE_RELEASE_DATE@\""
 
 AM_LDFLAGS = $(prte_hwloc_LDFLAGS) $(prte_libevent_LDFLAGS) $(prte_pmix_LDFLAGS)
 
 bin_PROGRAMS = prte-info
 
 prte_info_SOURCES = \
-		pinfo.h \
-		prte_info.c \
-		output.c \
-		param.c \
-		components.c \
-		version.c
+		prte_info.c
 
 prte_info_LDADD = \
 	$(prte_libevent_LIBS) \

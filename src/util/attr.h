@@ -3,10 +3,12 @@
  * Copyright (c) 2016      Research Organization for Information Science
  *                         and Technology (RIST). All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * Copyright (c) 2021      The University of Tennessee and The University
  *                         of Tennessee Research Foundation.  All rights
  *                         reserved.
+ * Copyright (c) 2026      Barcelona Supercomputing Center (BSC-CNS).
+ *                         All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -64,6 +66,40 @@ typedef uint8_t prte_app_context_flags_t;
 #define PRTE_APP_ADD_ENVAR          21 // prte_envar_t - add envar, do not override pre-existing one
 #define PRTE_APP_PSET_NAME          23 // string - user-assigned name for the process
                                        //          set containing the given process
+#define PRTE_APP_PES_PER_PROC       24 // uint16_t - number of cpus to be assigned to each process
+#define PRTE_APP_PPR                25 // string - this app's ppr pattern, "N:object", in the same
+                                       //          spelling as the job-level PRTE_JOB_PPR. The object
+                                       //          is part of the pattern: an app that asks for
+                                       //          "2:package" is not asking for the job's object
+                                       //          twice per node
+#define PRTE_APP_MAPBY              26 /* uint16_t mapping policy enum */
+#define PRTE_APP_RANKBY             27 /* uint16_t ranking policy enum */
+#define PRTE_APP_BINDTO             28 /* uint16_t binding policy enum */
+#define PRTE_APP_MAP_FILE           29 /* char* path to seq or rankfile */
+#define PRTE_APP_MAP_DEVICE         30 /* char* device class or name for --map-by device= */
+#define PRTE_APP_MAP_INTERLEAVE     39 /* char* level to interleave the device list across */
+#define PRTE_APP_MAP_SHARED         40 /* bool: devices may be shared by several procs */
+#define PRTE_APP_MAP_NDEV           41 /* uint16_t: devices assigned to each proc */
+#define PRTE_APP_HWT_CPUS           31 /* bool: use hwthreads as CPUs */
+#define PRTE_APP_CORE_CPUS          32 /* bool: use cores as CPUs */
+#define PRTE_APP_CPUSET             33 /* char* comma-delimited CPU ranges */
+#define PRTE_APP_BINDING_LIMIT      34 /* uint16_t max procs per binding target */
+/* effective map/rank/bind policies resolved for this app during per-app
+ * dispatch, recorded so the map display can show per-app policy lines. Local
+ * to the HNP - never packed/sent. */
+#define PRTE_APP_RESOLVED_MAPBY     35 /* uint16_t resolved mapping policy */
+#define PRTE_APP_RESOLVED_RANKBY    36 /* uint16_t resolved ranking policy */
+#define PRTE_APP_RESOLVED_BINDTO    37 /* uint16_t resolved binding policy */
+/* the mapping component that placed this app, recorded by the rmaps base once
+ * a mapper accepts it. There is no matching "which mapper to use" key: the
+ * mapping policy is the choice of mapper. Local to the HNP - never
+ * packed/sent. */
+#define PRTE_APP_LAST_MAPPER        38 /* char* mapping component that placed this app */
+/* nodes the DVM is to be extended across before this app is launched. Unlike
+ * PRTE_APP_ADD_HOST this adds nothing to the allocation - it can only name
+ * nodes the allocation already contains, and merely asks that a daemon be
+ * started on them. */
+#define PRTE_APP_ACTIVATE_HOSTS     42 /* char* hosts to bring into the DVM */
 
 #define PRTE_APP_MAX_KEY 100
 
@@ -87,6 +123,7 @@ typedef uint8_t prte_node_flags_t;
 #define PRTE_NODE_SERIAL_NUMBER (PRTE_NODE_START_KEY + 5) // string - serial number: used if node is a coprocessor
 #define PRTE_NODE_PORT          (PRTE_NODE_START_KEY + 6) // int32 - Alternate port to be passed to plm
 #define PRTE_NODE_ADD_SLOTS     (PRTE_NODE_START_KEY + 7) // bool - slots are being added to existing node
+#define PRTE_NODE_ALLOC_ID      (PRTE_NODE_START_KEY + 8) // uint32_t - allocation ID of the session to which this node belongs
 
 #define PRTE_NODE_MAX_KEY (PRTE_NODE_START_KEY + 100)
 
@@ -99,6 +136,8 @@ typedef uint16_t prte_job_flags_t;
 #define PRTE_JOB_FLAG_FORWARD_OUTPUT    0x0020 // forward output from the apps
 #define PRTE_JOB_FLAG_DO_NOT_MONITOR    0x0040 // do not monitor apps for termination
 #define PRTE_JOB_FLAG_FORWARD_COMM      0x0080 //
+#define PRTE_JOB_FLAG_SUSPENDED         0x0100 // job's procs have been stopped by a session
+                                               // pause/preempt directive and await a resume/restore
 #define PRTE_JOB_FLAG_RESTART           0x0200 //
 #define PRTE_JOB_FLAG_PROCS_MIGRATING   0x0400 // some procs in job are migrating from one node to another
 #define PRTE_JOB_FLAG_OVERSUBSCRIBED    0x0800 // at least one node in the job is oversubscribed
@@ -186,7 +225,10 @@ typedef uint16_t prte_job_flags_t;
 #define PRTE_JOB_TRACE_TIMEOUT_EVENT        (PRTE_JOB_START_KEY +  75) // prte_ptr (prte_timer_t*) - timer event for stacktrace collection
 #define PRTE_JOB_INHERIT                    (PRTE_JOB_START_KEY +  76) // bool - job inherits parent's mapping/ranking/binding policies
 #define PRTE_JOB_PES_PER_PROC               (PRTE_JOB_START_KEY +  77) // uint16_t - number of cpus to be assigned to each process
-#define PRTE_JOB_DIST_DEVICE                (PRTE_JOB_START_KEY +  78) // char* - device to use for dist mapping
+#define PRTE_JOB_MAP_DEVICE                 (PRTE_JOB_START_KEY +  78) // char* - device class or name for --map-by device=
+#define PRTE_JOB_MAP_INTERLEAVE             (PRTE_JOB_START_KEY + 128) // char* - level to interleave the device list across
+#define PRTE_JOB_MAP_SHARED                 (PRTE_JOB_START_KEY + 129) // bool - devices may be shared by several procs
+#define PRTE_JOB_MAP_NDEV                   (PRTE_JOB_START_KEY + 130) // uint16_t - devices assigned to each proc
 #define PRTE_JOB_HWT_CPUS                   (PRTE_JOB_START_KEY +  79) // bool - job requests hwthread cpus
 #define PRTE_JOB_CORE_CPUS                  (PRTE_JOB_START_KEY +  80) // bool - job requests core cpus
 #define PRTE_JOB_PPR                        (PRTE_JOB_START_KEY +  81) // char* - string specifying the procs-per-resource pattern
@@ -198,6 +240,15 @@ typedef uint16_t prte_job_flags_t;
 #define PRTE_JOB_DEBUG_DAEMONS_PER_PROC     (PRTE_JOB_START_KEY +  87) // uint16_t - Number of debug daemons per application proc
 #define PRTE_JOB_STOP_IN_INIT               (PRTE_JOB_START_KEY +  88) // bool - stop in PMIx_Init
 #define PRTE_JOB_STOP_IN_APP                (PRTE_JOB_START_KEY +  89) // bool - stop at app-determined location
+#define PRTE_JOB_BREAKPOINT                 (PRTE_JOB_START_KEY + 131) // char* - string ID of the app-determined location at which to stop
+#define PRTE_JOB_SPAWN_ALLOC                (PRTE_JOB_START_KEY + 132) // pmix_data_array_t* - an entire allocation request (PMIX_SPAWN_ALLOC)
+                                                                       // to be executed before this job is launched: the array's first
+                                                                       // element carries the directive, the rest are the request's info
+#define PRTE_JOB_SPAWN_ALLOC_ID             (PRTE_JOB_START_KEY + 133) // char* - PMIX_ALLOC_ID of the allocation obtained FOR this job by
+                                                                       // PRTE_JOB_SPAWN_ALLOC. Present only while the job owes that
+                                                                       // allocation a release should it fail to launch
+#define PRTE_JOB_SPAWN_ALLOC_STATUS         (PRTE_JOB_START_KEY + 134) // int32_t - the spawn status held while the allocation obtained for a
+                                                                       // failed job is handed back, and delivered once it has been
 #define PRTE_JOB_ENVARS_HARVESTED           (PRTE_JOB_START_KEY +  90) // envars have already been harvested
 #define PRTE_JOB_OUTPUT_NOCOPY              (PRTE_JOB_START_KEY +  91) // bool - do not copy output to stdout/err
 #define PRTE_JOB_RANK_OUTPUT                (PRTE_JOB_START_KEY +  92) // bool - tag stdout/stderr with rank
@@ -240,6 +291,22 @@ typedef uint16_t prte_job_flags_t;
 #define PRTE_JOB_FWD_ENVIRONMENT            (PRTE_JOB_START_KEY + 120) // bool - forward local environment to procs in this job
 #define PRTE_JOB_REPORT_PHYSICAL_CPUS       (PRTE_JOB_START_KEY + 121) // bool - report using physical (vs logical) cpu IDs
 #define PRTE_JOB_ALLOC_DISPLAYED            (PRTE_JOB_START_KEY + 122) // bool - allocation has been displayed
+#define PRTE_JOB_DO_NOT_SPAWN               (PRTE_JOB_START_KEY + 123) // bool - do not spawn app procs
+#define PRTE_JOB_SPAWN_TARGET               (PRTE_JOB_START_KEY + 124) // char* - comma-delimited list of PMIX_ALLOC_ID strings naming the
+                                                                       // allocations (sessions) this job may map onto; empty token = default session
+#define PRTE_JOB_OUTPUT_FILE_PATTERN        (PRTE_JOB_START_KEY + 125) // bool - treat PRTE_JOB_OUTPUT_TO_FILE as a name pattern the user
+                                                                       // controls instead of annotating it with nspace and rank
+#define PRTE_JOB_REPORT_CHILD_SEP           (PRTE_JOB_START_KEY + 126) // bool - report the exit status of child jobs separately: return the
+                                                                       // primary job's status only, rather than the first non-zero status
+                                                                       // returned by the primary job or any job it spawned
+#define PRTE_JOB_NO_IOF_INHERIT             (PRTE_JOB_START_KEY + 127) // bool - this job is NOT to inherit the output forwarding of the job
+                                                                       // that spawned it. Recorded by the mapper, which is where the
+                                                                       // inherit question is resolved, and read where the job's PMIx
+                                                                       // information is built, which is where it has to be told to PMIx.
+                                                                       // Deliberately NOT PRTE_JOB_NOINHERIT: that one is consulted when
+                                                                       // this job later becomes a parent itself, so reusing it would make
+                                                                       // a non-inheriting child silently refuse to pass mapping,
+                                                                       // ranking and binding on to a grandchild
 
 #define PRTE_JOB_MAX_KEY (PRTE_JOB_START_KEY + 200)
 
@@ -276,6 +343,7 @@ typedef uint16_t prte_proc_flags_t;
 #define PRTE_PROC_NODENAME          (PRTE_PROC_START_KEY + 12) // string - node where proc is located, used only by tools
 #define PRTE_PROC_CGROUP            (PRTE_PROC_START_KEY + 13) // string - name of cgroup this proc shall be assigned to
 #define PRTE_PROC_NBEATS            (PRTE_PROC_START_KEY + 14) // int32 - number of heartbeats in current window
+#define PRTE_PROC_DEVICE_ID         (PRTE_PROC_START_KEY + 15) // pmix_data_array_t of pmix_device_t - the devices this proc was mapped against, always an array even for one
 
 #define PRTE_PROC_MAX_KEY (PRTE_PROC_START_KEY + 100)
 
@@ -296,6 +364,26 @@ typedef uint16_t prte_proc_flags_t;
 #define PRTE_RML_MAX_KEY (PRTE_RML_START_KEY + 100)
 
 #define PRTE_ATTR_KEY_MAX PRTE_RML_MAX_KEY
+
+/*** SESSION FLAGS ***/
+typedef uint16_t prte_session_flags_t;
+#define PRTE_SESSION_FLAG_DYNAMIC       0x0001 // session was dynamically allocated
+#define PRTE_SESSION_FLAG_RESERVED      0x0002 // nodes withheld from default pool
+#define PRTE_SESSION_FLAG_DETACHED      0x0004 // session lifetime is independent of its owning
+                                               // namespace (PMIX_SESSION_SEP) - the inheritance
+                                               // disposition is not fired when that namespace ends
+#define PRTE_SESSION_FLAG_PAUSED        0x0008 // every job in the session has been stopped by a
+                                               // PMIX_SESSION_PAUSE directive
+#define PRTE_SESSION_FLAG_SCHEDULER     0x0010 // session was instantiated by the scheduler via
+                                               // PMIx_Session_control, so its completion must be
+                                               // reported back to the scheduler
+#define PRTE_SESSION_FLAG_TERMINATING   0x0020 // a PMIX_SESSION_TERMINATE is in flight - the
+                                               // session is reclaimed once its jobs have retired
+#define PRTE_SESSION_FLAG_AUTO_COMPLETE 0x0040 // the session exists to run the jobs it was
+                                               // instantiated with, so it is reclaimed when the
+                                               // last of them retires rather than persisting
+                                               // until an explicit terminate
+
 
 /*** FLAG OPS ***/
 #define PRTE_FLAG_SET(p, f)   ((p)->flags |= (f))
@@ -318,8 +406,20 @@ PRTE_EXPORT void prte_remove_attribute(pmix_list_t *attributes, prte_attribute_k
 PRTE_EXPORT prte_attribute_t *prte_fetch_attribute(pmix_list_t *attributes, prte_attribute_t *prev,
                                                    prte_attribute_key_t key);
 
+/* Add an attribute to the front of a list, keeping any prior entry with the
+ * same key - use for the multi-valued attributes (the envar directives) when
+ * the new entry must be applied BEFORE the ones already there.  Note that
+ * prepending a block of entries one at a time reverses that block: walk the
+ * source in reverse if its internal order matters. */
 PRTE_EXPORT int prte_prepend_attribute(pmix_list_t *attributes, prte_attribute_key_t key,
                                        bool local, void *data, pmix_data_type_t type);
+
+/* Add an attribute to the end of a list, keeping any prior entry with the
+ * same key.  This is what preserves the order a set of multi-valued
+ * attributes was generated in - which, for the envar directives, is the
+ * order the user gave them on the command line. */
+PRTE_EXPORT int prte_append_attribute(pmix_list_t *attributes, prte_attribute_key_t key,
+                                      bool local, void *data, pmix_data_type_t type);
 
 PRTE_EXPORT int prte_attr_load(prte_attribute_t *kv, void *data, pmix_data_type_t type);
 
@@ -351,8 +451,10 @@ struct prte_proc_t;
 struct prte_node_t;
 struct prte_app_context_t;
 struct prte_job_t;
+struct prte_session_t;
 
 PRTE_EXPORT char* prte_print_proc_flags(struct prte_proc_t *p);
 PRTE_EXPORT char* prte_print_node_flags(struct prte_node_t *p);
 PRTE_EXPORT char* prte_print_app_flags(struct prte_app_context_t *p);
 PRTE_EXPORT char* prte_print_job_flags(struct prte_job_t *p);
+PRTE_EXPORT char* prte_print_session_flags(struct prte_session_t *ptr);

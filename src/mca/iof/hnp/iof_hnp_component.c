@@ -51,7 +51,7 @@ const char *prte_mca_iof_hnp_component_version_string
 
 prte_mca_iof_hnp_component_t prte_mca_iof_hnp_component = {
     .super = {
-        PRTE_IOF_BASE_VERSION_2_0_0,
+        PRTE_MCA_BASE_VERSION(iof),
 
         .pmix_mca_component_name = "hnp",
         PMIX_MCA_BASE_MAKE_VERSION(component,
@@ -63,7 +63,8 @@ prte_mca_iof_hnp_component_t prte_mca_iof_hnp_component = {
         .pmix_mca_open_component = prte_iof_hnp_open,
         .pmix_mca_close_component = prte_iof_hnp_close,
         .pmix_mca_query_component = prte_iof_hnp_query,
-    }
+    },
+    .xoff = false
 };
 PMIX_MCA_BASE_COMPONENT_INIT(prte, iof, hnp)
 
@@ -88,7 +89,7 @@ static int prte_iof_hnp_close(void)
 static int prte_iof_hnp_query(pmix_mca_base_module_t **module, int *priority)
 {
     /* if we are not the HNP, then don't use this module */
-    if (!PRTE_PROC_IS_MASTER && !PRTE_PROC_IS_MASTER) {
+    if (!PRTE_PROC_IS_MASTER) {
         *priority = -1;
         *module = NULL;
         return PRTE_ERROR;

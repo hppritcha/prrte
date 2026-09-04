@@ -17,7 +17,7 @@
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2020      Amazon.com, Inc. or its affiliates.  All Rights
  *                         reserved.
- * Copyright (c) 2021-2024 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -57,7 +57,34 @@ typedef struct {
     pmix_list_t addrs;
     prte_oob_tcp_addr_t *active_addr;
     prte_oob_tcp_state_t state;
+    bool established;          /**< did the connection currently held ever reach CONNECTED?
+                                    Cleared by prte_oob_tcp_peer_close, so it always describes
+                                    the connection being closed.  Separates a connection that
+                                    died while still being established, whose untried addresses
+                                    must still be tried, from the loss of a working one. */
+    bool ever_connected;       /**< has a connection to this peer EVER reached CONNECTED?
+                                    Unlike `established`, this is never cleared, so it answers
+                                    a different question: not "is the connection being closed
+                                    a working one" but "did this peer ever work at all".  That
+                                    is what separates a daemon we have never reached - which
+                                    may not have started, or may be behind a firewall - from
+                                    one that was running and has since gone away, and the two
+                                    need opposite advice. */
     int num_retries;
+    time_t first_attempt; /**< wall-clock time of the first connection attempt in the current
+                               retry sequence; 0 until the first retry is scheduled.  Used to
+                               bound how long we chase a non-lifeline peer before healing to an
+                               ancestor (see prte_oob_base.connect_max_time). */
+    prte_event_base_t *evbase; /**< the base servicing this peer's socket once connected.
+                                    Assigned round-robin at construction from
+                                    prte_oob_base.ev_bases; equal to prte_event_base when no
+                                    worker progress threads were requested.  The connection
+                                    state machine and the handshake always run on
+                                    prte_event_base - the events move here at CONNECTED. */
+    pmix_mutex_t lock;         /**< guards send_msg/send_queue/send_ev_active, and the
+                                    once-only state transition in prte_oob_tcp_peer_close.
+                                    Held across queue manipulation only - never across a
+                                    writev, and never across a callback. */
     prte_event_t send_event; /**< registration with event thread for send events */
     bool send_ev_active;
     prte_event_t recv_event; /**< registration with event thread for recv events */

@@ -5,7 +5,7 @@
  * Copyright (c) 2014-2020 Intel, Inc.  All rights reserved.
  * Copyright (c) 2015-2019 Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -28,6 +28,7 @@
 
 #include "src/mca/errmgr/errmgr.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 
 #include "rmaps_ppr.h"
 #include "src/mca/rmaps/base/base.h"
@@ -45,9 +46,8 @@ static int ppr_mapper(prte_job_t *jdata,
 {
     int rc = PRTE_SUCCESS, j, idx, ncpus;
     prte_proc_t *proc;
-    pmix_mca_base_component_t *c = &prte_mca_rmaps_ppr_component;
     prte_node_t *node, *nd;
-    prte_app_context_t *app;
+    prte_app_context_t *app, *myapp = NULL;
     int nprocs_mapped;
     prte_mapping_policy_t mapping = 0;
     prte_ranking_policy_t ranking;
@@ -56,8 +56,18 @@ static int ppr_mapper(prte_job_t *jdata,
     pmix_list_t node_list;
     int32_t num_slots;
     char *jobppr = NULL;
-    bool initial_map = true;
+    /* "ppr:N:device=<class>" places N procs on each device rather than on
+     * each object of an hwloc level.  The device list is the base's - the
+     * same one --map-by device= uses, deliberately: the two differ only in
+     * how many procs a device takes. */
+    bool bydev;
+    void *devctx = NULL;
+    /* see rmaps_rr.c: reset the per-node "mapped" flags only on the genuine
+     * first mapping pass so per-app dispatch (one entry per app) does not
+     * re-add nodes a previous app already placed in the job map */
+    bool initial_map = (0 == jdata->map->num_nodes);
     prte_binding_policy_t savebind = options->bind;
+    uint16_t jobppn, jobpes;
 
     /* only handle initial launch of loadbalanced
      * or NPERxxx jobs - allow restarting of failed apps
@@ -68,22 +78,27 @@ static int ppr_mapper(prte_job_t *jdata,
                             PRTE_JOBID_PRINT(jdata->nspace));
         return PRTE_ERR_TAKE_NEXT_OPTION;
     }
-    if (NULL != jdata->map->req_mapper
-        && 0 != strcasecmp(jdata->map->req_mapper, c->pmix_mca_component_name)) {
-        /* a mapper has been specified, and it isn't me */
-        pmix_output_verbose(5, prte_rmaps_base_framework.framework_output,
-                            "mca:rmaps:ppr: job %s not using ppr mapper",
-                            PRTE_JOBID_PRINT(jdata->nspace));
-        return PRTE_ERR_TAKE_NEXT_OPTION;
+    /* The policy is what selects the mapper, so find the pattern this
+     * request carries: in per-app dispatch, the app's own if it gave one,
+     * and only then the job's. Asking the job first meant a per-app
+     * "--map-by ppr:N:obj" was placed by whatever the job's default had
+     * resolved to, since the job's own policy is not PPR at all */
+    if (0 <= options->app_idx) {
+        myapp = (prte_app_context_t *) pmix_pointer_array_get_item(jdata->apps,
+                                                                   options->app_idx);
+        if (NULL != myapp) {
+            prte_get_attribute(&myapp->attributes, PRTE_APP_PPR, (void **) &jobppr, PMIX_STRING);
+        }
     }
-
-    if (!prte_get_attribute(&jdata->attributes, PRTE_JOB_PPR, (void **) &jobppr, PMIX_STRING) ||
-        NULL == jobppr || PRTE_MAPPING_PPR != PRTE_GET_MAPPING_POLICY(jdata->map->mapping)) {
+    if (NULL == jobppr) {
+        prte_get_attribute(&jdata->attributes, PRTE_JOB_PPR, (void **) &jobppr, PMIX_STRING);
+    }
+    if (NULL == jobppr || PRTE_MAPPING_PPR != PRTE_GET_MAPPING_POLICY(options->map)) {
         /* not for us */
         pmix_output_verbose(5, prte_rmaps_base_framework.framework_output,
                             "mca:rmaps:ppr: job %s not using ppr mapper PPR %s policy %s",
                             PRTE_JOBID_PRINT(jdata->nspace), (NULL == jobppr) ? "NULL" : jobppr,
-                            (PRTE_MAPPING_PPR == PRTE_GET_MAPPING_POLICY(jdata->map->mapping))
+                            (PRTE_MAPPING_PPR == PRTE_GET_MAPPING_POLICY(options->map))
                                 ? "PPRSET"
                                 : "PPR NOTSET");
         if (NULL != jobppr) {
@@ -96,11 +111,7 @@ static int ppr_mapper(prte_job_t *jdata,
                         "mca:rmaps:ppr: mapping job %s with ppr %s",
                         PRTE_JOBID_PRINT(jdata->nspace), jobppr);
 
-    /* flag that I did the mapping */
-    if (NULL != jdata->map->last_mapper) {
-        free(jdata->map->last_mapper);
-    }
-    jdata->map->last_mapper = strdup(c->pmix_mca_component_name);
+    bydev = (HWLOC_OBJ_OS_DEVICE == options->maptype);
 
     ranking = PRTE_RANK_BY_SLOT;
     if (HWLOC_OBJ_MACHINE == options->maptype) {
@@ -120,20 +131,33 @@ static int ppr_mapper(prte_job_t *jdata,
         mapping = PRTE_MAPPING_BYCORE;
     } else if (HWLOC_OBJ_PU == options->maptype) {
         mapping = PRTE_MAPPING_BYHWTHREAD;
+    } else if (HWLOC_OBJ_OS_DEVICE == options->maptype) {
+        mapping = PRTE_MAPPING_BYDEVICE;
     }
 
-    /* record the results */
-    PRTE_SET_MAPPING_POLICY(jdata->map->mapping, mapping);
-    if (!PRTE_RANKING_POLICY_IS_SET(jdata->map->ranking)) {
-        PRTE_SET_RANKING_POLICY(jdata->map->ranking, ranking);
+    /* record the results. A ppr by an object is recorded as the equivalent
+     * BY<object> mapping so the display and the ranking agree with where
+     * the procs actually went. In per-app dispatch that answer is this
+     * app's alone: writing it onto the job would hand every app after this
+     * one a mapping policy its user never gave it */
+    if (0 > options->app_idx) {
+        PRTE_SET_MAPPING_POLICY(jdata->map->mapping, mapping);
+        if (!PRTE_RANKING_POLICY_IS_SET(jdata->map->ranking)) {
+            PRTE_SET_RANKING_POLICY(jdata->map->ranking, ranking);
+        }
+        options->map = PRTE_GET_MAPPING_POLICY(jdata->map->mapping);
+        options->rank = PRTE_GET_RANKING_POLICY(jdata->map->ranking);
+    } else {
+        options->map = mapping;
+        if (!PRTE_RANKING_POLICY_IS_SET(options->rank)) {
+            options->rank = ranking;
+        }
     }
-    options->map = PRTE_GET_MAPPING_POLICY(jdata->map->mapping);
-    options->rank = PRTE_GET_RANKING_POLICY(jdata->map->ranking);
     if (PRTE_RANK_BY_SPAN == options->rank ||
         PRTE_RANK_BY_FILL == options->rank) {
         if (options->map < PRTE_MAPPING_BYNUMA ||
             options->map > PRTE_MAPPING_BYHWTHREAD) {
-            pmix_show_help("help-prte-rmaps-base.txt", "must-map-by-obj",
+            prte_show_help("help-prte-rmaps-base.txt", "must-map-by-obj",
                            true, prte_rmaps_base_print_mapping(options->map),
                            prte_rmaps_base_print_ranking(options->rank));
             free(jobppr);
@@ -147,13 +171,29 @@ static int ppr_mapper(prte_job_t *jdata,
                         prte_rmaps_base_print_mapping(options->map),
                         prte_rmaps_base_print_ranking(options->rank));
 
+    // cache job-level values
+    jobppn = options->pprn;
+    jobpes = options->cpus_per_rank;
+
     /* cycle thru the apps */
     for (idx = 0; idx < jdata->apps->size; idx++) {
         app = (prte_app_context_t *) pmix_pointer_array_get_item(jdata->apps, idx);
         if (NULL == app) {
             continue;
         }
+        if (options->app_idx >= 0 && (int)idx != options->app_idx) {
+            continue;
+        }
         options->total_nobjs = 0;
+
+        /* pprn and cpus_per_rank come from options (set by resolve_app_options for
+         * per-app dispatch, or from job-level parsing for normal dispatch) */
+        if (0 == options->pprn) {
+            options->pprn = jobppn;
+        }
+        if (0 == options->cpus_per_rank) {
+            options->cpus_per_rank = jobpes;
+        }
 
         /* get the available nodes */
         PMIX_CONSTRUCT(&node_list, pmix_list_t);
@@ -165,11 +205,60 @@ static int ppr_mapper(prte_job_t *jdata,
         }
         /* flag that all subsequent requests should not reset the node->mapped flag */
         initial_map = false;
+
+        if (0 == app->num_procs) {
+            // compute the number of procs
+            if (HWLOC_OBJ_MACHINE == options->maptype) {
+                app->num_procs = options->pprn * pmix_list_get_size(&node_list);
+            } else if (HWLOC_OBJ_PACKAGE == options->maptype) {
+                /* add in #packages for each node */
+                PMIX_LIST_FOREACH (node, &node_list, prte_node_t) {
+                    nobjs = prte_hwloc_base_get_nbobjs_by_type(node->topology->topo,
+                                                               HWLOC_OBJ_PACKAGE);
+                    app->num_procs += options->pprn * nobjs;
+                }
+            } else if (HWLOC_OBJ_NUMANODE== options->maptype) {
+                /* add in #numa for each node */
+                PMIX_LIST_FOREACH (node, &node_list, prte_node_t) {
+                    nobjs = prte_hwloc_base_get_nbobjs_by_type(node->topology->topo,
+                                                               HWLOC_OBJ_NUMANODE);
+                    app->num_procs += options->pprn * nobjs;
+                }
+            } else if (HWLOC_OBJ_L1CACHE == options->maptype ||
+                       HWLOC_OBJ_L2CACHE == options->maptype ||
+                       HWLOC_OBJ_L3CACHE == options->maptype) {
+                /* add in #cache for each node */
+                PMIX_LIST_FOREACH (node, &node_list, prte_node_t) {
+                    nobjs = prte_hwloc_base_get_nbobjs_by_type(node->topology->topo,
+                                                               options->maptype);
+                    app->num_procs += options->pprn * nobjs;
+                }
+            } else if (HWLOC_OBJ_CORE == options->maptype) {
+                /* add in #cores for each node */
+                PMIX_LIST_FOREACH (node, &node_list, prte_node_t) {
+                    nobjs = prte_hwloc_base_get_nbobjs_by_type(node->topology->topo,
+                                                               HWLOC_OBJ_CORE);
+                    app->num_procs += options->pprn * nobjs;
+                }
+            } else if (HWLOC_OBJ_PU == options->maptype) {
+                /* add in #hwt for each node */
+                PMIX_LIST_FOREACH (node, &node_list, prte_node_t) {
+                    nobjs = prte_hwloc_base_get_nbobjs_by_type(node->topology->topo,
+                                                               HWLOC_OBJ_PU);
+                    app->num_procs += options->pprn * nobjs;
+                }
+            } else if (HWLOC_OBJ_OS_DEVICE == options->maptype) {
+                /* add in #devices for each node */
+                app->num_procs = options->pprn
+                                 * (int) prte_rmaps_base_devices_total(&node_list, options);
+            }
+        }
+
         /* check to see if we can map all the procs */
         if (!PRTE_FLAG_TEST(app, PRTE_APP_FLAG_TOOL) &&
             num_slots < (int) app->num_procs) {
             if (!options->oversubscribe) {
-                pmix_show_help("help-prte-rmaps-base.txt", "prte-rmaps-base:alloc-error", true,
+                prte_show_help("help-prte-rmaps-base.txt", "prte-rmaps-base:alloc-error", true,
                                app->num_procs, app->app, prte_process_info.nodename);
                 rc = PRTE_ERR_SILENT;
                 goto error;
@@ -201,13 +290,23 @@ static int ppr_mapper(prte_job_t *jdata,
 
             if (HWLOC_OBJ_MACHINE == options->maptype) {
                 options->nprocs = options->pprn;
-                /* if the number of procs is greater than the number of CPUs
-                 * on this node, but less or equal to the number of slots,
+                /* if there are not enough slots to support the required
+                 * number of procs, and they didn't specify oversubscribe,
+                 * then we cannot use this node */
+                if (options->nprocs > node->slots_available &&
+                    !options->oversubscribe) {
+                    // skip this node
+                    continue;
+                }
+                /* if the number of procs times the number of pes/proc
+                 * is greater than the number of CPUs
+                 * on this node, but the number of procs is less or equal
+                 * to the number of slots,
                  * then we are not oversubscribed but we are overloaded. If
                  * the user didn't specify a required binding, then we set
                  * the binding policy to do-not-bind for this node */
                 ncpus = prte_rmaps_base_get_ncpus(node, NULL, options);
-                if (options->nprocs > ncpus &&
+                if ((options->nprocs * options->cpus_per_rank) > ncpus &&
                     options->nprocs <= node->slots_available &&
                     !PRTE_BINDING_POLICY_IS_SET(jdata->map->binding)) {
                     options->bind = PRTE_BIND_TO_NONE;
@@ -235,25 +334,56 @@ static int ppr_mapper(prte_job_t *jdata,
                     } else if (PRTE_SUCCESS != rc) {
                         /* got an error */
                         PMIX_RELEASE(proc);
-                        return rc;
+                        goto error;
                     }
                     PMIX_RELEASE(proc);
                 }
             } else {
                 /* get the number of resources on this node */
-                nobjs = prte_hwloc_base_get_nbobjs_by_type(node->topology->topo,
-                                                 options->maptype);
+                if (bydev) {
+                    rc = prte_rmaps_base_devices_begin(node, options, &devctx);
+                    if (PRTE_SUCCESS != rc) {
+                        goto error;
+                    }
+                    nobjs = prte_rmaps_base_devices_count(node, options, devctx);
+                } else {
+                    nobjs = prte_hwloc_base_get_nbobjs_by_type(node->topology->topo,
+                                                     options->maptype);
+                }
                 if (0 == nobjs) {
-                    continue;
+                    /* The pattern names the resource to place procs on, and
+                     * a node that has none of it cannot answer the request.
+                     * Skipping the node instead quietly shrank the
+                     * allocation the user gave us and, worse, changed what
+                     * the pattern means: "2 per L3cache" over nodes that
+                     * have no L3cache placed nothing there while reporting
+                     * success. Same rule as round_robin's object mapper. */
+                    prte_show_help("help-prte-rmaps-base.txt", "rmaps:mapping-target-not-found",
+                                   true,
+                                   bydev ? options->map_device
+                                         : hwloc_obj_type_string(options->maptype),
+                                   node->name);
+                    rc = PRTE_ERR_SILENT;
+                    goto error;
                 }
                 options->nprocs = options->pprn * nobjs;
-                /* if the number of procs is greater than the number of CPUs
-                 * on this node, but less or equal to the number of slots,
+                /* if there are not enough slots to support the required
+                 * number of procs, and they didn't specify oversubscribe,
+                 * then we cannot use this node */
+                if (options->nprocs > node->slots_available &&
+                    !options->oversubscribe) {
+                    // skip this node
+                    continue;
+                }
+                /* if the number of procs times the number of pes/proc
+                 * is greater than the number of CPUs
+                 * on this node, but the number of procs is less or equal
+                 * to the number of slots,
                  * then we are not oversubscribed but we are overloaded. If
                  * the user didn't specify a required binding, then we set
                  * the binding policy to do-not-bind for this node */
                 ncpus = prte_rmaps_base_get_ncpus(node, NULL, options);
-                if (options->nprocs > ncpus &&
+                if ((options->nprocs * options->cpus_per_rank) > ncpus &&
                     options->nprocs <= node->slots_available &&
                     !PRTE_BINDING_POLICY_IS_SET(jdata->map->binding)) {
                     options->bind = PRTE_BIND_TO_NONE;
@@ -261,16 +391,27 @@ static int ppr_mapper(prte_job_t *jdata,
                 }
                 /* map the specified number of procs to each such resource on this node */
                 for (i = 0; i < nobjs && nprocs_mapped < app->num_procs; i++) {
-                    obj = prte_hwloc_base_get_obj_by_type(node->topology->topo,
-                                                options->maptype, i);
+                    if (bydev) {
+                        obj = prte_rmaps_base_devices_locale(node, options, devctx, i);
+                    } else {
+                        obj = prte_hwloc_base_get_obj_by_type(node->topology->topo,
+                                                    options->maptype, i);
+                    }
+                    // are there enough cpus on this obj to meet the request?
                     if (!prte_rmaps_base_check_avail(jdata, app, node, &node_list, obj, options)) {
                         continue;
                     }
-                    for (j=0; j < options->pprn && app->num_procs; j++) {
+                    for (j=0; j < options->pprn && nprocs_mapped < app->num_procs; j++) {
                         proc = prte_rmaps_base_setup_proc(jdata, idx, node, obj, options);
                         if (NULL == proc) {
                             rc = PRTE_ERR_OUT_OF_RESOURCE;
                             goto error;
+                        }
+                        if (bydev) {
+                            /* every proc on this device is told which one it
+                             * is - sharing a device does not make the
+                             * assignment less worth knowing */
+                            prte_rmaps_base_devices_record(proc, options, devctx, i);
                         }
                         nprocs_mapped++;
                         rc = prte_rmaps_base_check_oversubscribed(jdata, app, node, options);
@@ -281,11 +422,17 @@ static int ppr_mapper(prte_job_t *jdata,
                         } else if (PRTE_SUCCESS != rc) {
                             /* got an error */
                             PMIX_RELEASE(proc);
-                            return rc;
+                            goto error;
                         }
                         PMIX_RELEASE(proc);
                     }
                 }
+            }
+            /* release this node's device list before moving on - the next
+             * node has its own */
+            if (NULL != devctx) {
+                prte_rmaps_base_devices_end(devctx);
+                devctx = NULL;
             }
             options->bind = savebind;
 
@@ -301,22 +448,36 @@ static int ppr_mapper(prte_job_t *jdata,
         }
         if (nprocs_mapped < app->num_procs) {
             /* couldn't map them all */
-            pmix_show_help("help-prte-rmaps-ppr.txt", "ppr-too-many-procs", true, app->app,
+            prte_show_help("help-prte-rmaps-ppr.txt", "ppr-too-many-procs", true, app->app,
                            app->num_procs, nprocs_mapped, options->nprocs, jobppr);
             rc = PRTE_ERR_SILENT;
             goto error;
         }
+
+        /* this app mapped successfully - the loop above can leave rc set to
+         * the per-node PRTE_ERR_TAKE_NEXT_OPTION "this node is full" signal
+         * returned by the final check_oversubscribed call, so clear it now to
+         * avoid leaking that as the mapper's overall result */
+        rc = PRTE_SUCCESS;
 
         jdata->num_procs += app->num_procs;
 
         PMIX_LIST_DESTRUCT(&node_list);
     }
     free(jobppr);
-    /* calculate the ranks for this app */
-    rc = prte_rmaps_base_compute_vpids(jdata, options);
+    /* calculate the ranks for this job - in per-app dispatch mode
+     * (app_idx >= 0) the base computes the vpids with the correct
+     * cross-app numbering, so skip it here to avoid colliding ranks */
+    if (options->app_idx < 0) {
+        rc = prte_rmaps_base_compute_vpids(jdata, options, -1, NULL);
+    }
     return rc;
 
 error:
+    /* an early exit can leave a node's device list held */
+    if (NULL != devctx) {
+        prte_rmaps_base_devices_end(devctx);
+    }
     PMIX_LIST_DESTRUCT(&node_list);
     free(jobppr);
     return rc;

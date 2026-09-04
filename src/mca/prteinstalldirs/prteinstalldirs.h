@@ -4,7 +4,7 @@
  *                         reserved.
  * Copyright (c) 2019-2020 Intel, Inc.  All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
- * Copyright (c) 2021-2023 Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -19,37 +19,13 @@
 
 #include "src/pmix/pmix-internal.h"
 #include "src/mca/base/pmix_base.h"
+#include "src/mca/pinstalldirs/pinstalldirs_types.h"
 #include "src/mca/mca.h"
 
 BEGIN_C_DECLS
 
-/*
- * Most of this file is just for ompi_info.  The only public interface
- * once prte_init has been called is the prte_install_dirs structure
- * and the prte_install_dirs_expand() call */
-struct prte_install_dirs_t {
-    char *prefix;
-    char *exec_prefix;
-    char *bindir;
-    char *sbindir;
-    char *libexecdir;
-    char *datarootdir;
-    char *datadir;
-    char *sysconfdir;
-    char *sharedstatedir;
-    char *localstatedir;
-    char *libdir;
-    char *includedir;
-    char *infodir;
-    char *mandir;
-    char *prtedatadir;
-    char *prtelibdir;
-    char *prteincludedir;
-};
-typedef struct prte_install_dirs_t prte_install_dirs_t;
-
 /* Install directories.  Only available after prte_init() */
-PRTE_EXPORT extern prte_install_dirs_t prte_install_dirs;
+PRTE_EXPORT extern pmix_pinstall_dirs_t prte_install_dirs;
 
 /**
  * Expand out path variables (such as ${prefix}) in the input string
@@ -63,17 +39,22 @@ struct prte_prteinstalldirs_base_component_2_0_0_t {
     /** MCA base component */
     pmix_mca_base_component_t component;
     /** install directories provided by the given component */
-    prte_install_dirs_t install_dirs_data;
+    pmix_pinstall_dirs_t install_dirs_data;
 };
 /**
  * Convenience typedef
  */
 typedef struct prte_prteinstalldirs_base_component_2_0_0_t prte_prteinstalldirs_base_component_t;
 
-/*
- * Macro for use in components that are of type prteinstalldirs
- */
-#define PRTE_INSTALLDIRS_BASE_VERSION_2_0_0 PRTE_MCA_BASE_VERSION_3_0_0("prteinstalldirs", 2, 0, 0)
+/* The prteinstalldirs framework interface version. It is stated here and
+ * nowhere else: components stamp it into their struct with
+ * PRTE_MCA_BASE_VERSION(prteinstalldirs), and the framework's
+ * declaration reaches the same three by pasting its name, so the two
+ * cannot drift apart. Bump it on any change to the module interface that
+ * a component built against the previous one would not survive. */
+#define PRTE_MCA_prteinstalldirs_MAJOR_VERSION   2
+#define PRTE_MCA_prteinstalldirs_MINOR_VERSION   0
+#define PRTE_MCA_prteinstalldirs_RELEASE_VERSION 0
 
 END_C_DECLS
 

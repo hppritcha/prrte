@@ -15,7 +15,7 @@
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2018-2019 Intel, Inc.  All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -31,6 +31,7 @@
 #include "src/mca/mca.h"
 #include "src/util/pmix_output.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 
 #include "src/mca/errmgr/errmgr.h"
 #include "src/mca/ras/base/base.h"
@@ -55,12 +56,8 @@
 prte_plm_globals_t prte_plm_globals = {
     .base_nspace = NULL,
     .next_jobid = 0,
-    .daemonlaunchstart = {0, 0},
-    .tree_spawn_cmd = PMIX_DATA_BUFFER_STATIC_INIT,
     .daemon_nodes_assigned_at_launch = true,
-    .node_regex_threshold = 0,
-    .daemon_cache = PMIX_LIST_STATIC_INIT,
-    .daemon1_has_reported = false
+    .pass_environ_mca_params = true
 };
 
 /*
@@ -86,13 +83,16 @@ static int mca_plm_base_register(pmix_mca_base_register_flag_t flags)
 {
     PRTE_HIDE_UNUSED_PARAMS(flags);
 
-    prte_plm_globals.node_regex_threshold = 1024;
-    (void) pmix_mca_base_framework_var_register(&prte_plm_base_framework,
-                                                "node_regex_threshold",
-                                                "Only pass the node regex on the orted command line if smaller than this threshold",
-                                                PMIX_MCA_BASE_VAR_TYPE_SIZE_T,
-                                                &prte_plm_globals.node_regex_threshold);
-
+    /* NOTE: there is deliberately no "plm_node_regex_threshold" parameter
+     * here any more.  It was registered, documented as controlling whether
+     * the node regex went onto the prted command line, and read by nothing
+     * at all - the regex is passed through the launch message, not the
+     * command line, and has been for years.  A knob that does nothing is
+     * worse than no knob: a user who hits a too-long command line sets it,
+     * sees no change, and has no way to tell a broken setting from a wrong
+     * diagnosis.  (The same reasoning retired plm_ssh_delay.)  The real
+     * remedy for an over-long command line is
+     * plm_ssh_pass_environ_mca_params 0, which help-plm-ssh.txt names. */
     /* Note that we break abstraction rules here by listing a
      specific PLM here in the base.  This is necessary, however,
      due to extraordinary circumstances:
@@ -134,10 +134,16 @@ static int prte_plm_base_close(void)
         }
     }
 
+    /* a size change granted but never launched still owes its requester an
+     * answer, and this is the last chance to give one */
+    prte_plm_base_flush_grow_requesters();
+
     if (NULL != prte_plm_globals.base_nspace) {
         free(prte_plm_globals.base_nspace);
+        /* the tool-attach path in plm_base_receive reads this to mint a
+         * nspace, so leave a NULL rather than a freed pointer behind */
+        prte_plm_globals.base_nspace = NULL;
     }
-    PMIX_LIST_DESTRUCT(&prte_plm_globals.daemon_cache);
 
     return pmix_mca_base_framework_components_close(&prte_plm_base_framework, NULL);
 }
@@ -154,13 +160,11 @@ static int prte_plm_base_open(pmix_mca_base_open_flag_t flags)
     /* default to assigning daemons to nodes at launch */
     prte_plm_globals.daemon_nodes_assigned_at_launch = true;
 
-    PMIX_CONSTRUCT(&prte_plm_globals.daemon_cache, pmix_list_t);
-
     /* Open up all available components */
     return pmix_mca_base_framework_components_open(&prte_plm_base_framework, flags);
 }
 
-PMIX_MCA_BASE_FRAMEWORK_DECLARE(prte, plm, NULL, mca_plm_base_register, prte_plm_base_open,
+PRTE_MCA_BASE_FRAMEWORK_DECLARE(plm, NULL, mca_plm_base_register, prte_plm_base_open,
                                 prte_plm_base_close, prte_plm_base_static_components,
                                 PMIX_MCA_BASE_FRAMEWORK_FLAG_DEFAULT);
 
@@ -262,22 +266,22 @@ static void launch_daemons(int fd, short args, void *cbdata)
             PMIX_RELEASE(state);
             return;
         }
-        if (!prte_managed_allocation || prte_set_slots_override) {
+        /* This is the local-only module: there is no launcher, so the head
+         * node is the entire virtual machine and its slots are the whole of
+         * what this job can be given. Size it only if nobody gave us a count
+         * for it - and never report the size of an allocation whose other
+         * nodes we have no way to reach, which is what copying
+         * prte_ras_base.total_slots_alloc here used to do.
+         */
+        if (!PRTE_FLAG_TEST(node, PRTE_NODE_FLAG_SLOTS_GIVEN) || prte_set_slots_override) {
             // set the number of slots on our node
             prte_plm_base_set_slots(node);
-            state->jdata->total_slots_alloc = node->slots;
-        } else {
-            /* for managed allocations, the total slots allocated is fixed at time of allocation */
-            state->jdata->total_slots_alloc = prte_ras_base.total_slots_alloc;
         }
+        state->jdata->total_slots_alloc = node->slots;
 
         // check for topology limitations
         prte_rmaps_base.require_hwtcpus = !prte_hwloc_base_core_cpus(node->topology->topo);
-
-        // display the allocation, if requested
-        if (prte_get_attribute(&state->jdata->attributes, PRTE_JOB_DISPLAY_ALLOC, NULL, PMIX_BOOL)) {
-            prte_ras_base_display_alloc(state->jdata);
-        }
+        prte_rmaps_base.have_cores = prte_hwloc_base_has_cores(node->topology->topo);
 
         /* jump to mapping */
         state->jdata->state = PRTE_JOB_STATE_VM_READY;
@@ -287,7 +291,7 @@ static void launch_daemons(int fd, short args, void *cbdata)
     }
 
     // otherwise, this is an error
-    pmix_show_help("help-plm-base.txt", "no-available-pls", true);
+    prte_show_help("help-plm-base.txt", "no-available-pls", true);
     PRTE_ACTIVATE_JOB_STATE(state->jdata, PRTE_JOB_STATE_FAILED_TO_START);
     PMIX_RELEASE(state);
 }

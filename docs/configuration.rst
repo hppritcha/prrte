@@ -55,19 +55,88 @@ will be executing. The ``prted`` that finds itself booting onto this host
 will declare itself to be the system controller and will initialize itself
 accordingly.
 
-``DVMControllerPort=<number> (default: 7817)`` is the TCP port upon which the
-DVM controller will be listening for connections from its ``prted`` daemons
-on the remaining system nodes.
-
-``PRTEDPort=<number (default: 7818)`` is the TCP port upon which each
-``prted`` daemon will be listening for connections from its peer daemons
-on the other system nodes.
+``DVMPort=<number> (default: 7817)`` is the TCP port upon which every DVM
+process listens for connections from its peers. The controller uses it to
+accept connections from its ``prted`` daemons, and each ``prted`` uses it to
+accept connections from peer daemons. Because a single well-known port is
+shared across the DVM, any process can construct any peer's contact address
+from that peer's host without a discovery exchange.
 
 ``DVMNodes=<regex of DVM nodes> (default: none)`` provides a regular expression
-identifying the nodes that upon which user applications can run. IP addresses can
-be provided in place of hostnames if desired.The regular expression can consist of
+identifying the nodes upon which user applications can run. IP addresses can
+be provided in place of hostnames if desired. The regular expression can consist of
 a simple comma-delimited list of hostnames, or a comma-delimited list of hostname
 ranges (e.g., "linux0,linux[2-10]"), or a PMIx "native" regular expression.
+
+``DVMNetworks=<comma-delimited list> (default: all)`` restricts the networks
+the runtime uses for inter-node (daemon-to-daemon) communication. Entries may be
+interface names or CIDR subnets (e.g., "eth0,10.0.0.0/8"). When omitted, the
+runtime selects among all available interfaces. This duplicates the
+``prte_if_include`` MCA parameter and is provided here so the transport can be
+managed from the single configuration file.
+
+The CIDR entries additionally disambiguate the address a daemon uses to reach
+its tree parent (or the controller). A daemon synthesizes those contact
+addresses from the configured host names before any topology has been
+distributed; when a host resolves to several addresses, the CIDR selects the
+one on the DVM interconnect. If such a host is multi-homed and no CIDR is given
+to choose among its addresses, the daemon fails to start with a clear
+diagnostic rather than guessing an interface. A single-homed host needs no
+``DVMNetworks`` entry.
+
+``DVMNetmask=<netmask> (default: derived)`` is the interface netmask associated
+with the inter-node network. It is used when constructing the contact
+information the DVM daemons exchange, allowing them to agree on reachability
+without dynamic discovery. The value follows the selected address family: a
+dotted netmask or prefix length for IPv4, or a prefix length for IPv6. When
+omitted, the prefix of the ``DVMNetworks`` CIDR that selected the address is
+used; absent that, reachability is left unrestricted.
+
+``DVMIPVersion=<4|6> (default: 4)`` selects the IP address family the DVM uses
+for inter-node communication. The default, ``4``, uses IPv4. Setting it to
+``6`` configures an IPv6-only DVM: the daemons listen and connect over IPv6,
+and the IPv4 family is disabled. IPv6 support requires that PRRTE was built
+with IPv6 enabled; if it was not, a DVM configured for ``6`` will fail to
+start with a clear diagnostic. The remaining address-bearing options
+(``DVMControllerHost``, ``DVMNodes``, ``DVMNetworks``, ``DVMNetmask``) accept
+values of the selected family, so IPv6 literal addresses and IPv6 CIDR
+subnets may be used when ``DVMIPVersion=6``.
+
+``DVMRadix=<number> (default: 64)`` sets the radix of the routing tree that
+connects the daemons. Rather than every daemon opening a connection directly
+to the controller, each daemon connects to its parent in a radix tree of the
+given width, which spreads the connection and message-relay load across the
+DVM. The value ties directly to the ``rml_base_radix`` MCA parameter and must
+be identical on every node, so it is set once in the configuration file. The
+default of 64 keeps the tree shallow for typical clusters while capping the
+number of children any single daemon (including the controller) must serve.
+
+``DVMConnectMaxTime=<seconds> (default: 30)`` bounds how long a daemon will
+keep trying to reach its assigned parent in the routing tree before it heals
+up to the next ancestor. Because the daemons start independently, a daemon's
+parent may not yet be running; after this interval the daemon promotes its
+connection target to the parent's parent, and so on up the tree, until it
+reaches the controller. The controller itself is retried indefinitely (see
+``DVMRetryMaxDelay``), so a daemon always eventually joins the DVM even if only
+the controller is up. Setting this to 0 disables healing and retries every
+parent forever.
+
+``DVMRetryMaxDelay=<seconds> (default: 5)`` bounds the delay between a
+daemon's attempts to connect to the DVM controller during bootstrap. Because
+the daemons start independently and the controller may come up arbitrarily
+late, a bootstrapping daemon retries the connection indefinitely rather than
+giving up. To avoid hammering an absent controller, the delay between attempts
+grows from an initial short interval and doubles on each attempt, up to this
+maximum, after which retries continue at that steady rate until the controller
+answers. A larger value lowers the polling load of a long-absent controller;
+a smaller value reconnects faster once it appears.
+
+.. note::
+   Several bootstrap options duplicate values that can also be set as MCA
+   parameters. They are provided here so that all DVM behavior can be managed
+   in one place. Where an option and an MCA parameter set the same value, the
+   configuration file takes precedence over the MCA parameter file. A value
+   given explicitly on the command line still overrides both.
 
 
 Operational Options
@@ -81,41 +150,53 @@ the DVM daemons are to use as the base for session directories for all
 application sessions. Working files for each session will be placed under
 this location, separated out into a directory for each session.
 
-Logging Options
-^^^^^^^^^^^^^^^
-``ControllerLogJobState=<true|false> (default: false)`` directs the DVM
-controller to log each DVM-launched job state transition. Log entry includes
-the namespace of the job, the state to which it is transitioning, and the
-date/time stamp when the transition was ordered.
+State Logging
+^^^^^^^^^^^^^
+There is deliberately **no** configuration-file key for DVM state logging.
 
-``ControllerLogProcState=<true|false> (default: false)`` directs the DVM
-controller to log each process (in a DVM-launched job) state transition.
-Log entry includes the namespace and rank of the process, the state to
-which it is transitioning, and the date/time stamp when the transition was
-ordered.
+The DVM can be asked to record every job and/or process state transition it
+orders |mdash| the namespace (and rank), the state, and the date/time stamp
+of the moment the transition was ordered |mdash| but only as MCA parameters,
+which are given one run at a time:
 
-``ControllerLogPath=<path> (default: DVMTempDir)`` is the path to where the logs are to
-be written. If a relative path is provided,
-then the directory will be created under the ``DVMTempDir`` location. The
-path defaults to the specified SessionTmpDir in the absence of any input
-to this field. The log filename is formatted as ``prtectrlr-<hostname>-log<``.
+* ``state_base_log_jobstate`` records each job state transition the process
+  orders.
+* ``state_base_log_procstate`` records each process state transition it
+  orders.
+* ``state_base_log_path`` is the directory the log is written into. A
+  relative path is created under the session directory base (``DVMTempDir``,
+  or the ``prte_tmpdir_base`` MCA parameter), which is also the default. The
+  file is ``prtectrlr-<hostname>-log`` on the DVM controller and
+  ``prted-<hostname>-log`` on a ``prted``, so a controller sharing a node
+  with a daemon does not contend with it for one file.
 
-``PRTEDLogJobState=<true|false> (default: false)`` directs each ``prted``
-in the DVM to log each DVM-launched job state transition. Log entry includes
-the namespace of the job, the state to which it is transitioning, and the
-date/time stamp when the transition was ordered.
+Each record is one line, with the state name last because several state
+names contain spaces:
 
-``PRTEDLogProcState=<true|false> (default: false)`` directs each ``prted``
-in the DVM to log each process (in a DVM-launched job) state transition.
-Log entry includes the namespace and rank of the process, the state to
-which it is transitioning, and the date/time stamp when the transition was
-ordered.
+.. code::
 
-``PRRTEDLogPath=<path> (default: DVMTempDir)`` is the path to where the logs are to
-be written. If a relative path is provided,
-then the directory will be created under the ``DVMTempDir`` location. The
-path defaults to the specified SessionTmpDir in the absence of any input
-to this field. The log filename is formatted as ``prted-<hostname>-log<``.
+   2026-08-22T18:45:01.008680 JOB <namespace> <state>
+   2026-08-22T18:45:01.105669 PROC <namespace>:<rank> <state>
+
+A field that has no value yet |mdash| a job whose namespace has not been
+assigned at the moment it reaches its first state |mdash| is written as
+``-``. The log is opened for append, so restarting a DVM adds to the record
+rather than erasing it; each run begins with a ``#`` banner line naming its
+pid. A transition is recorded when it is **ordered**, which is deliberately
+not the same as when it is acted on: a state that no handler is registered
+for is dropped by the state machine, and the log is where that shows up.
+
+Making these configuration keys was considered and rejected. A key in this
+file applies to every daemon of every DVM the cluster starts, for as long as
+the line is present, and nobody is watching |mdash| whereas the volume of a
+per-transition record scales with the number of processes launched and the
+disk it fills is the one the session directories live on. A knob with that
+blast radius should have to be asked for by the run that wants it, which is
+what an MCA parameter is. An older ``prte.conf`` that still carries the
+``ControllerLogJobState``, ``ControllerLogProcState``, ``ControllerLogPath``,
+``PRTEDLogJobState``, ``PRTEDLogProcState`` or ``PRTEDLogPath`` keys is still
+read normally: they are now simply unknown keys, and unknown keys are
+ignored.
 
 
 Configurator Tool

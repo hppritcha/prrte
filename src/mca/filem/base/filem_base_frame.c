@@ -13,7 +13,7 @@
  * Copyright (c) 2019      Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
- * Copyright (c) 2021-2022 Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -39,6 +39,7 @@
 PRTE_EXPORT prte_filem_base_module_t prte_filem
     = {.filem_init = prte_filem_base_module_init,
        .filem_finalize = prte_filem_base_module_finalize,
+       .fault_handler = prte_filem_base_none_fault_handler,
        .put = prte_filem_base_none_put,
        .put_nb = prte_filem_base_none_put_nb,
        .get = prte_filem_base_none_get,
@@ -49,7 +50,6 @@ PRTE_EXPORT prte_filem_base_module_t prte_filem
        .wait_all = prte_filem_base_none_wait_all,
        .preposition_files = prte_filem_base_none_preposition_files,
        .link_local_files = prte_filem_base_none_link_local_files};
-bool prte_filem_base_is_active = false;
 
 static int prte_filem_base_close(void)
 {
@@ -71,6 +71,6 @@ static int prte_filem_base_open(pmix_mca_base_open_flag_t flags)
     return pmix_mca_base_framework_components_open(&prte_filem_base_framework, flags);
 }
 
-PMIX_MCA_BASE_FRAMEWORK_DECLARE(prte, filem, NULL, NULL, prte_filem_base_open,
+PRTE_MCA_BASE_FRAMEWORK_DECLARE(filem, NULL, NULL, prte_filem_base_open,
                                 prte_filem_base_close, prte_filem_base_static_components,
                                 PMIX_MCA_BASE_FRAMEWORK_FLAG_DEFAULT);

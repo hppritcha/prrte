@@ -16,7 +16,7 @@
  * Copyright (c) 2014-2019 Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2017-2019 Intel, Inc.  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -30,11 +30,9 @@
 #include <signal.h>
 #include <string.h>
 
-#include "src/class/pmix_ring_buffer.h"
 #include "src/hwloc/hwloc-internal.h"
 #include "src/mca/base/pmix_base.h"
 #include "src/mca/mca.h"
-#include "src/runtime/prte_progress_threads.h"
 #include "src/util/pmix_argv.h"
 #include "src/util/pmix_output.h"
 #include "src/util/pmix_path.h"
@@ -46,8 +44,10 @@
 #include "src/runtime/prte_globals.h"
 #include "src/threads/pmix_threads.h"
 #include "src/util/name_fns.h"
+#include "src/util/proc_info.h"
 #include "src/util/pmix_parse_options.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 
 #include "src/mca/odls/base/base.h"
 
@@ -69,41 +69,17 @@ prte_odls_base_module_t prte_odls = {0};
  */
 prte_odls_globals_t prte_odls_globals = {
     .output = 0,
-    .xterm_ranks = PMIX_LIST_STATIC_INIT,
+    .xterm_ranks = PMIX_LIST_STATIC_INIT(prte_odls_globals.xterm_ranks),
     .xtermcmd = NULL,
-    .max_threads = 0,
-    .num_threads = 0,
-    .cutoff = 0,
-    .ev_bases = NULL,
-    .ev_threads = NULL,
-    .next_base = 0,
     .signal_direct_children_only = false,
-    .exec_agent = NULL
+    .exec_agent = NULL,
+    .scatter_cpusets = true,
+    .pending_slices = PMIX_LIST_STATIC_INIT(prte_odls_globals.pending_slices)
 };
-
-static prte_event_base_t **prte_event_base_ptr = NULL;
 
 static int prte_odls_base_register(pmix_mca_base_register_flag_t flags)
 {
     PRTE_HIDE_UNUSED_PARAMS(flags);
-
-    prte_odls_globals.max_threads = 16;
-    (void) pmix_mca_base_var_register("prte", "odls", "base", "max_threads",
-                                      "Maximum number of threads to use for spawning local procs",
-                                      PMIX_MCA_BASE_VAR_TYPE_INT,
-                                      &prte_odls_globals.max_threads);
-
-    prte_odls_globals.num_threads = -1;
-    (void) pmix_mca_base_var_register("prte", "odls", "base", "num_threads",
-                                      "Specific number of threads to use for spawning local procs",
-                                      PMIX_MCA_BASE_VAR_TYPE_INT,
-                                      &prte_odls_globals.num_threads);
-
-    prte_odls_globals.cutoff = 32;
-    (void) pmix_mca_base_var_register("prte", "odls", "base", "cutoff",
-                                      "Minimum number of local procs before using thread pool for spawn",
-                                      PMIX_MCA_BASE_VAR_TYPE_INT,
-                                      &prte_odls_globals.cutoff);
 
     prte_odls_globals.signal_direct_children_only = false;
     (void) pmix_mca_base_var_register("prte", "odls", "base", "signal_direct_children_only",
@@ -118,88 +94,38 @@ static int prte_odls_base_register(pmix_mca_base_register_flag_t flags)
                                       PMIX_MCA_BASE_VAR_TYPE_STRING,
                                       &prte_odls_globals.exec_agent);
 
+    prte_odls_globals.scatter_cpusets = true;
+    (void) pmix_mca_base_var_register("prte", "odls", "base", "scatter_cpusets",
+                                      "Send each daemon the bindings of the procs it will launch, "
+                                      "rather than broadcasting every proc's binding to every daemon",
+                                      PMIX_MCA_BASE_VAR_TYPE_BOOL,
+                                      &prte_odls_globals.scatter_cpusets);
+
+    /* A fault-injection hook, in the same spirit as prte_daemon_fail.  The
+     * daemon forks its children on a worker thread and records each child's
+     * pid there, while the SIGCHLD reaper runs on the progress thread and
+     * has nothing but that pid with which to attribute what it reaps.  A
+     * child short-lived enough to run between the fork and the store used to
+     * be reaped unattributably, and the job then never completed.  The child
+     * is now held until the store is done, and stalling here is what widens
+     * a window that is otherwise microseconds wide and fails in a fraction
+     * of a percent of launches.
+     *
+     * Deliberately NOT restricted to a debug build.  A timing defect has to
+     * be demonstrable in the build that ships, and an optimized build is a
+     * different race from a debug one; a hook that exists only in the latter
+     * cannot say anything about the former.  It costs a load and a
+     * predictable branch per fork(), against a fork/exec pair, and every
+     * launched proc pays the stall itself only if somebody sets it. */
+    prte_odls_globals.fork_publish_delay = 0;
+    (void) pmix_mca_base_var_register("prte", "odls", "base", "fork_publish_delay",
+                                      "Microseconds to stall between forking a child and recording "
+                                      "its pid, to exercise the launch/reap race "
+                                      "[default: 0 => no delay]",
+                                      PMIX_MCA_BASE_VAR_TYPE_INT,
+                                      &prte_odls_globals.fork_publish_delay);
+
     return PRTE_SUCCESS;
-}
-
-void prte_odls_base_harvest_threads(void)
-{
-    int i;
-
-    if (0 < prte_odls_globals.num_threads) {
-        /* stop the progress threads */
-        if (NULL != prte_odls_globals.ev_threads) {
-            for (i = 0; NULL != prte_odls_globals.ev_threads[i]; i++) {
-                prte_progress_thread_finalize(prte_odls_globals.ev_threads[i]);
-            }
-        }
-        free(prte_odls_globals.ev_bases);
-        prte_odls_globals.ev_bases = (prte_event_base_t **) malloc(sizeof(prte_event_base_t *));
-        /* use the default event base */
-        prte_odls_globals.ev_bases[0] = prte_event_base;
-        prte_odls_globals.num_threads = 0;
-        if (NULL != prte_odls_globals.ev_threads) {
-            PMIX_ARGV_FREE_COMPAT(prte_odls_globals.ev_threads);
-            prte_odls_globals.ev_threads = NULL;
-        }
-    }
-}
-
-void prte_odls_base_start_threads(prte_job_t *jdata)
-{
-    int i;
-    char *tmp;
-
-    /* only do this once */
-    if (NULL != prte_odls_globals.ev_threads) {
-        return;
-    }
-
-    /* if we are a persistent DVM, expect to service lots
-     * of clients */
-    if (prte_persistent) {
-        prte_odls_globals.num_threads = prte_odls_globals.max_threads;
-        goto startup;
-    }
-
-    /* setup the pool of worker threads */
-    prte_odls_globals.ev_threads = NULL;
-    prte_odls_globals.next_base = 0;
-    if (-1 == prte_odls_globals.num_threads) {
-        if ((int) jdata->num_local_procs < prte_odls_globals.cutoff) {
-            /* do not use any dedicated odls thread */
-            prte_odls_globals.num_threads = 0;
-        } else {
-            /* user didn't specify anything, so default to some fraction of
-             * the number of local procs, capping it at the max num threads
-             * parameter value. */
-            prte_odls_globals.num_threads = jdata->num_local_procs / 8;
-            if (0 == prte_odls_globals.num_threads) {
-                prte_odls_globals.num_threads = 1;
-            } else if (prte_odls_globals.max_threads < prte_odls_globals.num_threads) {
-                prte_odls_globals.num_threads = prte_odls_globals.max_threads;
-            }
-        }
-    }
-startup:
-    if (0 == prte_odls_globals.num_threads) {
-        if (NULL == prte_event_base_ptr) {
-            prte_event_base_ptr = (prte_event_base_t **) malloc(sizeof(prte_event_base_t *));
-            /* use the default event base */
-            prte_event_base_ptr[0] = prte_event_base;
-        }
-        prte_odls_globals.ev_bases = prte_event_base_ptr;
-    } else {
-        pmix_output_verbose(5, prte_odls_base_framework.framework_output,
-                            "START %d LAUNCH THREADS", prte_odls_globals.num_threads);
-        prte_odls_globals.ev_bases = (prte_event_base_t **) malloc(prte_odls_globals.num_threads
-                                                                   * sizeof(prte_event_base_t *));
-        for (i = 0; i < prte_odls_globals.num_threads; i++) {
-            pmix_asprintf(&tmp, "PRTE-ODLS-%d", i);
-            prte_odls_globals.ev_bases[i] = prte_progress_thread_init(tmp);
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&prte_odls_globals.ev_threads, tmp);
-            free(tmp);
-        }
-    }
 }
 
 static int prte_odls_base_close(void)
@@ -214,6 +140,10 @@ static int prte_odls_base_close(void)
     }
     PMIX_DESTRUCT(&prte_odls_globals.xterm_ranks);
 
+    /* anything still here is a launch that never completed, or a slice for
+     * one - PMIX_DESTRUCT would leave the items themselves behind */
+    PMIX_LIST_DESTRUCT(&prte_odls_globals.pending_slices);
+
     /* cleanup the global list of local children and job data */
     for (i = 0; i < prte_local_children->size; i++) {
         if (NULL != (proc = (prte_proc_t *) pmix_pointer_array_get_item(prte_local_children, i))) {
@@ -221,8 +151,6 @@ static int prte_odls_base_close(void)
         }
     }
     PMIX_RELEASE(prte_local_children);
-
-    prte_odls_base_harvest_threads();
 
     return pmix_mca_base_framework_components_close(&prte_odls_base_framework, NULL);
 }
@@ -249,6 +177,7 @@ static int prte_odls_base_open(pmix_mca_base_open_flag_t flags)
 
     /* initialize ODLS globals */
     PMIX_CONSTRUCT(&prte_odls_globals.xterm_ranks, pmix_list_t);
+    PMIX_CONSTRUCT(&prte_odls_globals.pending_slices, pmix_list_t);
     prte_odls_globals.xtermcmd = NULL;
 
     /* ensure that SIGCHLD is unblocked as we need to capture it */
@@ -264,7 +193,7 @@ static int prte_odls_base_open(pmix_mca_base_open_flag_t flags)
         /* construct a list of ranks to be displayed */
         xterm_hold = false;
         pmix_util_parse_range_options(prte_xterm, &ranks);
-        for (i = 0; i < PMIX_ARGV_COUNT_COMPAT(ranks); i++) {
+        for (i = 0; i < PMIx_Argv_count(ranks); i++) {
             if (0 == strcmp(ranks[i], "BANG")) {
                 xterm_hold = true;
                 continue;
@@ -276,8 +205,12 @@ static int prte_odls_base_open(pmix_mca_base_open_flag_t flags)
                 nm->name.rank = PMIX_RANK_WILDCARD;
             } else if (rank < 0) {
                 /* error out on bozo case */
-                pmix_show_help("help-prte-odls-base.txt", "prte-odls-base:xterm-neg-rank", true,
+                prte_show_help("help-prte-odls-base.txt", "prte-odls-base:xterm-neg-rank", true,
                                rank);
+                /* nm was never put on the list, and we still own the parsed
+                 * range - do not walk out holding either */
+                PMIX_RELEASE(nm);
+                PMIx_Argv_free(ranks);
                 return PRTE_ERROR;
             } else {
                 /* we can't check here if the rank is out of
@@ -288,28 +221,30 @@ static int prte_odls_base_open(pmix_mca_base_open_flag_t flags)
             }
             pmix_list_append(&prte_odls_globals.xterm_ranks, &nm->super);
         }
-        PMIX_ARGV_FREE_COMPAT(ranks);
+        PMIx_Argv_free(ranks);
         /* construct the xtermcmd */
         prte_odls_globals.xtermcmd = NULL;
         tmp = pmix_find_absolute_path("xterm");
         if (NULL == tmp) {
+            prte_show_help("help-prte-odls-base.txt", "prte-odls-base:xterm-not-found", true,
+                           prte_process_info.nodename);
             return PRTE_ERROR;
         }
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&prte_odls_globals.xtermcmd, tmp);
+        PMIx_Argv_append_nosize(&prte_odls_globals.xtermcmd, tmp);
         free(tmp);
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&prte_odls_globals.xtermcmd, "-T");
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&prte_odls_globals.xtermcmd, "save");
+        PMIx_Argv_append_nosize(&prte_odls_globals.xtermcmd, "-T");
+        PMIx_Argv_append_nosize(&prte_odls_globals.xtermcmd, "save");
         if (xterm_hold) {
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&prte_odls_globals.xtermcmd, "-hold");
+            PMIx_Argv_append_nosize(&prte_odls_globals.xtermcmd, "-hold");
         }
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&prte_odls_globals.xtermcmd, "-e");
+        PMIx_Argv_append_nosize(&prte_odls_globals.xtermcmd, "-e");
     }
 
     /* Open up all available components */
     return pmix_mca_base_framework_components_open(&prte_odls_base_framework, flags);
 }
 
-PMIX_MCA_BASE_FRAMEWORK_DECLARE(prte, odls, "PRTE Daemon Launch Subsystem", prte_odls_base_register,
+PRTE_MCA_BASE_FRAMEWORK_DECLARE(odls, "PRTE Daemon Launch Subsystem", prte_odls_base_register,
                                 prte_odls_base_open, prte_odls_base_close,
                                 prte_odls_base_static_components,
                                 PMIX_MCA_BASE_FRAMEWORK_FLAG_DEFAULT);
@@ -337,6 +272,17 @@ static void sccon(prte_odls_spawn_caddy_t *p)
     p->wdir = NULL;
     p->argv = NULL;
     p->env = NULL;
+    p->bind_cpuset = NULL;
+    p->bind_fatal = false;
+    p->do_membind = false;
+    p->membind_prep_errno = 0;
+    p->membind_mode = 0;
+    p->membind_nodemask = NULL;
+    p->membind_maxnode = 0;
+#if PRTE_HAVE_SCHED_SETAFFINITY
+    p->bind_mask = NULL;
+    p->bind_masksize = 0;
+#endif
 }
 static void scdes(prte_odls_spawn_caddy_t *p)
 {
@@ -347,11 +293,22 @@ static void scdes(prte_odls_spawn_caddy_t *p)
         free(p->wdir);
     }
     if (NULL != p->argv) {
-        PMIX_ARGV_FREE_COMPAT(p->argv);
+        PMIx_Argv_free(p->argv);
     }
     if (NULL != p->env) {
-        PMIX_ARGV_FREE_COMPAT(p->env);
+        PMIx_Argv_free(p->env);
     }
+    if (NULL != p->bind_cpuset) {
+        hwloc_bitmap_free(p->bind_cpuset);
+    }
+    if (NULL != p->membind_nodemask) {
+        free(p->membind_nodemask);
+    }
+#if PRTE_HAVE_SCHED_SETAFFINITY
+    if (NULL != p->bind_mask) {
+        CPU_FREE(p->bind_mask);
+    }
+#endif
 }
 PMIX_CLASS_INSTANCE(prte_odls_spawn_caddy_t,
                     pmix_object_t,

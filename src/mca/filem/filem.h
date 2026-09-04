@@ -14,7 +14,8 @@
  *                         reserved
  * Copyright (c) 2019      Intel, Inc.  All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
- * Copyright (c) 2021-2022 Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2026      Sandia National Laboratories  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -105,9 +106,6 @@ PRTE_EXPORT PMIX_CLASS_DECLARATION(prte_filem_base_process_set_t);
 struct prte_filem_base_file_set_1_0_0_t {
     /** This is an object, so must have a super */
     pmix_list_item_t super;
-
-    /* the app_index this pertains to, if applicable */
-    prte_app_idx_t app_idx;
 
     /* Local file reference */
     char *local_target;
@@ -208,6 +206,12 @@ typedef int (*prte_filem_base_module_init_fn_t)(void);
  * Returns PRTE_SUCCESS
  */
 typedef int (*prte_filem_base_module_finalize_fn_t)(void);
+
+/**
+ * Recovers filem operations from given faults or else activates relevant job
+ * failure state.
+ */
+typedef void (*prte_filem_base_fault_handler_fn_t)(const prte_rml_recovery_status_t *status);
 
 /**
  * Put a file or directory on the remote machine
@@ -350,6 +354,9 @@ struct prte_filem_base_module_1_0_0_t {
     /** Finalization Function */
     prte_filem_base_module_finalize_fn_t filem_finalize;
 
+    /** Respond to daemon failures */
+    prte_filem_base_fault_handler_fn_t fault_handler;
+
     /** Put a file on the remote machine */
     prte_filem_base_put_fn_t put;
     prte_filem_base_put_nb_fn_t put_nb;
@@ -375,10 +382,15 @@ typedef struct prte_filem_base_module_1_0_0_t prte_filem_base_module_t;
 
 PRTE_EXPORT extern prte_filem_base_module_t prte_filem;
 
-/**
- * Macro for use in components that are of type FILEM
- */
-#define PRTE_FILEM_BASE_VERSION_2_0_0 PRTE_MCA_BASE_VERSION_3_0_0("filem", 2, 0, 0)
+/* The filem framework interface version. It is stated here and nowhere
+ * else: components stamp it into their struct with
+ * PRTE_MCA_BASE_VERSION(filem), and the framework's declaration reaches
+ * the same three by pasting its name, so the two cannot drift apart.
+ * Bump it on any change to the module interface that a component built
+ * against the previous one would not survive. */
+#define PRTE_MCA_filem_MAJOR_VERSION   2
+#define PRTE_MCA_filem_MINOR_VERSION   0
+#define PRTE_MCA_filem_RELEASE_VERSION 0
 
 END_C_DECLS
 

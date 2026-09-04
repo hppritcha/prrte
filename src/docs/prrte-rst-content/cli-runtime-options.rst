@@ -24,11 +24,14 @@ need to be set (e.g., to override a default set by MCA parameter), the
 syntax of the command line directive includes the use of an ``=``
 character to allow inclusion of a value for the option. For example,
 one can set the ``ABORT-NONZERO-STATUS`` option to ``true`` by
-specifying it as ``ABORT-NONZERO-STATUS=1``. Note that boolean options
-can be set to ``true`` using a non-zero integer or a case-insensitive
-string of the word ``true``.  For the latter representation, the user
-need only provide at least the ``T`` character. The same policy
-applies to setting a boolean option to ``false``.
+specifying it as ``ABORT-NONZERO-STATUS=1``. A boolean option can be
+set to ``true`` using a non-zero integer, the single letter ``T`` or
+``Y``, or the whole word ``TRUE``, ``YES`` or ``ENABLE``; and to
+``false`` using zero, the single letter ``F`` or ``N``, or the whole
+word ``FALSE``, ``NO`` or ``DISABLE``. All of these are
+case-insensitive. Note that these are the whole words |mdash| ``TR``
+is not an abbreviation of ``TRUE`` |mdash| and that a value which is
+neither true nor false is refused rather than guessed at.
 
 Note that a boolean option will default to ``true`` if provided
 without a value. Thus, ``--runtime-options abort-nonzero`` is
@@ -117,10 +120,20 @@ Supported values include:
   application process(es) to stop in ``PMIx_Init()``. The directive
   will apply to all processes in the job.
 
-* ``STOP-IN-APP``: indicates that the runtime should direct
-  application processes to stop at some application-defined place and
-  notify they are ready-to-debug. The directive will apply to all
-  processes in the job.
+* ``STOP-IN-APP[=<breakpoint>]``: indicates that the runtime should
+  direct application processes to stop at some application-defined
+  place and notify they are ready-to-debug. The directive will apply
+  to all processes in the job. Given without a value, the processes
+  stop at whichever such place they reach first. Given a value, that
+  string is the identifier of the one breakpoint at which they are to
+  stop: the runtime passes it to the application in the
+  ``PMIX_BREAKPOINT`` environment variable and then waits for the
+  application to report itself ready for debug, so it is up to the
+  application to recognize the name and stop in the corresponding
+  place. This is the one directive whose value may be something other
+  than a truth value, and it is read as a truth value whenever it
+  spells one |mdash| so a breakpoint cannot be named ``true``,
+  ``false``, or any other spelling of a boolean.
 
 * ``TIMEOUT=<string>``: directs the runtime to terminate the job after
   it has executed for the specified time. Time is specified in
@@ -165,3 +178,13 @@ The ``--runtime-options`` command line option has no qualifiers.
 
 .. note:: Directives are case-insensitive.  ``FWD-ENVIRONMENT`` is the
           same as ``fwd-environment``.
+
+A value that is neither true nor false is refused rather than guessed at:
+the truth test underneath reads anything it does not recognize as
+``false``, so ``donotlaunch=maybe`` would otherwise quietly launch.
+
+``--runtime-options`` describes the job as a whole |mdash| there is no such
+thing as one app context of an MPMD command line not launching |mdash| so
+it may be written in *any* app context and applies to all of them. Two app
+contexts that ask for opposite things are refused, since there is no way to
+honor both.

@@ -14,7 +14,7 @@
  *                         All rights reserved.
  * Copyright (c) 2014-2020 Intel, Inc.  All rights reserved.
  * Copyright (c) 2016-2021 IBM Corporation.  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -41,11 +41,15 @@
 
 #include "src/mca/errmgr/errmgr.h"
 #include "src/mca/ess/ess.h"
+#include "src/mca/iof/base/base.h"
+#include "src/mca/ras/base/base.h"
+#include "src/mca/state/state.h"
 #include "src/runtime/prte_globals.h"
 #include "src/util/dash_host/dash_host.h"
 #include "src/util/hostfile/hostfile.h"
 #include "src/util/name_fns.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 #include "types.h"
 
 #include "src/mca/rmaps/base/base.h"
@@ -70,7 +74,7 @@ int prte_rmaps_base_filter_nodes(prte_app_context_t *app, pmix_list_t *nodes, bo
         }
         /** check that anything is here */
         if (0 == pmix_list_get_size(nodes)) {
-            pmix_show_help("help-prte-rmaps-base.txt", "prte-rmaps-base:no-mapped-node", true,
+            prte_show_help("help-prte-rmaps-base.txt", "prte-rmaps-base:no-mapped-node", true,
                            app->app, "-hostfile", hosts);
             free(hosts);
             return PRTE_ERR_SILENT;
@@ -88,7 +92,7 @@ int prte_rmaps_base_filter_nodes(prte_app_context_t *app, pmix_list_t *nodes, bo
         }
         /** check that anything is left! */
         if (0 == pmix_list_get_size(nodes)) {
-            pmix_show_help("help-prte-rmaps-base.txt", "prte-rmaps-base:no-mapped-node", true,
+            prte_show_help("help-prte-rmaps-base.txt", "prte-rmaps-base:no-mapped-node", true,
                            app->app, "-host", hosts);
             free(hosts);
             return PRTE_ERR_SILENT;
@@ -99,9 +103,75 @@ int prte_rmaps_base_filter_nodes(prte_app_context_t *app, pmix_list_t *nodes, bo
     return rc;
 }
 
+/* The session a node belongs to for targeting purposes. A node with no
+ * explicit session belongs to the default session (the unreserved pool). */
+static inline prte_session_t *node_owning_session(prte_node_t *nd)
+{
+    return (NULL == nd->session) ? prte_default_session : nd->session;
+}
+
+/* True if nd is usable by a job targeting the given set of sessions. */
+static bool node_in_targets(prte_node_t *nd,
+                            prte_session_t **targets, size_t ntargets)
+{
+    prte_session_t *owner = node_owning_session(nd);
+    size_t i;
+
+    for (i = 0; i < ntargets; i++) {
+        if (owner == targets[i]) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /*
  * Query the registry for all nodes allocated to a specified app_context
  */
+void prte_rmaps_base_record_resize(prte_node_t *node, int32_t slots)
+{
+    prte_rmaps_base_resize_t *rsz;
+
+    /* if this map already grew the node, the value it had the first time is
+     * the one to put back - a later app must not record the grown count as
+     * the original */
+    PMIX_LIST_FOREACH(rsz, &prte_rmaps_base.resized_nodes, prte_rmaps_base_resize_t) {
+        if (rsz->node == node) {
+            return;
+        }
+    }
+    rsz = PMIX_NEW(prte_rmaps_base_resize_t);
+    rsz->node = node;   // borrowed - the pool owns it
+    rsz->slots = slots;
+    rsz->slots_given = PRTE_FLAG_TEST(node, PRTE_NODE_FLAG_SLOTS_GIVEN);
+    pmix_list_append(&prte_rmaps_base.resized_nodes, &rsz->super);
+}
+
+void prte_rmaps_base_restore_resized(void)
+{
+    prte_rmaps_base_resize_t *rsz;
+
+    while (NULL != (rsz = (prte_rmaps_base_resize_t *)
+                    pmix_list_remove_first(&prte_rmaps_base.resized_nodes))) {
+        PMIX_OUTPUT_VERBOSE((5, prte_rmaps_base_framework.framework_output,
+                             "%s restoring node %s to %d slots",
+                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                             rsz->node->name, rsz->slots));
+        rsz->node->slots = rsz->slots;
+        /* the flag says the slot count was stated rather than detected, and
+         * a later job reads it to decide whether it may oversubscribe this
+         * node. Growing the node for a "-host node:N" sets it, so a job that
+         * merely said how many slots it wanted would otherwise have left the
+         * node refusing oversubscription to every job that followed. */
+        if (rsz->slots_given) {
+            PRTE_FLAG_SET(rsz->node, PRTE_NODE_FLAG_SLOTS_GIVEN);
+        } else {
+            PRTE_FLAG_UNSET(rsz->node, PRTE_NODE_FLAG_SLOTS_GIVEN);
+        }
+        PMIX_RELEASE(rsz);
+    }
+}
+
 int prte_rmaps_base_get_target_nodes(pmix_list_t *allocated_nodes,
                                      int32_t *total_num_slots,
                                      prte_job_t *jdata, prte_app_context_t *app,
@@ -109,159 +179,52 @@ int prte_rmaps_base_get_target_nodes(pmix_list_t *allocated_nodes,
                                      bool initial_map, bool silent, bool keepall)
 {
     pmix_list_item_t *item;
-    prte_node_t *node, *nd, *nptr, *next;
+    prte_node_t *node, *nd, *next;
     int32_t num_slots;
     int32_t i;
     int rc;
     prte_job_t *daemons;
     bool novm;
-    pmix_list_t nodes;
     char *hosts = NULL;
-    bool needhosts = false;
+    prte_session_t **targets;
+    size_t ntargets;
+    prte_session_t *deftarget[1];
     /** set default answer */
     *total_num_slots = 0;
+
+    /* determine the set of sessions whose nodes this job may map onto. The HNP
+     * resolves PRTE_JOB_SPAWN_TARGET into jdata->target_sessions; absent that,
+     * the job maps onto its own (primary) session - preserving the historical
+     * single-session behavior. */
+    if (NULL != jdata->target_sessions && 0 < jdata->num_target_sessions) {
+        targets = jdata->target_sessions;
+        ntargets = jdata->num_target_sessions;
+    } else {
+        deftarget[0] = jdata->session;
+        targets = deftarget;
+        ntargets = 1;
+    }
 
     /* get the daemon job object */
     daemons = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
     /* see if we have a vm or not */
     novm = prte_get_attribute(&daemons->attributes, PRTE_JOB_NO_VM, NULL, PMIX_BOOL);
 
-    /* if this is NOT a managed allocation, then we use the nodes
-     * that were specified for this app - there is no need to collect
-     * all available nodes and "filter" them.
+    /* Build the job's node set from the resources of the session(s) it may
+     * map onto, then narrow that set with whatever the app specified. The
+     * session resources are the allocation - a resource manager's, or one
+     * built from -host/-hostfile at allocation time - so they are the
+     * authoritative list, and -host/-hostfile can only select within it.
+     * prte_util_filter_dash_host_nodes rebuilds the list in the order the
+     * user named the hosts, so their ordering is preserved.
      *
-     * However, if it is a managed allocation AND the hostfile or the hostlist was
-     * provided, those take precedence, so process them and filter as we normally do.
+     * A second path used to run here for an unmanaged allocation, assembling
+     * the list from the app specs and looking each name up in the pool. It
+     * reached the same set by a longer route - nothing outside the pool could
+     * ever survive it either - but it bypassed the checks this one applies,
+     * notably that an unallocated head node is not usable just because
+     * someone named it.
      */
-    hosts = NULL;
-    if ((prte_get_attribute(&app->attributes, PRTE_APP_DASH_HOST, (void **) &hosts, PMIX_STRING) ||
-         prte_get_attribute(&app->attributes, PRTE_APP_HOSTFILE, (void **) &hosts, PMIX_STRING)) &&
-         NULL != hosts) {
-        needhosts = true;
-        free(hosts);
-    }
-    if (!prte_managed_allocation ||
-        (prte_managed_allocation && needhosts)) {
-        PMIX_CONSTRUCT(&nodes, pmix_list_t);
-        /* if the app provided a dash-host, then use those nodes */
-        hosts = NULL;
-        if (prte_get_attribute(&app->attributes, PRTE_APP_DASH_HOST, (void **) &hosts, PMIX_STRING) &&
-            NULL != hosts) {
-            PMIX_OUTPUT_VERBOSE((5, prte_rmaps_base_framework.framework_output,
-                                 "%s using dash_host %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                                 hosts));
-            if (PRTE_SUCCESS != (rc = prte_util_add_dash_host_nodes(&nodes, hosts, false))) {
-                PRTE_ERROR_LOG(rc);
-                free(hosts);
-                return rc;
-            }
-            free(hosts);
-        } else if (prte_get_attribute(&app->attributes, PRTE_APP_HOSTFILE, (void **) &hosts, PMIX_STRING) &&
-                   NULL != hosts) {
-            /* otherwise, if the app provided a hostfile, then use that */
-            PMIX_OUTPUT_VERBOSE((5, prte_rmaps_base_framework.framework_output,
-                                 "%s using hostfile %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                                 hosts));
-            if (PRTE_SUCCESS != (rc = prte_util_add_hostfile_nodes(&nodes, hosts))) {
-                free(hosts);
-                PRTE_ERROR_LOG(rc);
-                return rc;
-            }
-            free(hosts);
-        } else {
-            /* if nothing else was specified by the app, then use all known nodes, which
-             * will include ourselves
-             */
-            PMIX_OUTPUT_VERBOSE((5, prte_rmaps_base_framework.framework_output,
-                                 "%s using known nodes", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
-            goto addknown;
-        }
-        /** if we still don't have anything */
-        if (0 == pmix_list_get_size(&nodes)) {
-            if (!silent) {
-                pmix_show_help("help-prte-rmaps-base.txt", "prte-rmaps-base:no-available-resources",
-                               true);
-            }
-            PMIX_DESTRUCT(&nodes);
-            return PRTE_ERR_SILENT;
-        }
-        /* find the nodes in the session and assemble them
-         * in list order as that is what the user specified. Note
-         * that the prte_node_t objects on the nodes list are not
-         * fully filled in - they only contain the user-provided
-         * name of the node as a temp object. Thus, we cannot just
-         * check to see if the node pointer matches that of a node
-         * in the session.
-         */
-        PMIX_LIST_FOREACH_SAFE(nptr, next, &nodes, prte_node_t)
-        {
-            for (i = 0; i < jdata->session->nodes->size; i++) {
-                node = (prte_node_t *) pmix_pointer_array_get_item(jdata->session->nodes, i);
-                if (NULL == node) {
-                    continue;
-                }
-                /* ignore nodes that are non-usable */
-                if (PRTE_FLAG_TEST(node, PRTE_NODE_NON_USABLE)) {
-                    continue;
-                }
-                /* ignore nodes that are marked as do-not-use for this mapping */
-                if (PRTE_NODE_STATE_DO_NOT_USE == node->state) {
-                    PMIX_OUTPUT_VERBOSE((10, prte_rmaps_base_framework.framework_output,
-                                         "NODE %s IS MARKED NO_USE", node->name));
-                    /* reset the state so it can be used another time */
-                    node->state = PRTE_NODE_STATE_UP;
-                    continue;
-                }
-                if (PRTE_NODE_STATE_DOWN == node->state) {
-                    PMIX_OUTPUT_VERBOSE((10, prte_rmaps_base_framework.framework_output,
-                                         "NODE %s IS DOWN", node->name));
-                    continue;
-                }
-                if (PRTE_NODE_STATE_NOT_INCLUDED == node->state) {
-                    PMIX_OUTPUT_VERBOSE((10, prte_rmaps_base_framework.framework_output,
-                                         "NODE %s IS MARKED NO_INCLUDE", node->name));
-                    /* not to be used */
-                    continue;
-                }
-                /* if this node wasn't included in the vm (e.g., by -host), ignore it,
-                 * unless we are mapping prior to launching the vm
-                 */
-                if (NULL == node->daemon && !novm) {
-                    PMIX_OUTPUT_VERBOSE((10, prte_rmaps_base_framework.framework_output,
-                                         "NODE %s HAS NO DAEMON", node->name));
-                    continue;
-                }
-                if (!prte_nptr_match(node, nptr)) {
-                    PMIX_OUTPUT_VERBOSE((10, prte_rmaps_base_framework.framework_output,
-                                         "NODE %s DOESNT MATCH NODE %s", node->name, nptr->name));
-                    continue;
-                }
-                /* retain a copy for our use in case the item gets
-                 * destructed along the way
-                 */
-                PMIX_RETAIN(node);
-                if (initial_map) {
-                    /* if this is the first app_context we
-                     * are getting for an initial map of a job,
-                     * then mark all nodes as unmapped
-                     */
-                    PRTE_FLAG_UNSET(node, PRTE_NODE_FLAG_MAPPED);
-                }
-                /* the list is ordered as per user direction using -host
-                 * or the listing in -hostfile - preserve that ordering */
-                pmix_list_append(allocated_nodes, &node->super);
-                break;
-            }
-            /* remove the item from the list as we have allocated it */
-            pmix_list_remove_item(&nodes, (pmix_list_item_t *) nptr);
-            PMIX_RELEASE(nptr);
-        }
-        PMIX_DESTRUCT(&nodes);
-        /* now prune for usage and compute total slots */
-        goto complete;
-    }
-
-addknown:
     /* add everything in the node pool that can be used - add them
      * in daemon order, which may be different than the order in the
      * node pool. Since an empty list is passed into us, the list at
@@ -273,10 +236,13 @@ addknown:
     } else {
         nd = (prte_node_t *) pmix_list_get_last(allocated_nodes);
     }
-    for (i = 0; i < jdata->session->nodes->size; i++) {
-        if (NULL != (node = (prte_node_t *) pmix_pointer_array_get_item(jdata->session->nodes, i))) {
+    for (i = 0; i < prte_node_pool->size; i++) {
+        if (NULL != (node = (prte_node_t *) pmix_pointer_array_get_item(prte_node_pool, i))) {
 
-
+            /* ignore nodes that are not in the job's targeted session set */
+            if (!node_in_targets(node, targets, ntargets)) {
+                continue;
+            }
             /* ignore nodes that are non-usable */
             if (PRTE_FLAG_TEST(node, PRTE_NODE_NON_USABLE)) {
                 continue;
@@ -361,7 +327,7 @@ addknown:
     /** check that anything is here */
     if (0 == pmix_list_get_size(allocated_nodes)) {
         if (!silent) {
-            pmix_show_help("help-prte-rmaps-base.txt", "prte-rmaps-base:no-available-resources",
+            prte_show_help("help-prte-rmaps-base.txt", "prte-rmaps-base:no-available-resources",
                            true);
         }
         return PRTE_ERR_SILENT;
@@ -380,7 +346,6 @@ addknown:
                          "%s Retained %d nodes in list", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                          (int) pmix_list_get_size(allocated_nodes)));
 
-complete:
     /* if we are mapping debuggers, then they don't count against
      * the allocation */
     if (PRTE_FLAG_TEST(app, PRTE_APP_FLAG_TOOL)) {
@@ -460,6 +425,48 @@ complete:
                     NULL != hosts) {
                     s = prte_util_dash_host_compute_slots(node, hosts);
                     free(hosts);
+                    /* the spec can name more slots on this node than the node
+                     * has left. Who may answer that depends on where the
+                     * allocation came from: a resource manager decided how
+                     * much of the node is ours and we cannot hand out more,
+                     * while an unmanaged allocation is only the description
+                     * the user gave us of a machine nobody is scheduling - so
+                     * the ":N" simply re-describes it - which is the same
+                     * authority prte_ras_base.scheduler_owned records for the
+                     * add-host directive. Left unreconciled, the
+                     * job was sized against the larger number and then mapped
+                     * against the smaller one, which is a "failed to map" with
+                     * nothing said about the slots. */
+                    if (s > node->slots - node->slots_inuse &&
+                        (PRTE_MAPPING_NO_OVERSUBSCRIBE &
+                         PRTE_GET_MAPPING_DIRECTIVE(policy))) {
+                        if (prte_ras_base.scheduler_owned) {
+                            prte_show_help("help-dash-host.txt",
+                                           "dash-host:slots-exceed-allocation", true,
+                                           node->name, s,
+                                           node->slots - node->slots_inuse);
+                            return PRTE_ERR_SILENT;
+                        }
+                        if (0 != node->slots_max &&
+                            node->slots_inuse + s > node->slots_max) {
+                            prte_show_help("help-dash-host.txt",
+                                           "dash-host:slots-exceed-max", true,
+                                           node->name, s,
+                                           node->slots_max - node->slots_inuse,
+                                           node->slots_max);
+                            return PRTE_ERR_SILENT;
+                        }
+                        /* grow the node to what the user just told us it is,
+                         * for the duration of this map. The ":N" says how many
+                         * slots THIS job may have on the node - the allocation
+                         * itself is unchanged, which is the difference between
+                         * -host and -add-host - so the count goes back at
+                         * cleanup and prte_ras_base.total_slots_alloc, which
+                         * describes the allocation, is left alone. */
+                        prte_rmaps_base_record_resize(node, node->slots);
+                        node->slots = node->slots_inuse + s;
+                        PRTE_FLAG_SET(node, PRTE_NODE_FLAG_SLOTS_GIVEN);
+                    }
                 } else {
                     s = node->slots - node->slots_inuse;
                 }
@@ -481,6 +488,12 @@ complete:
                 PMIX_OUTPUT_VERBOSE((5, prte_rmaps_base_framework.framework_output,
                                      "%s node %s is fully used, but available for oversubscription",
                                      PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), node->name));
+                /* this node offers the job nothing - say so. The mappers read
+                 * slots_available as what they may take here, and this branch
+                 * used to leave whatever the last job to map left behind: a
+                 * count from a node that had room, against a node that has
+                 * none. */
+                node->slots_available = 0;
                 /* cache the available CPUs for later */
                 hwloc_bitmap_copy(node->jobcache, node->available);
             } else if (!keepall) {
@@ -504,7 +517,7 @@ complete:
              */
             return PRTE_ERR_RESOURCE_BUSY;
         } else {
-            pmix_show_help("help-prte-rmaps-base.txt",
+            prte_show_help("help-prte-rmaps-base.txt",
                            "prte-rmaps-base:all-available-resources-used", true);
             return PRTE_ERR_SILENT;
         }
@@ -516,14 +529,57 @@ complete:
     /* check for prior bookmark */
     prte_rmaps_base_get_starting_point(allocated_nodes, jdata);
 
-    if (4 < pmix_output_get_verbosity(prte_rmaps_base_framework.framework_output)) {
-        pmix_output(0, "AVAILABLE NODES FOR MAPPING:");
-        for (item = pmix_list_get_first(allocated_nodes);
-             item != pmix_list_get_end(allocated_nodes); item = pmix_list_get_next(item)) {
-            node = (prte_node_t *) item;
-            pmix_output(0, "    node: %s daemon: %s slots_available: %d", node->name,
-                        (NULL == node->daemon) ? "NULL" : PRTE_VPID_PRINT(node->daemon->name.rank),
-                        node->slots_available);
+    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_DISPLAY_ALLOC, NULL, PMIX_BOOL) ||
+        4 < pmix_output_get_verbosity(prte_rmaps_base_framework.framework_output)) {
+        bool parsable;
+        char *tmp = NULL, *tmp2, *tmp3;
+        prte_node_t *alloc;
+        pmix_proc_t source;
+
+        if (!prte_get_attribute(&jdata->attributes, PRTE_JOB_ALLOC_DISPLAYED, NULL, PMIX_BOOL)) {
+
+            parsable = prte_get_attribute(&jdata->attributes, PRTE_JOB_DISPLAY_PARSEABLE_OUTPUT, NULL, PMIX_BOOL);
+            PMIX_LOAD_PROCID(&source, jdata->nspace, PMIX_RANK_WILDCARD);
+
+            if (parsable) {
+                pmix_asprintf(&tmp, "<allocation>\n");
+            } else {
+                pmix_asprintf(&tmp,
+                              "\n============   ALLOCATED NODES FOR JOB %s APP %d ============\n",
+                              jdata->nspace, app->idx);
+            }
+            for (item = pmix_list_get_first(allocated_nodes);
+                 item != pmix_list_get_end(allocated_nodes); item = pmix_list_get_next(item)) {
+                alloc = (prte_node_t *) item;
+                if (parsable) {
+                    /* need to create the output in XML format */
+                    pmix_asprintf(&tmp2,
+                                  "\t<host name=\"%s\" slots=\"%d\" max_slots=\"%d\" slots_inuse=\"%d\">\n",
+                                  (NULL == alloc->name) ? "UNKNOWN" : alloc->name, (int) alloc->slots_available,
+                                  (int) alloc->slots_max, (int) alloc->slots_inuse);
+                } else {
+                    pmix_asprintf(&tmp2, "    %s: slots=%d max_slots=%d slots_inuse=%d\n",
+                                  (NULL == alloc->name) ? "UNKNOWN" : alloc->name, (int) alloc->slots_available,
+                                  (int) alloc->slots_max, (int) alloc->slots_inuse);
+                }
+                if (NULL == tmp) {
+                    tmp = tmp2;
+                } else {
+                    pmix_asprintf(&tmp3, "%s%s", tmp, tmp2);
+                    free(tmp);
+                    free(tmp2);
+                    tmp = tmp3;
+                }
+            }
+            if (parsable) {
+                pmix_asprintf(&tmp2, "%s</allocation>\n", tmp);
+            } else {
+                pmix_asprintf(&tmp2,
+                            "%s=================================================================================\n", tmp);
+            }
+            free(tmp);
+            prte_iof_base_output(&source, PMIX_FWD_STDOUT_CHANNEL, tmp2);
+            prte_set_attribute(&jdata->attributes, PRTE_JOB_ALLOC_DISPLAYED, PRTE_ATTR_LOCAL, NULL, PMIX_BOOL);
         }
     }
 
@@ -560,9 +616,8 @@ prte_proc_t *prte_rmaps_base_setup_proc(prte_job_t *jdata,
         proc->parent = node->daemon->name.rank;
     }
 
-    // point the proc at its node
+    // point the proc at its node - borrowed, not retained
     proc->node = node;
-    PMIX_RETAIN(node); /* maintain accounting on object */
 
     /* point the proc to its locale */
     proc->obj = obj;
@@ -578,16 +633,45 @@ prte_proc_t *prte_rmaps_base_setup_proc(prte_job_t *jdata,
         PMIX_RELEASE(proc); // releases node to maintain accounting
         return NULL;
     }
+    /* A node rank has to be unique among the procs alive on this node at any
+     * one time, across every job running there - that is the entire
+     * difference between it and local_rank, which is numbered within one job.
+     * The slot this proc just took in node->procs is exactly that property:
+     * pmix_pointer_array_add() hands back the lowest index no live proc
+     * holds, and a job's completion NULLs the slot as it releases the proc.
+     *
+     * node->num_procs cannot supply it, which is what this used to read.  It
+     * is a population count, and it goes back *down* when any job's procs
+     * leave, so a job mapped after an earlier job ended was handed the node
+     * ranks a third, still-running job was already using.  Two live procs on
+     * one node then answered PMIX_NODE_RANK with the same number.  On a
+     * persistent DVM - and on anything doing repeated PMIx_Spawn - that is
+     * the common case, not a corner. */
+    if (PRTE_NODE_RANK_INVALID <= rc) {
+        /* more live procs on this node than a node rank can name.  Refuse
+         * rather than hand back a value that aliases the invalid marker */
+        PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+        pmix_pointer_array_set_item(node->procs, rc, NULL);
+        PMIX_RELEASE(proc); // releases node to maintain accounting
+        return NULL;
+    }
 
     /* if this is a tool app, then it doesn't count against
      * available slots - otherwise, it does */
     if (PRTE_FLAG_TEST(app, PRTE_APP_FLAG_TOOL)) {
         proc->local_rank = 0;
-        proc->node_rank = UINT16_MAX;
+        proc->node_rank = PRTE_NODE_RANK_INVALID;
     } else {
-        proc->node_rank = node->num_procs;
+        proc->node_rank = (prte_node_rank_t) rc;
         node->num_procs++;
         ++node->slots_inuse;
+        /* slots_available is what this mapping operation may still take
+         * from the node - it is not always slots minus slots_inuse (a
+         * -host suffix can cap it below that), so it has to be consumed
+         * here rather than recomputed by the mappers */
+        if (0 < node->slots_available) {
+            --node->slots_available;
+        }
     }
 
     /* retain the proc struct so that we correctly track its release */
@@ -662,6 +746,17 @@ int prte_rmaps_base_get_ncpus(prte_node_t *node,
     return ncpus;
 }
 
+/* the target cpuset is recomputed for every node we consider, so the one
+ * left over from the previous node has to go back before we build a new
+ * one - the mappers free only the final target when they are done */
+static void free_target(prte_rmaps_options_t *options)
+{
+    if (NULL != options->target) {
+        hwloc_bitmap_free(options->target);
+        options->target = NULL;
+    }
+}
+
 bool prte_rmaps_base_check_avail(prte_job_t *jdata,
                                  prte_app_context_t *app,
                                  prte_node_t *node,
@@ -691,17 +786,25 @@ bool prte_rmaps_base_check_avail(prte_job_t *jdata,
     }
     if (0 != node->slots_max &&
         node->slots_max <= node->slots_inuse) {
-        /* cannot use this node - already at max_slots */
-        pmix_list_remove_item(node_list, &node->super);
-        PMIX_RELEASE(node);
+        /* cannot use this node - already at max_slots. Drop it from the
+         * caller's node list so no later pass considers it again; a caller
+         * that has no such list (its list holds something other than the
+         * nodes it is walking) passes NULL and simply gets "false" back.
+         * Note that a caller which does pass a list must treat a false
+         * return as "done with this node" - handing us the same node twice
+         * would remove an item that is no longer on the list and release a
+         * reference we no longer hold. */
+        if (NULL != node_list) {
+            pmix_list_remove_item(node_list, &node->super);
+            PMIX_RELEASE(node);
+        }
         goto done;
     }
 
     if (PRTE_BIND_TO_NONE == options->bind) {
+        free_target(options);
         if (NULL != options->job_cpuset) {
             options->target = hwloc_bitmap_dup(options->job_cpuset);
-        } else {
-            options->target = NULL;
         }
         avail = true;
         goto done;
@@ -709,17 +812,28 @@ bool prte_rmaps_base_check_avail(prte_job_t *jdata,
 
     options->ncpus = prte_rmaps_base_get_ncpus(node, obj, options);
     /* the available cpus are in the scratch location */
+    free_target(options);
     options->target = hwloc_bitmap_dup(prte_rmaps_base.available);
 
+    // compute how many procs we can support on this object
     nprocs = options->ncpus / options->cpus_per_rank;
-    if (options->nprocs <= nprocs) {
-        avail = true;
-    } else if (options->overload) {
-        /* doesn't matter how many cpus are in use */
-        avail = true;
-    } else if (0 == options->pprn && 0 < nprocs) {
-        options->nprocs = nprocs;
-        avail = true;
+
+    if (0 < options->pprn) {
+        // we are ppr mapping, so there must be enough cpus to
+        // support at least pprn procs on this object
+        if (options->pprn <= nprocs) {
+            avail = true;
+        }
+    } else {
+        if (options->nprocs <= nprocs) {
+            avail = true;
+        } else if (options->overload) {
+            /* doesn't matter how many cpus are in use */
+            avail = true;
+        } else if (0 < nprocs) {
+            options->nprocs = nprocs;
+            avail = true;
+        }
     }
 
 done:
@@ -741,10 +855,25 @@ void prte_rmaps_base_get_cpuset(prte_job_t *jdata,
 {
     PRTE_HIDE_UNUSED_PARAMS(jdata);
 
+    /* mappers call this once per candidate node, so drop the cpuset computed
+     * for the previous node before computing this one's */
+    if (NULL != options->job_cpuset) {
+        hwloc_bitmap_free(options->job_cpuset);
+        options->job_cpuset = NULL;
+    }
+
     if (NULL != options->cpuset) {
         options->job_cpuset = prte_hwloc_base_generate_cpuset(node->topology->topo,
                                                               options->use_hwthreads,
                                                               &options->cpuset);
+        if (NULL == options->job_cpuset) {
+            /* the cpu-set does not resolve against this node's topology.
+             * generate_cpuset() has already said which entry failed; hand
+             * back an empty set so this node simply offers nothing, rather
+             * than a NULL for the callers below to intersect */
+            options->job_cpuset = hwloc_bitmap_alloc();
+            hwloc_bitmap_zero(options->job_cpuset);
+        }
     } else {
         options->job_cpuset = hwloc_bitmap_dup(node->available);
     }
@@ -772,7 +901,7 @@ int prte_rmaps_base_check_support(prte_job_t *jdata,
         if (PRTE_BINDING_REQUIRED(jdata->map->binding) &&
             PRTE_BINDING_POLICY_IS_SET(jdata->map->binding)) {
             /* we are required to bind but cannot */
-            pmix_show_help("help-prte-rmaps-base.txt", "rmaps:cpubind-not-supported",
+            prte_show_help("help-prte-rmaps-base.txt", "rmaps:cpubind-not-supported",
                            true, node->name);
             return PRTE_ERR_SILENT;
         }
@@ -789,11 +918,11 @@ int prte_rmaps_base_check_support(prte_job_t *jdata,
         !support->membind->set_thisthread_membind &&
         PRTE_BINDING_POLICY_IS_SET(jdata->map->binding)) {
         if (PRTE_HWLOC_BASE_MBFA_WARN == prte_hwloc_base_mbfa && !options->membind_warned) {
-            pmix_show_help("help-prte-rmaps-base.txt", "rmaps:membind-not-supported", true,
+            prte_show_help("help-prte-rmaps-base.txt", "rmaps:membind-not-supported", true,
                            node->name);
             options->membind_warned = true;
         } else if (PRTE_HWLOC_BASE_MBFA_ERROR == prte_hwloc_base_mbfa) {
-            pmix_show_help("help-prte-rmaps-base.txt", "rmaps:membind-not-supported-fatal",
+            prte_show_help("help-prte-rmaps-base.txt", "rmaps:membind-not-supported-fatal",
                            true, node->name);
             return PRTE_ERR_SILENT;
         }
@@ -834,13 +963,13 @@ int prte_rmaps_base_check_oversubscribed(prte_job_t *jdata,
              * via hostfile/dash-host */
             if (!(PRTE_MAPPING_SUBSCRIBE_GIVEN &
                   PRTE_GET_MAPPING_DIRECTIVE(jdata->map->mapping))) {
-                pmix_show_help("help-prte-rmaps-base.txt", "prte-rmaps-base:alloc-error",
+                prte_show_help("help-prte-rmaps-base.txt", "prte-rmaps-base:alloc-error",
                                true, app->num_procs, app->app, prte_process_info.nodename);
                 PRTE_UPDATE_EXIT_STATUS(PRTE_ERROR_DEFAULT_EXIT_CODE);
                 return PRTE_ERR_SILENT;
             } else if (!options->oversubscribe) {
                 /* if we were explicitly told not to oversubscribe, then don't */
-                pmix_show_help("help-prte-rmaps-base.txt", "prte-rmaps-base:alloc-error",
+                prte_show_help("help-prte-rmaps-base.txt", "prte-rmaps-base:alloc-error",
                                true, app->num_procs, app->app, prte_process_info.nodename);
                 PRTE_UPDATE_EXIT_STATUS(PRTE_ERROR_DEFAULT_EXIT_CODE);
                 return PRTE_ERR_SILENT;

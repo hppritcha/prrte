@@ -5,7 +5,8 @@
  * Copyright (c) 2014-2020 Intel, Inc.  All rights reserved.
  * Copyright (c) 2015-2019 Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2026      Sandia National Laboratories  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -45,9 +46,10 @@
 #include "src/util/pmix_path.h"
 #include "src/util/pmix_environ.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 
 #include "src/mca/errmgr/errmgr.h"
-#include "src/mca/grpcomm/base/base.h"
+#include "src/grpcomm/grpcomm.h"
 #include "src/rml/rml.h"
 #include "src/mca/state/state.h"
 #include "src/runtime/prte_globals.h"
@@ -63,12 +65,14 @@
 
 static int raw_init(void);
 static int raw_finalize(void);
+static void raw_fault_handler(const prte_rml_recovery_status_t *status);
 static int raw_preposition_files(prte_job_t *jdata, prte_filem_completion_cbfunc_t cbfunc,
                                  void *cbdata);
 static int raw_link_local_files(prte_job_t *jdata, prte_app_context_t *app);
 
 prte_filem_base_module_t prte_filem_raw_module = {.filem_init = raw_init,
                                                   .filem_finalize = raw_finalize,
+                                                  .fault_handler = raw_fault_handler,
                                                   /* we don't use any of the following */
                                                   .put = prte_filem_base_none_put,
                                                   .put_nb = prte_filem_base_none_put_nb,
@@ -87,11 +91,13 @@ static pmix_list_t incoming_files;
 static pmix_list_t positioned_files;
 
 static void send_chunk(int fd, short argc, void *cbdata);
+static void chunk_delivered(void *cbdata);
 static void recv_files(int status, pmix_proc_t *sender, pmix_data_buffer_t *buffer,
                        prte_rml_tag_t tag, void *cbdata);
 static void recv_ack(int status, pmix_proc_t *sender, pmix_data_buffer_t *buffer,
                      prte_rml_tag_t tag, void *cbdata);
 static void write_handler(int fd, short event, void *cbdata);
+static void xfer_check_complete(prte_filem_raw_xfer_t *xfer);
 
 static int raw_init(void)
 {
@@ -116,6 +122,16 @@ static int raw_finalize(void)
 {
     pmix_list_item_t *item;
 
+    /* stop the receives before dropping the state they feed. In a
+     * --enable-mca-dso build the framework close that follows unloads this
+     * component, so a recv left posted here is an RML callback pointing
+     * into memory that is about to be unmapped
+     */
+    PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_FILEM_BASE);
+    if (PRTE_PROC_IS_MASTER) {
+        PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_FILEM_BASE_RESP);
+    }
+
     while (NULL != (item = pmix_list_remove_first(&incoming_files))) {
         PMIX_RELEASE(item);
     }
@@ -135,9 +151,204 @@ static int raw_finalize(void)
     return PRTE_SUCCESS;
 }
 
-static void xfer_complete(int status, prte_filem_raw_xfer_t *xfer)
+/* Drop a set of departed ranks from what one transfer is owed.
+ *
+ * A rank at or above the transfer's horizon joined after the broadcast began,
+ * never saw its chunks and owes it nothing, so it is skipped.  Below the
+ * horizon there are two cases and they need opposite adjustments: a daemon
+ * that had already acked is dropped from nrecvd as well, because the file no
+ * longer covers a daemon that is no longer here, while one that had not acked
+ * simply stops being expected.
+ */
+static void credit_departures(prte_filem_raw_xfer_t *xfer,
+                              const pmix_rank_t *failed, size_t nfailed)
+{
+    size_t n;
+    int r;
+
+    for (n = 0; n < nfailed; n++) {
+        r = (int) failed[n];
+        if ((pmix_rank_t) r >= xfer->horizon) {
+            /* joined after this broadcast began - it never owed us an ack */
+            continue;
+        }
+        if (pmix_bitmap_is_set_bit(&xfer->acked, r)) {
+            /* it took delivery before it died: the file no longer covers
+             * this daemon because the daemon is no longer here
+             */
+            pmix_bitmap_clear_bit(&xfer->acked, r);
+            if (0 < xfer->nrecvd) {
+                --xfer->nrecvd;
+            }
+        }
+        if (0 < xfer->nexpected) {
+            --xfer->nexpected;
+        }
+        PMIX_OUTPUT_VERBOSE((1, prte_filem_base_framework.framework_output,
+                             "%s filem:raw: daemon %s departed - file %s now"
+                             " delivered to %u of %u expected",
+                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                             PRTE_VPID_PRINT(failed[n]), xfer->file,
+                             (unsigned) xfer->nrecvd, (unsigned) xfer->nexpected));
+    }
+}
+
+/* A daemon has left the DVM.  Everything a transfer needs to survive that is
+ * already in place elsewhere, so this handler has exactly one job: settle the
+ * ack accounting for the daemons that are never going to answer.
+ *
+ *  - The chunks themselves ride xcast, which re-drives its in-flight ops over
+ *    the repaired tree, so a daemon whose parent died still receives the rest
+ *    of the file, in order, without anything here.
+ *  - The acks travel back over RELM (PRTE_RML_RELIABLE_SEND in
+ *    send_complete), so an ack in flight through the daemon that died is
+ *    re-driven rather than lost.
+ *  - What neither of those can supply is an ack from a daemon that is gone.
+ *    Nothing else will ever revisit the transfer - completion is driven by
+ *    arriving acks - so a file still owing one to the departed daemon would
+ *    hang its outbound forever and wedge the job at VM_READY.  Drop the dead
+ *    ranks from what is owed here, and let any transfer that is thereby
+ *    finished retire.
+ *
+ * positioned_files is walked for the same reason, even though those transfers
+ * are long over: their counts are what the already-positioned check in
+ * raw_preposition_files reads to decide whether the file still covers the
+ * whole DVM, and a daemon that took its copy with it must stop counting.
+ *
+ * This is deliberately master-only and deliberately silent on the daemons:
+ * outbound_files exists only on the master (raw_init constructs it nowhere
+ * else), and a daemon's own incoming transfers need no repair.
+ */
+static void raw_fault_handler(const prte_rml_recovery_status_t *status){
+    prte_filem_raw_outbound_t *outbound;
+    prte_filem_raw_xfer_t *xfer, *nxt_x;
+    pmix_list_item_t *item, *nxt;
+    pmix_rank_t *failed;
+
+    if (!PRTE_PROC_IS_MASTER) {
+        return;
+    }
+    /* the local pass is the one that carries the news first, and it is the
+     * only one the elastic shrink path drives at all - keying on it means
+     * this runs exactly once per departure, on both routes
+     */
+    if (PRTE_RML_FAULT_SCOPE_LOCAL != status->scope) {
+        return;
+    }
+    /* a revival reaches us through this same entry point with nothing marked
+     * failed (prte_rml_revive_routing_tree), and so does a fault notice whose
+     * ranks were all already recorded as gone.  Neither owes us anything.
+     */
+    if (0 == status->failed_ranks.size || NULL == status->failed_ranks.array) {
+        return;
+    }
+    failed = (pmix_rank_t *) status->failed_ranks.array;
+
+    PMIX_LIST_FOREACH_SAFE(xfer, nxt_x, &positioned_files, prte_filem_raw_xfer_t) {
+        credit_departures(xfer, failed, status->failed_ranks.size);
+    }
+
+    item = pmix_list_get_first(&outbound_files);
+    while (item != pmix_list_get_end(&outbound_files)) {
+        /* retiring the last xfer of an outbound releases the outbound, so
+         * take the next link before touching its contents
+         */
+        nxt = pmix_list_get_next(item);
+        outbound = (prte_filem_raw_outbound_t *) item;
+        PMIX_LIST_FOREACH_SAFE(xfer, nxt_x, &outbound->xfers, prte_filem_raw_xfer_t) {
+            credit_departures(xfer, failed, status->failed_ranks.size);
+            xfer_check_complete(xfer);
+        }
+        item = nxt;
+    }
+}
+
+/* Do these two specifications name the same source file?
+ *
+ * A string compare is not enough: "./mesh.dat" and "mesh.dat" are the same
+ * file, and two apps of one job may perfectly well name it each way. Read
+ * as different files they would look like two files fighting over one
+ * delivered name, and the launch would be refused for a collision that
+ * does not exist. Fall back to the string compare if either one cannot be
+ * stat'd - the open() that follows will produce the real diagnostic.
+ */
+static bool same_source(const char *one, const char *two)
+{
+    struct stat sone, stwo;
+
+    if (0 == strcmp(one, two)) {
+        return true;
+    }
+    if (0 != stat(one, &sone) || 0 != stat(two, &stwo)) {
+        return false;
+    }
+    return (sone.st_dev == stwo.st_dev && sone.st_ino == stwo.st_ino);
+}
+
+static bool has_suffix(const char *name, const char *suffix)
+{
+    size_t ln = strlen(name), ls = strlen(suffix);
+
+    return (ln >= ls && 0 == strcmp(name + ln - ls, suffix));
+}
+
+/* Classify a file by the suffix at the END of its name. Anything we know
+ * how to unpack is unpacked on arrival; everything else is delivered as
+ * the bytes it is.
+ */
+static int32_t suffix_type(const char *name)
+{
+    if (has_suffix(name, ".tar.gz") || has_suffix(name, ".tgz") ||
+        has_suffix(name, ".gz")) {
+        return PRTE_FILEM_TYPE_GZIP;
+    }
+    if (has_suffix(name, ".tar.bz2") || has_suffix(name, ".tbz2") ||
+        has_suffix(name, ".tbz") || has_suffix(name, ".bz2") ||
+        has_suffix(name, ".bz")) {
+        return PRTE_FILEM_TYPE_BZIP;
+    }
+    if (has_suffix(name, ".tar")) {
+        return PRTE_FILEM_TYPE_TAR;
+    }
+    return PRTE_FILEM_TYPE_FILE;
+}
+
+static const char *type_name(int32_t type)
+{
+    switch (type) {
+    case PRTE_FILEM_TYPE_TAR:
+        return "TAR";
+    case PRTE_FILEM_TYPE_BZIP:
+        return "BZIP";
+    case PRTE_FILEM_TYPE_GZIP:
+        return "GZIP";
+    case PRTE_FILEM_TYPE_EXE:
+        return "EXE";
+    case PRTE_FILEM_TYPE_FILE:
+        return "FILE";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+/* Retire a transfer from its outbound request, firing the request's
+ * completion callback once the last of its transfers is gone.
+ *
+ * A transfer that actually reached every daemon is remembered in
+ * positioned_files so a later job in this DVM does not broadcast the same
+ * bytes again; one that failed on the way out is not - it was never
+ * delivered, and recording it as positioned would make the next job skip
+ * a file that is not there.
+ */
+static void xfer_retire(int status, prte_filem_raw_xfer_t *xfer, bool positioned)
 {
     prte_filem_raw_outbound_t *outbound = xfer->outbound;
+
+    /* chunks of this file may still be travelling; each holds a reference
+     * and will call back.  Say the transfer is over so that none of them
+     * restarts a read on it - see chunk_delivered.
+     */
+    xfer->retired = true;
 
     /* transfer the status, if not success */
     if (PRTE_SUCCESS != status) {
@@ -146,8 +357,12 @@ static void xfer_complete(int status, prte_filem_raw_xfer_t *xfer)
 
     /* this transfer is complete - remove it from list */
     pmix_list_remove_item(&outbound->xfers, &xfer->super);
-    /* add it to the list of files that have been positioned */
-    pmix_list_append(&positioned_files, &xfer->super);
+    if (positioned) {
+        /* add it to the list of files that have been positioned */
+        pmix_list_append(&positioned_files, &xfer->super);
+    } else {
+        PMIX_RELEASE(xfer);
+    }
 
     /* if the list is now empty, then the xfer is complete */
     if (0 == pmix_list_get_size(&outbound->xfers)) {
@@ -159,6 +374,44 @@ static void xfer_complete(int status, prte_filem_raw_xfer_t *xfer)
         pmix_list_remove_item(&outbound_files, &outbound->super);
         PMIX_RELEASE(outbound);
     }
+}
+
+static void xfer_complete(int status, prte_filem_raw_xfer_t *xfer)
+{
+    xfer_retire(status, xfer, true);
+}
+
+/* Has every daemon this file was broadcast to answered for it?
+ *
+ * The comparison is against the transfer's own frozen "nexpected", not the
+ * live prte_process_info.num_daemons: the DVM's size moves underneath a
+ * transfer in both directions, and neither direction says anything about
+ * who owes an ack for these bytes.  A daemon that joined after the
+ * broadcast never saw the chunks (xcast hands a late joiner the ops it
+ * missed as already complete), so it will never ack and must not be
+ * counted as owing; a daemon that departed is credited by the fault
+ * handler, whose arithmetic must not also be racing a num_daemons that
+ * may or may not have been decremented yet.
+ */
+static void xfer_check_complete(prte_filem_raw_xfer_t *xfer)
+{
+    if (0 <= xfer->fd) {
+        /* still reading and broadcasting this file.  An ack cannot mean
+         * "delivered" yet - a receiver only acks at EOF - so this is a
+         * receiver reporting an error, and retiring the transfer now would
+         * leave send_chunk pumping bytes for a file the job has already been
+         * told is in place.  The ack that does complete it always arrives
+         * after the last chunk went out.
+         */
+        return;
+    }
+    if (xfer->nrecvd < xfer->nexpected) {
+        return;
+    }
+    PMIX_OUTPUT_VERBOSE((1, prte_filem_base_framework.framework_output,
+                         "%s filem:raw: xfer complete for file %s status %d",
+                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), xfer->file, xfer->status));
+    xfer_complete(xfer->status, xfer);
 }
 
 static void recv_ack(int status, pmix_proc_t *sender, pmix_data_buffer_t *buffer,
@@ -178,12 +431,20 @@ static void recv_ack(int status, pmix_proc_t *sender, pmix_data_buffer_t *buffer
         PMIX_ERROR_LOG(rc);
         return;
     }
+    /* an ack that doesn't name a file matches nothing and cannot be
+     * compared against anything - drop it rather than dereference it
+     */
+    if (NULL == file) {
+        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+        return;
+    }
 
     /* unpack the status */
     n = 1;
     rc = PMIx_Data_unpack(NULL, buffer, &st, &n, PMIX_INT32);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
+        free(file);
         return;
     }
 
@@ -203,20 +464,26 @@ static void recv_ack(int status, pmix_proc_t *sender, pmix_data_buffer_t *buffer
                 if (0 != st) {
                     xfer->status = st;
                 }
-                /* track number of respondents */
-                xfer->nrecvd++;
-                /* if all daemons have responded, then this is complete */
-                if (xfer->nrecvd == prte_process_info.num_daemons) {
-                    PMIX_OUTPUT_VERBOSE((1, prte_filem_base_framework.framework_output,
-                                         "%s filem:raw: xfer complete for file %s status %d",
-                                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), file, xfer->status));
-                    xfer_complete(xfer->status, xfer);
+                /* record WHICH daemon answered, and count it only the first
+                 * time it does: a repeated ack for the same file from the
+                 * same daemon must not be read as another daemon reporting
+                 * in, or the transfer completes while some daemon still has
+                 * no copy of the file
+                 */
+                if (!pmix_bitmap_is_set_bit(&xfer->acked, (int) sender->rank)) {
+                    pmix_bitmap_set_bit(&xfer->acked, (int) sender->rank);
+                    xfer->nrecvd++;
                 }
+                xfer_check_complete(xfer);
                 free(file);
                 return;
             }
         }
     }
+    /* no matching xfer found (e.g. the file was already fully positioned
+     * and removed) - avoid leaking the unpacked filename
+     */
+    free(file);
 }
 
 static int raw_preposition_files(prte_job_t *jdata,
@@ -233,11 +500,23 @@ static int raw_preposition_files(prte_job_t *jdata,
     prte_filem_raw_outbound_t *outbound, *optr;
     char *cptr, *nxt, *filestring;
     pmix_list_t fsets;
+    struct stat sbuf;
     bool already_sent;
+    prte_job_t *daemons;
 
     PMIX_OUTPUT_VERBOSE((1, prte_filem_base_framework.framework_output,
                          "%s filem:raw: preposition files for job %s",
                          PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_JOBID_PRINT(jdata->nspace)));
+
+    /* only the master ever calls this - and only the master has the
+     * bookkeeping it needs, since raw_init builds outbound_files and
+     * positioned_files nowhere else. Appending to a list that was never
+     * constructed is not a failure that would announce itself.
+     */
+    if (!PRTE_PROC_IS_MASTER) {
+        PRTE_ERROR_LOG(PRTE_ERR_NOT_SUPPORTED);
+        return PRTE_ERR_NOT_SUPPORTED;
+    }
 
     /* cycle across the app_contexts looking for files or
      * binaries to be prepositioned
@@ -264,9 +543,18 @@ static int raw_preposition_files(prte_job_t *jdata,
             cptr = pmix_basename(app->app);
             free(app->app);
             pmix_asprintf(&app->app, "./%s", cptr);
+            free(cptr);
+            if (NULL == app->app) {
+                PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+                PMIX_LIST_DESTRUCT(&fsets);
+                return PRTE_ERR_OUT_OF_RESOURCE;
+            }
             free(app->argv[0]);
             app->argv[0] = strdup(app->app);
-            fs->remote_target = strdup(app->app);
+            /* the delivered name is what the app will open, relative to
+             * the directory it lands in - so it carries no leading "./"
+             */
+            fs->remote_target = strdup(prte_filem_base_strip_leading_dots(app->app));
             /* ensure the app uses that location as its cwd */
             prte_set_attribute(&app->attributes, PRTE_APP_SSNDIR_CWD,
                                PRTE_ATTR_GLOBAL, NULL, PMIX_BOOL);
@@ -276,103 +564,130 @@ static int raw_preposition_files(prte_job_t *jdata,
         if (prte_get_attribute(&app->attributes, PRTE_APP_PRELOAD_FILES,
                                (void **) &filestring, PMIX_STRING) &&
             NULL != filestring) {
-            files = PMIX_ARGV_SPLIT_COMPAT(filestring, ',');
+            files = PMIx_Argv_split(filestring, ',');
             free(filestring);
+            /* an empty list splits to nothing at all - there is no file
+             * here to position, and files[0] is not ours to read
+             */
+            if (NULL == files) {
+                continue;
+            }
             for (j = 0; NULL != files[j]; j++) {
                 fs = PMIX_NEW(prte_filem_base_file_set_t);
                 fs->local_target = strdup(files[j]);
-                /* check any suffix for file type */
-                if (NULL != (cptr = strchr(files[j], '.'))) {
-                    if (0 == strncmp(cptr, ".tar", 4)) {
-                        PMIX_OUTPUT_VERBOSE((1, prte_filem_base_framework.framework_output,
-                                             "%s filem:raw: marking file %s as TAR",
-                                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), files[j]));
-                        fs->target_flag = PRTE_FILEM_TYPE_TAR;
-                    } else if (0 == strncmp(cptr, ".bz", 3)) {
-                        PMIX_OUTPUT_VERBOSE((1, prte_filem_base_framework.framework_output,
-                                             "%s filem:raw: marking file %s as BZIP",
-                                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), files[j]));
-                        fs->target_flag = PRTE_FILEM_TYPE_BZIP;
-                    } else if (0 == strncmp(cptr, ".gz", 3)) {
-                        PMIX_OUTPUT_VERBOSE((1, prte_filem_base_framework.framework_output,
-                                             "%s filem:raw: marking file %s as GZIP",
-                                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), files[j]));
-                        fs->target_flag = PRTE_FILEM_TYPE_GZIP;
-                    } else {
-                        fs->target_flag = PRTE_FILEM_TYPE_FILE;
-                    }
-                } else {
-                    fs->target_flag = PRTE_FILEM_TYPE_FILE;
-                }
+                /* the archive suffix is at the END of the name, not after
+                 * its first dot - "run.v2.tar.gz" is every bit as much a
+                 * gzipped tarball as "run.tar.gz", and reading from the
+                 * first dot left it a plain file that was never unpacked
+                 */
+                fs->target_flag = suffix_type(files[j]);
+                PMIX_OUTPUT_VERBOSE((1, prte_filem_base_framework.framework_output,
+                                     "%s filem:raw: marking file %s as %s",
+                                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), files[j],
+                                     type_name(fs->target_flag)));
                 /* if we are flattening directory trees, then the
                  * remote path is just the basename file name
                  */
                 if (prte_filem_raw_flatten_trees) {
                     fs->remote_target = pmix_basename(files[j]);
                 } else {
-                    /* if this was an absolute path, then we need
-                     * to convert it to a relative path - we do not
-                     * allow positioning of files to absolute locations
+                    /* the file is going to be placed in the working
+                     * directory of the processes that asked for it, so the
+                     * name it lands under has to be a relative one - we do
+                     * not allow positioning of files to absolute locations
                      * due to the potential for unintentional overwriting
-                     * of files
+                     * of files. A relative specification is preserved as
+                     * given, since that is the name the app will use to
+                     * open it. An absolute one cannot be: recreating its
+                     * source tree ("/home/me/f.dat" -> "./home/me/f.dat")
+                     * puts the file somewhere the app never asked for and
+                     * scatters directories through the user's working
+                     * directory, so it is placed under its basename.
                      */
                     if (pmix_path_is_absolute(files[j])) {
-                        fs->remote_target = strdup(&files[j][1]);
+                        fs->remote_target = pmix_basename(files[j]);
                     } else {
                         fs->remote_target = strdup(files[j]);
                     }
                 }
-                pmix_list_append(&fsets, &fs->super);
-                /* prep the filename for matching on the remote
-                 * end by stripping any leading '.' directories to avoid
-                 * stepping above the session dir location - all
-                 * files will be relative to that point. Ensure
-                 * we *don't* mistakenly strip the dot from a
-                 * filename that starts with one
+                /* strip any leading '.' directories to avoid stepping
+                 * above the session dir location - all files will be
+                 * relative to that point. Normalize the file set's own
+                 * copy, so the name we check for clashes, the name we
+                 * broadcast, and the name we hand back to the app are
+                 * all one and the same
                  */
-                cptr = fs->remote_target;
-                nxt = cptr;
-                nxt++;
-                while ('\0' != *cptr) {
-                    if ('.' == *cptr) {
-                        /* have to check the next character to
-                         * see if it's a dotfile or not
-                         */
-                        if ('.' == *nxt || '/' == *nxt) {
-                            cptr = nxt;
-                            nxt++;
-                        } else {
-                            /* if the next character isn't a dot
-                             * or a slash, then this is a dot-file
-                             * and we need to leave it alone
-                             */
-                            break;
-                        }
-                    } else if ('/' == *cptr) {
-                        /* move to the next character */
-                        cptr = nxt;
-                        nxt++;
-                    } else {
-                        /* the character isn't a dot or a slash,
-                         * so this is the beginning of the filename
-                         */
-                        break;
-                    }
+                cptr = (char *) prte_filem_base_strip_leading_dots(fs->remote_target);
+                if (cptr != fs->remote_target) {
+                    nxt = strdup(cptr);
+                    free(fs->remote_target);
+                    fs->remote_target = nxt;
                 }
+                pmix_list_append(&fsets, &fs->super);
+                /* prep the filename for matching on the remote end */
                 free(files[j]);
-                files[j] = strdup(cptr);
+                files[j] = strdup(fs->remote_target);
             }
             /* replace the app's file list with the revised one so we
              * can find them on the remote end
              */
-            filestring = PMIX_ARGV_JOIN_COMPAT(files, ',');
+            filestring = PMIx_Argv_join(files, ',');
             prte_set_attribute(&app->attributes, PRTE_APP_PRELOAD_FILES, PRTE_ATTR_GLOBAL,
                                filestring, PMIX_STRING);
             /* cleanup for the next app */
-            PMIX_ARGV_FREE_COMPAT(files);
+            PMIx_Argv_free(files);
             free(filestring);
         }
     }
+    /* Every delivered name has to be a plain relative path *under* the
+     * directory the file lands in. Stripping the leading dot directories
+     * above is not enough to guarantee that: a ".." anywhere else in the
+     * path ("a/../../f") still steps above the session directory on every
+     * node, where the file would be created with O_TRUNC over whatever is
+     * already there. Refuse the request rather than honor it.
+     */
+    for (item = pmix_list_get_first(&fsets); item != pmix_list_get_end(&fsets);
+         item = pmix_list_get_next(item)) {
+        fs = (prte_filem_base_file_set_t *) item;
+        if (NULL == fs->remote_target || '\0' == fs->remote_target[0] ||
+            0 == strcmp(fs->remote_target, ".") ||
+            prte_filem_base_has_dotdot(fs->remote_target)) {
+            prte_show_help("help-prte-filem-raw.txt", "preload-bad-path", true,
+                           fs->local_target);
+            PMIX_LIST_DESTRUCT(&fsets);
+            if (NULL != cbfunc) {
+                cbfunc(PRTE_ERR_BAD_PARAM, cbdata);
+            }
+            return PRTE_SUCCESS;
+        }
+    }
+
+    /* Two different files that would be delivered under the same name in
+     * the working directory cannot both be delivered - the second would
+     * overwrite the first, silently, and whichever app opened that name
+     * would get whichever one happened to be staged last. Say so here
+     * rather than picking one: this is the same refusal the daemon makes
+     * when the name collides with something already in the directory.
+     */
+    for (item = pmix_list_get_first(&fsets); item != pmix_list_get_end(&fsets);
+         item = pmix_list_get_next(item)) {
+        fs = (prte_filem_base_file_set_t *) item;
+        for (itm = pmix_list_get_next(item); itm != pmix_list_get_end(&fsets);
+             itm = pmix_list_get_next(itm)) {
+            prte_filem_base_file_set_t *fs2 = (prte_filem_base_file_set_t *) itm;
+            if (0 == strcmp(fs->remote_target, fs2->remote_target) &&
+                !same_source(fs->local_target, fs2->local_target)) {
+                prte_show_help("help-prte-filem-raw.txt", "preload-name-clash", true,
+                               fs->local_target, fs2->local_target, fs->remote_target);
+                PMIX_LIST_DESTRUCT(&fsets);
+                if (NULL != cbfunc) {
+                    cbfunc(PRTE_ERR_PRELOAD_CONFLICT, cbdata);
+                }
+                return PRTE_SUCCESS;
+            }
+        }
+    }
+
     if (0 == pmix_list_get_size(&fsets)) {
         /* nothing to preposition */
         PMIX_OUTPUT_VERBOSE((1, prte_filem_base_framework.framework_output,
@@ -405,13 +720,27 @@ static int raw_preposition_files(prte_job_t *jdata,
                              "%s filem:raw: checking prepositioning of file %s",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), fs->local_target));
 
-        /* have we already sent this file? */
+        /* Have we already sent this file, under this name, to this many
+         * daemons? All three qualifiers earn their place.
+         *
+         * Under this name: the same source delivered under two different
+         * names is two deliveries, and dropping the second leaves the app
+         * looking for a file that was never placed.
+         *
+         * To this many daemons: a file broadcast before an elastic grow
+         * never reached the daemons that joined afterwards, and treating
+         * it as positioned would launch procs on those nodes with the file
+         * simply absent - no error anywhere, just an app that cannot open
+         * its input.
+         */
         already_sent = false;
         for (itm = pmix_list_get_first(&positioned_files);
              !already_sent && itm != pmix_list_get_end(&positioned_files);
              itm = pmix_list_get_next(itm)) {
             xptr = (prte_filem_raw_xfer_t *) itm;
-            if (0 == strcmp(fs->local_target, xptr->src)) {
+            if (same_source(fs->local_target, xptr->src) &&
+                0 == strcmp(fs->remote_target, xptr->file) &&
+                xptr->nrecvd >= prte_process_info.num_daemons) {
                 already_sent = true;
             }
         }
@@ -434,7 +763,8 @@ static int raw_preposition_files(prte_job_t *jdata,
             for (itm2 = pmix_list_get_first(&optr->xfers); itm2 != pmix_list_get_end(&optr->xfers);
                  itm2 = pmix_list_get_next(itm2)) {
                 xptr = (prte_filem_raw_xfer_t *) itm2;
-                if (0 == strcmp(fs->local_target, xptr->src)) {
+                if (same_source(fs->local_target, xptr->src) &&
+                    0 == strcmp(fs->remote_target, xptr->file)) {
                     already_sent = true;
                 }
             }
@@ -453,9 +783,20 @@ static int raw_preposition_files(prte_job_t *jdata,
             pmix_output(0, "%s CANNOT ACCESS FILE %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                         fs->local_target);
             PMIX_RELEASE(item);
-            pmix_list_remove_item(&outbound_files, &outbound->super);
-            PMIX_RELEASE(outbound);
-            return PRTE_ERROR;
+            /* record the failure and stop queueing further files, but do NOT
+             * tear down the outbound here: files already handed to send_chunk
+             * still have live events queued on the progress thread, and their
+             * xfers hold open fds. Freeing the outbound now would drain those
+             * xfers (use-after-free on the queued events, leaked fds) and
+             * would also double-drive FILES_POSN_FAILED, since the caller
+             * treats our error return as a failure *and* the completion
+             * callback would fire again. Instead let the async path report
+             * the error: the callback delivers outbound->status once every
+             * queued xfer has acked (or immediately below if none were
+             * queued).
+             */
+            outbound->status = PRTE_ERR_FILE_OPEN_FAILURE;
+            break;
         }
         /* set the flags to non-blocking */
         if ((flags = fcntl(fd, F_GETFL, 0)) < 0) {
@@ -473,66 +814,76 @@ static int raw_preposition_files(prte_job_t *jdata,
         PMIX_OUTPUT_VERBOSE((1, prte_filem_base_framework.framework_output,
                              "%s filem:raw: setting up to position file %s",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), fs->local_target));
-        xfer = PMIX_NEW(prte_filem_raw_xfer_t);
-        /* save the source so we can avoid duplicate transfers */
-        xfer->src = strdup(fs->local_target);
-        /* strip any leading '.' directories to avoid
-         * stepping above the session dir location - all
-         * files will be relative to that point. Ensure
-         * we *don't* mistakenly strip the dot from a
-         * filename that starts with one
+        /* we are about to (re)send this file, so drop any stale record of
+         * an earlier delivery that no longer covers the DVM - otherwise
+         * positioned_files accumulates one dead entry per grow
          */
-        cptr = fs->remote_target;
-        nxt = cptr;
-        nxt++;
-        while ('\0' != *cptr) {
-            if ('.' == *cptr) {
-                /* have to check the next character to
-                 * see if it's a dotfile or not
-                 */
-                if ('.' == *nxt || '/' == *nxt) {
-                    cptr = nxt;
-                    nxt++;
-                } else {
-                    /* if the next character isn't a dot
-                     * or a slash, then this is a dot-file
-                     * and we need to leave it alone
-                     */
-                    break;
-                }
-            } else if ('/' == *cptr) {
-                /* move to the next character */
-                cptr = nxt;
-                nxt++;
-            } else {
-                /* the character isn't a dot or a slash,
-                 * so this is the beginning of the filename
-                 */
-                break;
+        itm = pmix_list_get_first(&positioned_files);
+        while (itm != pmix_list_get_end(&positioned_files)) {
+            xptr = (prte_filem_raw_xfer_t *) itm;
+            itm = pmix_list_get_next(itm);
+            if (same_source(fs->local_target, xptr->src) &&
+                0 == strcmp(fs->remote_target, xptr->file)) {
+                pmix_list_remove_item(&positioned_files, &xptr->super);
+                PMIX_RELEASE(xptr);
             }
         }
+
+        xfer = PMIX_NEW(prte_filem_raw_xfer_t);
+        /* every daemon in the DVM as it stands right now is a target of the
+         * broadcast about to start, and is therefore expected to ack.  The
+         * set is fixed here rather than re-read as acks arrive - see
+         * xfer_check_complete() - and the vpid horizon is taken from the same
+         * instant so a daemon that joins later can be told apart from one
+         * that was here all along
+         */
+        xfer->nexpected = prte_process_info.num_daemons;
+        daemons = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
+        xfer->horizon = (NULL == daemons) ? prte_process_info.num_daemons
+                                          : daemons->num_procs;
+        /* save the source so we can avoid duplicate transfers */
+        xfer->src = strdup(fs->local_target);
         xfer->fd = fd;
-        xfer->file = strdup(cptr);
+        /* carry the source file's permissions along with its bytes - a
+         * staged helper script that arrives unreadable or non-executable
+         * is not the file the user asked us to deliver. Nothing else in
+         * the chunk stream describes the file, so if this is not sent the
+         * receiver has to guess, and it used to guess "0600, unless the
+         * whole thing was flagged as the executable".
+         */
+        if (0 == fstat(fd, &sbuf)) {
+            xfer->mode = (uint32_t)(sbuf.st_mode & 0777);
+        }
+        /* remote_target was normalized and validated above - it is already
+         * the relative name the receiving daemon is to write it under
+         */
+        xfer->file = strdup(fs->remote_target);
         xfer->type = fs->target_flag;
-        xfer->app_idx = fs->app_idx;
         xfer->outbound = outbound;
         pmix_list_append(&outbound->xfers, &xfer->super);
         PRTE_PMIX_THREADSHIFT(xfer, prte_event_base, send_chunk);
         PMIX_RELEASE(item);
     }
-    PMIX_DESTRUCT(&fsets);
+    /* a mid-loop break (open failure) can leave entries on fsets, so use
+     * PMIX_LIST_DESTRUCT to release any that remain
+     */
+    PMIX_LIST_DESTRUCT(&fsets);
 
-    /* check to see if anything remains to be sent - if everything
-     * is a duplicate, then the list will be empty
+    /* check to see if anything remains to be sent - the list is empty if
+     * every file was a duplicate, or if the very first file failed to open
      */
     if (0 == pmix_list_get_size(&outbound->xfers)) {
+        /* capture the status before releasing the outbound: it is a failure
+         * only if an open() failed above, success if all were duplicates
+         */
+        int st = outbound->status;
         PMIX_OUTPUT_VERBOSE((1, prte_filem_base_framework.framework_output,
-                             "%s filem:raw: all duplicate files - no positioning reqd",
+                             "%s filem:raw: nothing to position (all duplicates or open failed)",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
         pmix_list_remove_item(&outbound_files, &outbound->super);
         PMIX_RELEASE(outbound);
         if (NULL != cbfunc) {
-            cbfunc(PRTE_SUCCESS, cbdata);
+            cbfunc(st, cbdata);
         }
         return PRTE_SUCCESS;
     }
@@ -549,6 +900,252 @@ static int raw_preposition_files(prte_job_t *jdata,
     return PRTE_SUCCESS;
 }
 
+/* read up to len bytes, tolerating short reads and signals - returns the
+ * number of bytes actually read (less than len only at EOF), or -1
+ */
+static ssize_t read_bytes(int fd, char *buf, size_t len)
+{
+    size_t total = 0;
+    ssize_t nb;
+
+    while (total < len) {
+        nb = read(fd, &buf[total], len - total);
+        if (0 > nb) {
+            if (EINTR == errno) {
+                continue;
+            }
+            return -1;
+        }
+        if (0 == nb) {
+            break;
+        }
+        total += nb;
+    }
+    return (ssize_t) total;
+}
+
+static int write_bytes(int fd, char *buf, size_t len)
+{
+    size_t total = 0;
+    ssize_t nb;
+
+    while (total < len) {
+        nb = write(fd, &buf[total], len - total);
+        if (0 > nb) {
+            if (EINTR == errno) {
+                continue;
+            }
+            return PRTE_ERR_FILE_WRITE_FAILURE;
+        }
+        total += nb;
+    }
+    return PRTE_SUCCESS;
+}
+
+/* Is what already sits at "dest" byte-for-byte what we were about to put
+ * there?
+ *
+ * This is the test that separates "the file would overwrite itself" from
+ * "the file would overwrite the user's data". It answers yes for every way
+ * the same staged file can legitimately arrive at the same destination
+ * twice - a second app or a second job in this session sharing the working
+ * directory, a working directory shared across nodes where another daemon
+ * placed the identical bytes, or the user's own copy of the very file they
+ * asked us to stage sitting in the directory they launched from. It answers
+ * no for anything else, which is then somebody else's data.
+ */
+static bool same_contents(char *src, char *dest)
+{
+    int fsrc, fdest;
+    struct stat sbuf, dbuf;
+    char sdata[PRTE_FILEM_RAW_COPY_MAX], ddata[PRTE_FILEM_RAW_COPY_MAX];
+    ssize_t ns, nd;
+    bool same = false;
+
+    if (0 > (fsrc = open(src, O_RDONLY))) {
+        return false;
+    }
+    /* Deliberately follows a symlink at the destination: a link pointing
+     * at an identical file is as much "already there" as the file itself.
+     * O_NONBLOCK because we have no idea what is sitting there - opening a
+     * fifo for reading would otherwise park the progress thread until
+     * somebody opened the other end. The fstat below is what actually
+     * decides; anything that is not a plain file is simply "not ours".
+     */
+    if (0 > (fdest = open(dest, O_RDONLY | O_NONBLOCK))) {
+        close(fsrc);
+        return false;
+    }
+    if (0 != fstat(fsrc, &sbuf) || 0 != fstat(fdest, &dbuf) ||
+        !S_ISREG(dbuf.st_mode) || sbuf.st_size != dbuf.st_size) {
+        goto done;
+    }
+    while (1) {
+        ns = read_bytes(fsrc, sdata, sizeof(sdata));
+        nd = read_bytes(fdest, ddata, sizeof(ddata));
+        if (0 > ns || 0 > nd || ns != nd) {
+            goto done;
+        }
+        if (0 == ns) {
+            /* both hit EOF having matched all the way */
+            same = true;
+            goto done;
+        }
+        if (0 != memcmp(sdata, ddata, ns)) {
+            goto done;
+        }
+    }
+
+done:
+    close(fsrc);
+    close(fdest);
+    return same;
+}
+
+/* Put a staged file into the working directory the app will run in.
+ *
+ * A copy, not a symlink: the bytes were written into this node's session
+ * directory, which is not a path any other node can resolve (nor one that
+ * outlives the DVM), so a link would be dangling for every proc whose
+ * working directory is on a shared filesystem written by some other
+ * daemon. Copying is also what "preload the files to the remote machine's
+ * working directory" has always claimed to do.
+ *
+ * We refuse to overwrite anything that is not already exactly what we
+ * would have written - see same_contents().
+ */
+static int place_file(char *my_dir, char *wdir, char *fname)
+{
+    char *src = NULL, *dest = NULL, *tmpname = NULL, *basedir;
+    struct stat sbuf;
+    mode_t mode;
+    char data[PRTE_FILEM_RAW_COPY_MAX];
+    int fsrc = -1, fdest = -1;
+    ssize_t nb;
+    int rc = PRTE_SUCCESS;
+
+    src = pmix_os_path(false, my_dir, fname, NULL);
+    dest = pmix_os_path(false, wdir, fname, NULL);
+    if (NULL == src || NULL == dest) {
+        rc = PRTE_ERR_OUT_OF_RESOURCE;
+        PRTE_ERROR_LOG(rc);
+        goto cleanup;
+    }
+
+    if (0 == lstat(dest, &sbuf)) {
+        if (same_contents(src, dest)) {
+            PMIX_OUTPUT_VERBOSE((10, prte_filem_base_framework.framework_output,
+                                 "%s filem:raw: %s is already in place at %s",
+                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), fname, dest));
+            goto cleanup;
+        }
+        prte_show_help("help-prte-filem-raw.txt", "preload-collision", true,
+                       fname, wdir, prte_process_info.nodename);
+        rc = PRTE_ERR_PRELOAD_CONFLICT;
+        goto cleanup;
+    }
+
+    PMIX_OUTPUT_VERBOSE((10, prte_filem_base_framework.framework_output,
+                         "%s filem:raw: placing %s in %s",
+                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), fname, wdir));
+
+    /* create any directories the file is to sit under - but only if they
+     * are not already there. pmix_os_dirpath_create() chmods a path that
+     * already exists to the mode it was given, and the working directory
+     * here belongs to the user: handing it their own cwd would silently
+     * reduce it to 0700. Directories we do create are left to the user's
+     * umask, like any other directory made on their behalf.
+     */
+    basedir = pmix_dirname(dest);
+    if (NULL != basedir && 0 != stat(basedir, &sbuf)) {
+        rc = pmix_os_dirpath_create(basedir, S_IRWXU | S_IRWXG | S_IRWXO);
+        if (PMIX_SUCCESS != rc && PMIX_ERR_EXISTS != rc) {
+            PMIX_ERROR_LOG(rc);
+            rc = prte_pmix_convert_status(rc);
+            free(basedir);
+            goto cleanup;
+        }
+        rc = PRTE_SUCCESS;
+    }
+    free(basedir);
+
+    if (0 > (fsrc = open(src, O_RDONLY))) {
+        pmix_output(0, "%s CANNOT ACCESS STAGED FILE %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), src);
+        rc = PRTE_ERR_FILE_OPEN_FAILURE;
+        goto cleanup;
+    }
+    /* the staged copy carries the source file's permissions (recv_files
+     * sets them from the sender), and those are what the user asked us to
+     * deliver - a helper script staged 0755 has to arrive executable. So
+     * give the placed copy the same, and chmod after the fact because
+     * open() would otherwise let this process's umask trim a mode the
+     * user chose deliberately.
+     */
+    mode = S_IRUSR | S_IWUSR;
+    if (0 == fstat(fsrc, &sbuf)) {
+        mode = (sbuf.st_mode & 0777) | S_IRUSR | S_IWUSR;
+    }
+    /* write a temporary alongside the target and rename it into place. The
+     * rename is atomic, so a proc never sees a half-written file - which
+     * matters when the working directory is shared and several daemons are
+     * placing the identical file at the same moment.
+     */
+    pmix_asprintf(&tmpname, "%s.prte-tmp.%lu", dest, (unsigned long) getpid());
+    if (NULL == tmpname) {
+        rc = PRTE_ERR_OUT_OF_RESOURCE;
+        PRTE_ERROR_LOG(rc);
+        goto cleanup;
+    }
+    if (0 > (fdest = open(tmpname, O_WRONLY | O_CREAT | O_TRUNC, mode))) {
+        pmix_output(0, "%s CANNOT CREATE FILE %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), tmpname);
+        rc = PRTE_ERR_FILE_OPEN_FAILURE;
+        free(tmpname);
+        tmpname = NULL;
+        goto cleanup;
+    }
+    if (0 != fchmod(fdest, mode)) {
+        PMIX_OUTPUT_VERBOSE((10, prte_filem_base_framework.framework_output,
+                             "%s filem:raw: could not set mode on %s",
+                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), tmpname));
+    }
+    while (0 < (nb = read_bytes(fsrc, data, sizeof(data)))) {
+        if (PRTE_SUCCESS != (rc = write_bytes(fdest, data, (size_t) nb))) {
+            pmix_output(0, "%s FAILED TO WRITE FILE %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), dest);
+            goto cleanup;
+        }
+    }
+    if (0 > nb) {
+        pmix_output(0, "%s FAILED TO READ STAGED FILE %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), src);
+        rc = PRTE_ERR_FILE_READ_FAILURE;
+        goto cleanup;
+    }
+    close(fdest);
+    fdest = -1;
+    if (0 != rename(tmpname, dest)) {
+        pmix_output(0, "%s FAILED TO PLACE FILE %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), dest);
+        rc = PRTE_ERR_FILE_WRITE_FAILURE;
+        goto cleanup;
+    }
+    free(tmpname);
+    tmpname = NULL;
+
+cleanup:
+    if (0 <= fsrc) {
+        close(fsrc);
+    }
+    if (0 <= fdest) {
+        close(fdest);
+    }
+    if (NULL != tmpname) {
+        /* we never got it into place */
+        unlink(tmpname);
+        free(tmpname);
+    }
+    free(src);
+    free(dest);
+    return rc;
+}
+
 static int create_link(char *my_dir, char *path, char *link_pt)
 {
     char *mypath, *fullname, *basedir;
@@ -560,9 +1157,12 @@ static int create_link(char *my_dir, char *path, char *link_pt)
     /* form the full target path name */
     fullname = pmix_os_path(false, path, link_pt, NULL);
     /* there may have been multiple files placed under the
-     * same directory, so check for existence first
+     * same directory, so check for existence first. lstat, not stat: a
+     * link left by an earlier job whose session dir is gone answers stat
+     * with ENOENT, and symlink() would then fail with EEXIST and abort
+     * the launch over a link that is already ours.
      */
-    if (0 != stat(fullname, &buf)) {
+    if (0 != lstat(fullname, &buf)) {
         PMIX_OUTPUT_VERBOSE((1, prte_filem_base_framework.framework_output,
                              "%s filem:raw: creating symlink to %s\n\tmypath: %s\n\tlink: %s",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), link_pt, mypath, fullname));
@@ -580,6 +1180,11 @@ static int create_link(char *my_dir, char *path, char *link_pt)
             return rc;
         }
         free(basedir);
+        /* the directory now exists (freshly created or already present) -
+         * clear the PMIX_ERR_EXISTS that dirpath_create may have left in
+         * rc, else a successful link is reported to the caller as a failure
+         */
+        rc = PRTE_SUCCESS;
         /* do the symlink */
         if (0 != symlink(mypath, fullname)) {
             pmix_output(0, "%s Failed to symlink %s to %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
@@ -594,20 +1199,35 @@ static int create_link(char *my_dir, char *path, char *link_pt)
 
 static int raw_link_local_files(prte_job_t *jdata, prte_app_context_t *app)
 {
-    char *session_dir, *path = NULL;
+    char *wdir;
     prte_proc_t *proc;
-    int i, j, rc;
+    int i, j, k, rc;
+    bool staged;
+    bool launching = false;
     prte_filem_raw_incoming_t *inbnd;
     pmix_list_item_t *item;
     char **files = NULL, *bname, *filestring;
 
-    /* check my job's session directory for files I have received and
-     * symlink them to the proc-level session directory of each
-     * local process in the job
+    /* The files this app asked us to preload go where the app will look
+     * for them: its working directory. odls resolved that immediately
+     * before calling us (setup_path, which has already chdir'd there), so
+     * app->cwd is the directory every one of this app's procs on this node
+     * will start in - whether that is the user's cwd, a -wdir value, or
+     * the session directory a --preload-binary/--set-cwd-to-session-dir
+     * job runs from. It is a per-app value, so the files are placed once
+     * here and serve every local proc of the app.
      */
-    session_dir = jdata->session_dir;
-    if (NULL == session_dir) {
-        /* we were unable to find any suitable directory */
+    wdir = app->cwd;
+    if (NULL == wdir) {
+        /* we have no idea where the procs will run */
+        rc = PRTE_ERR_BAD_PARAM;
+        PRTE_ERROR_LOG(rc);
+        return rc;
+    }
+    /* the staged bytes were written under this node's top session dir
+     * (see recv_files), so that is where every placement comes from
+     */
+    if (NULL == prte_process_info.top_session_dir) {
         rc = PRTE_ERR_BAD_PARAM;
         PRTE_ERROR_LOG(rc);
         return rc;
@@ -618,13 +1238,13 @@ static int raw_link_local_files(prte_job_t *jdata, prte_app_context_t *app)
     if (prte_get_attribute(&app->attributes, PRTE_APP_PRELOAD_FILES,
                            (void **) &filestring, PMIX_STRING) &&
         NULL != filestring) {
-        files = PMIX_ARGV_SPLIT_COMPAT(filestring, ',');
+        files = PMIx_Argv_split(filestring, ',');
         free(filestring);
     }
     if (prte_get_attribute(&app->attributes, PRTE_APP_PRELOAD_BIN, NULL, PMIX_BOOL)) {
         /* add the app itself to the list */
         bname = pmix_basename(app->app);
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&files, bname);
+        PMIx_Argv_append_nosize(&files, bname);
         free(bname);
     }
 
@@ -633,25 +1253,15 @@ static int raw_link_local_files(prte_job_t *jdata, prte_app_context_t *app)
         return PRTE_SUCCESS;
     }
 
+    /* only do this if we actually have a proc of this app to launch here -
+     * there is no reason to touch the user's working directory otherwise
+     */
     for (i = 0; i < prte_local_children->size; i++) {
         if (NULL == (proc = (prte_proc_t *) pmix_pointer_array_get_item(prte_local_children, i))) {
             continue;
         }
-        PMIX_OUTPUT_VERBOSE((10, prte_filem_base_framework.framework_output,
-                             "%s filem:raw: working symlinks for proc %s",
-                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(&proc->name)));
-        if (!PMIX_CHECK_NSPACE(proc->name.nspace, jdata->nspace)) {
-            PMIX_OUTPUT_VERBOSE((10, prte_filem_base_framework.framework_output,
-                                 "%s filem:raw: proc %s not part of job %s",
-                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(&proc->name),
-                                 PRTE_JOBID_PRINT(jdata->nspace)));
-            continue;
-        }
-        if (proc->app_idx != app->idx) {
-            PMIX_OUTPUT_VERBOSE((10, prte_filem_base_framework.framework_output,
-                                 "%s filem:raw: proc %s not part of app_idx %d",
-                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(&proc->name),
-                                 (int) app->idx));
+        if (!PMIX_CHECK_NSPACE(proc->name.nspace, jdata->nspace) ||
+            proc->app_idx != app->idx) {
             continue;
         }
         /* ignore children we have already handled */
@@ -659,52 +1269,92 @@ static int raw_link_local_files(prte_job_t *jdata, prte_app_context_t *app)
             (PRTE_PROC_STATE_INIT != proc->state && PRTE_PROC_STATE_RESTART != proc->state)) {
             continue;
         }
+        launching = true;
+        break;
+    }
+    if (!launching) {
+        PMIX_OUTPUT_VERBOSE((10, prte_filem_base_framework.framework_output,
+                             "%s filem:raw: no procs of app %d to launch for job %s",
+                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), (int) app->idx,
+                             PRTE_JOBID_PRINT(jdata->nspace)));
+        PMIx_Argv_free(files);
+        return PRTE_SUCCESS;
+    }
 
+    PMIX_OUTPUT_VERBOSE((1, prte_filem_base_framework.framework_output,
+                         "%s filem:raw: placing preloaded files for job %s in %s",
+                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_JOBID_PRINT(jdata->nspace),
+                         wdir));
+
+    /* cycle thru the incoming files */
+    for (item = pmix_list_get_first(&incoming_files);
+         item != pmix_list_get_end(&incoming_files); item = pmix_list_get_next(item)) {
+        inbnd = (prte_filem_raw_incoming_t *) item;
         PMIX_OUTPUT_VERBOSE((1, prte_filem_base_framework.framework_output,
-                             "%s filem:raw: creating symlinks for %s",
-                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(&proc->name)));
+                             "%s filem:raw: checking file %s",
+                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), inbnd->file));
 
-        /* get the session dir name in absolute form */
-        pmix_asprintf(&path, "%s/%s", session_dir, PMIX_RANK_PRINT(proc->name.rank));
-
-        /* cycle thru the incoming files */
-        for (item = pmix_list_get_first(&incoming_files);
-             item != pmix_list_get_end(&incoming_files); item = pmix_list_get_next(item)) {
-            inbnd = (prte_filem_raw_incoming_t *) item;
-            PMIX_OUTPUT_VERBOSE((1, prte_filem_base_framework.framework_output,
-                                 "%s filem:raw: checking file %s",
-                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), inbnd->file));
-
-            /* is this file for this app_context? */
-            for (j = 0; NULL != files[j]; j++) {
-                if (0 == strcmp(inbnd->file, files[j])) {
-                    /* this must be one of the files we are to link against */
-                    if (NULL != inbnd->link_pts) {
-                        PMIX_OUTPUT_VERBOSE((10, prte_filem_base_framework.framework_output,
-                                             "%s filem:raw: creating links for file %s",
-                                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), inbnd->file));
-                        /* cycle thru the link points and create symlinks to them */
-                        for (j = 0; NULL != inbnd->link_pts[j]; j++) {
-                            if (PRTE_SUCCESS
-                                != (rc = create_link(session_dir, path, inbnd->link_pts[j]))) {
-                                PRTE_ERROR_LOG(rc);
-                                free(files);
-                                free(path);
-                                return rc;
-                            }
-                        }
-                    } else {
-                        PMIX_OUTPUT_VERBOSE((10, prte_filem_base_framework.framework_output,
-                                             "%s filem:raw: file %s has no link points",
-                                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), inbnd->file));
+        /* is this file for this app_context? */
+        for (j = 0; NULL != files[j]; j++) {
+            if (0 != strcmp(inbnd->file, files[j])) {
+                continue;
+            }
+            /* this must be one of the files we are to place */
+            if (NULL == inbnd->link_pts) {
+                PMIX_OUTPUT_VERBOSE((10, prte_filem_base_framework.framework_output,
+                                     "%s filem:raw: file %s has no link points",
+                                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), inbnd->file));
+                break;
+            }
+            for (k = 0; NULL != inbnd->link_pts[k]; k++) {
+                /* A preloaded binary is the one thing we link instead of
+                 * copy: --preload-binary sets PRTE_APP_SSNDIR_CWD, so the
+                 * working directory resolved above is this job's own
+                 * session directory on this node - never shared, never
+                 * outliving the job - and a link there costs nothing where
+                 * a second copy of an executable can cost a great deal.
+                 */
+                if (PRTE_FILEM_TYPE_EXE == inbnd->type) {
+                    rc = create_link(prte_process_info.top_session_dir, wdir, inbnd->link_pts[k]);
+                } else {
+                    rc = place_file(prte_process_info.top_session_dir, wdir, inbnd->link_pts[k]);
+                }
+                if (PRTE_SUCCESS != rc) {
+                    if (PRTE_ERR_PRELOAD_CONFLICT != rc) {
+                        /* the collision already said its piece */
+                        PRTE_ERROR_LOG(rc);
                     }
-                    break;
+                    PMIx_Argv_free(files);
+                    return rc;
                 }
             }
+            break;
         }
-        free(path);
     }
-    PMIX_ARGV_FREE_COMPAT(files);
+    /* Every file this app asked for should have arrived - the HNP does not
+     * advance the job past pre-positioning until every daemon has acked
+     * every file. If one is missing, the app is about to start in a
+     * directory that does not contain a file it was promised, and the only
+     * symptom would be the app failing to open it. Say which one instead.
+     */
+    for (j = 0; NULL != files[j]; j++) {
+        staged = false;
+        for (item = pmix_list_get_first(&incoming_files);
+             !staged && item != pmix_list_get_end(&incoming_files);
+             item = pmix_list_get_next(item)) {
+            inbnd = (prte_filem_raw_incoming_t *) item;
+            if (0 == strcmp(inbnd->file, files[j])) {
+                staged = true;
+            }
+        }
+        if (!staged) {
+            prte_show_help("help-prte-filem-raw.txt", "preload-not-staged", true,
+                           files[j], prte_process_info.nodename);
+            PMIx_Argv_free(files);
+            return PRTE_ERR_FILE_OPEN_FAILURE;
+        }
+    }
+    PMIx_Argv_free(files);
     return PRTE_SUCCESS;
 }
 
@@ -740,16 +1390,26 @@ static void send_chunk(int xxx, short argc, void *cbdata)
 
         /* Un-recoverable error. Allow the code to flow as usual in order to
          * to send the zero bytes message up the stream, and then close the
-         * file descriptor and delete the event.
+         * file descriptor and delete the event. Record the failure, though:
+         * the receivers cannot tell a truncated file from a complete one
+         * and will happily ack it as staged, so this is the only place that
+         * knows the bytes the app was promised never left this node.
          */
+        rev->status = PRTE_ERR_FILE_READ_FAILURE;
         numbytes = 0;
     }
 
     /* if job termination has been ordered, just ignore the
-     * data and delete the read event
+     * data and delete the read event. Retire the transfer rather than
+     * simply releasing it - the outbound's xfers list still holds it, and
+     * releasing it in place leaves that list walking freed memory
      */
     if (prte_dvm_abort_ordered) {
-        PMIX_RELEASE(rev);
+        if (0 <= rev->fd) {
+            close(rev->fd);
+            rev->fd = -1;
+        }
+        xfer_retire(PRTE_ERR_JOB_CANCELLED, rev, false);
         return;
     }
 
@@ -757,62 +1417,112 @@ static void send_chunk(int xxx, short argc, void *cbdata)
                          "%s filem:raw:read handler sending chunk %d of %d bytes for file %s",
                          PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), rev->nchunk, numbytes, rev->file));
 
-    /* package it for transmission */
+    /* package it for transmission.
+     *
+     * Every bailout below has to retire the transfer, not just close the
+     * fd and walk away: this xfer is the only thing keeping its outbound
+     * request alive, no further event is scheduled for it, and the
+     * daemons will never ack a file whose chunks stopped arriving. Left
+     * on the outbound's list it would hold the completion callback
+     * forever and wedge the job at VM_READY.
+     */
     PMIX_DATA_BUFFER_CONSTRUCT(&chunk);
     rc = PMIx_Data_pack(NULL, &chunk, &rev->file, 1, PMIX_STRING);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
-        close(fd);
-        PMIX_DATA_BUFFER_DESTRUCT(&chunk);
-        return;
+    if (PMIX_SUCCESS == rc) {
+        rc = PMIx_Data_pack(NULL, &chunk, &rev->nchunk, 1, PMIX_INT32);
     }
-    rc = PMIx_Data_pack(NULL, &chunk, &rev->nchunk, 1, PMIX_INT32);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
-        close(fd);
-        PMIX_DATA_BUFFER_DESTRUCT(&chunk);
-        return;
+    if (PMIX_SUCCESS == rc) {
+        rc = PMIx_Data_pack(NULL, &chunk, data, numbytes, PMIX_BYTE);
     }
-    rc = PMIx_Data_pack(NULL, &chunk, data, numbytes, PMIX_BYTE);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
-        close(fd);
-        PMIX_DATA_BUFFER_DESTRUCT(&chunk);
-        return;
-    }
-    /* if it is the first chunk, then add file type and index of the app */
-    if (0 == rev->nchunk) {
+    /* if it is the first chunk, then add the file type and permissions */
+    if (PMIX_SUCCESS == rc && 0 == rev->nchunk) {
         rc = PMIx_Data_pack(NULL, &chunk, &rev->type, 1, PMIX_INT32);
-        if (PMIX_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
-            close(fd);
-            PMIX_DATA_BUFFER_DESTRUCT(&chunk);
-            return;
+        if (PMIX_SUCCESS == rc) {
+            rc = PMIx_Data_pack(NULL, &chunk, &rev->mode, 1, PMIX_UINT32);
         }
     }
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        close(fd);
+        rev->fd = -1;
+        PMIX_DATA_BUFFER_DESTRUCT(&chunk);
+        xfer_retire(prte_pmix_convert_status(rc), rev, false);
+        return;
+    }
 
-    /* goes to all daemons */
-    if (PRTE_SUCCESS != (rc = prte_grpcomm.xcast(PRTE_RML_TAG_FILEM_BASE, &chunk))) {
+    /* Goes to all daemons, and we ask to be told when it got there.
+     *
+     * The reference is what makes that callback safe: this transfer can be
+     * retired - by an error ack, by an aborting DVM, by the fault handler -
+     * while chunks it broadcast are still travelling, and the callback for
+     * one of those would otherwise land on freed memory.  Each in-flight
+     * chunk holds one, and chunk_delivered gives it back.
+     */
+    PMIX_RETAIN(rev);
+    rc = prte_grpcomm_xcast_nb(PRTE_RML_TAG_FILEM_BASE, &chunk, chunk_delivered, rev);
+    if (PRTE_SUCCESS != rc) {
         PRTE_ERROR_LOG(rc);
+        PMIX_RELEASE(rev);
         PMIX_DATA_BUFFER_DESTRUCT(&chunk);
         close(fd);
+        rev->fd = -1;
+        xfer_retire(rc, rev, false);
         return;
     }
     PMIX_DATA_BUFFER_DESTRUCT(&chunk);
     rev->nchunk++;
+    rev->inflight++;
 
     /* if num_bytes was zero, then we need to terminate the event
      * and close the file descriptor
      */
     if (0 == numbytes) {
         close(fd);
+        rev->fd = -1;
         return;
-    } else {
-        /* restart the read event */
+    }
+
+    /* Read on only while this file has fewer than the window's worth of
+     * chunks still travelling.  Nothing else limits how far ahead of
+     * delivery this loop can run: the file-level ack cannot gate it (a
+     * daemon sends that once, at EOF), and re-arming with prte_event_active
+     * does not even return to the event loop's poll, so the whole file
+     * would be read, compressed and queued without the progress thread
+     * servicing anything at all.  See the flow-control commentary on
+     * prte_filem_raw_xfer_t.
+     */
+    if (rev->inflight >= prte_filem_raw_chunk_window) {
+        rev->paused = true;
+        return;
+    }
+    /* restart the read event */
+    rev->pending = true;
+    PMIX_POST_OBJECT(rev);
+    prte_event_active(&rev->ev, PRTE_EV_WRITE, 1);
+}
+
+/* One broadcast chunk has reached every daemon in the DVM.
+ *
+ * Fires on the progress thread from grpcomm's completion path, so it may
+ * simply restart a read the window had stopped - but only if the transfer
+ * is still running.  A transfer that has been retired still owes this
+ * callback its reference; it just has nothing left to read.
+ */
+static void chunk_delivered(void *cbdata)
+{
+    prte_filem_raw_xfer_t *rev = (prte_filem_raw_xfer_t *) cbdata;
+
+    if (0 < rev->inflight) {
+        rev->inflight--;
+    }
+    if (rev->paused && !rev->retired && 0 <= rev->fd &&
+        rev->inflight < prte_filem_raw_chunk_window) {
+        rev->paused = false;
         rev->pending = true;
         PMIX_POST_OBJECT(rev);
         prte_event_active(&rev->ev, PRTE_EV_WRITE, 1);
     }
+    PMIX_RELEASE(rev);
 }
 
 static void send_complete(char *file, int status)
@@ -833,10 +1543,16 @@ static void send_complete(char *file, int status)
         PMIX_DATA_BUFFER_RELEASE(buf);
         return;
     }
-    PRTE_RML_SEND(rc, PRTE_PROC_MY_HNP->rank, buf, PRTE_RML_TAG_FILEM_BASE_RESP);
+    /* send this reliably: the ack is the only thing that retires a transfer
+     * on the master, and a plain send that is in flight through a daemon
+     * which then dies is simply dropped - leaving the master waiting on an
+     * ack this daemon believes it has already given, and the job wedged at
+     * VM_READY.  RELM re-drives it over the repaired tree.
+     */
+    PRTE_RML_RELIABLE_SEND(rc, PRTE_PROC_MY_HNP->rank, buf, PRTE_RML_TAG_FILEM_BASE_RESP);
     if (PRTE_SUCCESS != rc) {
         PRTE_ERROR_LOG(rc);
-        PMIX_RELEASE(buf);
+        PMIX_DATA_BUFFER_RELEASE(buf);
     }
 }
 
@@ -847,14 +1563,21 @@ static void send_complete(char *file, int status)
 static int link_archive(prte_filem_raw_incoming_t *inbnd)
 {
     FILE *fp;
-    char *cmd;
+    char *cmd, *quoted;
+    size_t len;
     char path[PRTE_PATH_MAX];
 
     PMIX_OUTPUT_VERBOSE((1, prte_filem_base_framework.framework_output,
                          "%s filem:raw: identifying links for archive %s",
                          PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), inbnd->fullpath));
 
-    pmix_asprintf(&cmd, "tar tf %s", inbnd->fullpath);
+    quoted = prte_filem_base_shell_quote(inbnd->fullpath);
+    if (NULL == quoted) {
+        PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+        return PRTE_ERR_OUT_OF_RESOURCE;
+    }
+    pmix_asprintf(&cmd, "tar tf %s", quoted);
+    free(quoted);
     fp = popen(cmd, "r");
     free(cmd);
     if (NULL == fp) {
@@ -868,16 +1591,33 @@ static int link_archive(prte_filem_raw_incoming_t *inbnd)
     while (fgets(path, sizeof(path), fp) != NULL) {
         PMIX_OUTPUT_VERBOSE((10, prte_filem_base_framework.framework_output,
                              "%s filem:raw: path %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), path));
-        /* protect against an empty result */
-        if (0 == strlen(path)) {
+        /* trim the trailing newline, if fgets gave us one - a final line
+         * with no newline keeps every character it has
+         */
+        len = strlen(path);
+        if (0 < len && '\n' == path[len - 1]) {
+            path[--len] = '\0';
+        }
+        /* protect against an empty result - a bare newline would otherwise
+         * send the directory test reading in front of the buffer
+         */
+        if (0 == len) {
             continue;
         }
-        /* trim the trailing cr */
-        path[strlen(path) - 1] = '\0';
         /* ignore directories */
-        if ('/' == path[strlen(path) - 1]) {
+        if ('/' == path[len - 1]) {
             PMIX_OUTPUT_VERBOSE((10, prte_filem_base_framework.framework_output,
                                  "%s filem:raw: path %s is a directory - ignoring it",
+                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), path));
+            continue;
+        }
+        /* an archive member that steps above the directory it is unpacked
+         * in is not ours to place - tar itself refuses to extract one, so
+         * there is nothing there to link to anyway
+         */
+        if (prte_filem_base_has_dotdot(path) || '/' == path[0]) {
+            PMIX_OUTPUT_VERBOSE((10, prte_filem_base_framework.framework_output,
+                                 "%s filem:raw: path %s is not relative - ignoring it",
                                  PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), path));
             continue;
         }
@@ -891,10 +1631,15 @@ static int link_archive(prte_filem_raw_incoming_t *inbnd)
         PMIX_OUTPUT_VERBOSE((10, prte_filem_base_framework.framework_output,
                              "%s filem:raw: adding path %s to link points",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), path));
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&inbnd->link_pts, path);
+        PMIx_Argv_append_nosize(&inbnd->link_pts, path);
     }
-    /* close */
-    pclose(fp);
+    /* a listing that failed leaves us with no link points and nothing to
+     * place - say so rather than acking a delivery that did not happen
+     */
+    if (0 != pclose(fp)) {
+        PRTE_ERROR_LOG(PRTE_ERR_FILE_READ_FAILURE);
+        return PRTE_ERR_FILE_READ_FAILURE;
+    }
     return PRTE_SUCCESS;
 }
 
@@ -909,22 +1654,34 @@ static void recv_files(int status, pmix_proc_t *sender, pmix_data_buffer_t *buff
     prte_filem_raw_incoming_t *ptr, *incoming;
     pmix_list_item_t *item;
     int32_t type = PRTE_FILEM_TYPE_UNKNOWN;
-    char *cptr;
+    uint32_t mode = 0;
     PRTE_HIDE_UNUSED_PARAMS(status, sender, tag, cbdata);
 
     /* unpack the data */
     n = 1;
     rc = PMIx_Data_unpack(NULL, buffer, &file, &n, PMIX_STRING);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
-        send_complete(NULL, rc);
+    if (PMIX_SUCCESS != rc || NULL == file) {
+        /* we cannot name the file, and an ack that names no file matches
+         * nothing on the HNP - there is nothing useful to report
+         */
+        PMIX_ERROR_LOG(PMIX_SUCCESS == rc ? PMIX_ERR_BAD_PARAM : rc);
+        return;
+    }
+    /* the sender is supposed to have forced this name relative to the
+     * session directory - refuse it if it steps above, rather than
+     * truncating whatever sits at the resulting path
+     */
+    if (prte_filem_base_has_dotdot(file)) {
+        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+        send_complete(file, PRTE_ERR_BAD_PARAM);
+        free(file);
         return;
     }
     n = 1;
     rc = PMIx_Data_unpack(NULL, buffer, &nchunk, &n, PMIX_INT32);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
-        send_complete(file, rc);
+        send_complete(file, prte_pmix_convert_status(rc));
         free(file);
         return;
     }
@@ -937,7 +1694,7 @@ static void recv_files(int status, pmix_proc_t *sender, pmix_data_buffer_t *buff
         rc = PMIx_Data_unpack(NULL, buffer, data, &nbytes, PMIX_BYTE);
         if (PMIX_SUCCESS != rc) {
             PMIX_ERROR_LOG(rc);
-            send_complete(file, rc);
+            send_complete(file, prte_pmix_convert_status(rc));
             free(file);
             return;
         }
@@ -946,9 +1703,13 @@ static void recv_files(int status, pmix_proc_t *sender, pmix_data_buffer_t *buff
     if (0 == nchunk) {
         n = 1;
         rc = PMIx_Data_unpack(NULL, buffer, &type, &n, PMIX_INT32);
+        if (PMIX_SUCCESS == rc) {
+            n = 1;
+            rc = PMIx_Data_unpack(NULL, buffer, &mode, &n, PMIX_UINT32);
+        }
         if (PMIX_SUCCESS != rc) {
             PMIX_ERROR_LOG(rc);
-            send_complete(file, rc);
+            send_complete(file, prte_pmix_convert_status(rc));
             free(file);
             return;
         }
@@ -981,19 +1742,20 @@ static void recv_files(int status, pmix_proc_t *sender, pmix_data_buffer_t *buff
 
     /* if this is the first chunk, we need to open the file descriptor */
     if (0 == nchunk) {
-        /* separate out the top-level directory of the target */
         char *tmp;
-        tmp = strdup(file);
-        if (NULL != (cptr = strchr(tmp, '/'))) {
-            *cptr = '\0';
-        }
-        /* save it */
-        incoming->top = strdup(tmp);
-        free(tmp);
         /* define the full path to where we will put it */
         session_dir = prte_process_info.top_session_dir;
 
+        /* a file may be staged more than once in the life of a DVM, so
+         * this may be a second chunk 0 for an entry we already have
+         */
+        free(incoming->fullpath);
         incoming->fullpath = pmix_os_path(false, session_dir, file, NULL);
+        incoming->type = type;
+        /* the sender's permissions, less anything that would stop us
+         * writing the file we are about to write
+         */
+        incoming->mode = (mode & 0777) | S_IRUSR | S_IWUSR;
 
         PMIX_OUTPUT_VERBOSE((1, prte_filem_base_framework.framework_output,
                              "%s filem:raw: opening target file %s",
@@ -1006,30 +1768,34 @@ static void recv_files(int status, pmix_proc_t *sender, pmix_data_buffer_t *buff
             send_complete(file, PRTE_ERR_FILE_WRITE_FAILURE);
             free(file);
             free(tmp);
+            /* drop this file from the incoming list before releasing it,
+             * else a later chunk would walk a dangling pointer
+             */
+            pmix_list_remove_item(&incoming_files, &incoming->super);
             PMIX_RELEASE(incoming);
             return;
         }
         /* open the file descriptor for writing */
-        if (PRTE_FILEM_TYPE_EXE == type) {
-            if (0
-                > (incoming->fd = open(incoming->fullpath, O_RDWR | O_CREAT | O_TRUNC, S_IRWXU))) {
-                pmix_output(0, "%s CANNOT CREATE FILE %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                            incoming->fullpath);
-                send_complete(file, PRTE_ERR_FILE_WRITE_FAILURE);
-                free(file);
-                free(tmp);
-                return;
-            }
-        } else {
-            if (0 > (incoming->fd = open(incoming->fullpath, O_RDWR | O_CREAT | O_TRUNC,
-                                         S_IRUSR | S_IWUSR))) {
-                pmix_output(0, "%s CANNOT CREATE FILE %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                            incoming->fullpath);
-                send_complete(file, PRTE_ERR_FILE_WRITE_FAILURE);
-                free(file);
-                free(tmp);
-                return;
-            }
+        incoming->fd = open(incoming->fullpath, O_RDWR | O_CREAT | O_TRUNC,
+                            (mode_t) incoming->mode);
+        if (0 > incoming->fd) {
+            pmix_output(0, "%s CANNOT CREATE FILE %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                        incoming->fullpath);
+            send_complete(file, PRTE_ERR_FILE_WRITE_FAILURE);
+            free(file);
+            free(tmp);
+            pmix_list_remove_item(&incoming_files, &incoming->super);
+            PMIX_RELEASE(incoming);
+            return;
+        }
+        /* open() only applies the mode when it creates the file, and it
+         * trims it by our umask; the staged copy is ours alone, so give
+         * it exactly what the sender had
+         */
+        if (0 != fchmod(incoming->fd, (mode_t) incoming->mode)) {
+            PMIX_OUTPUT_VERBOSE((1, prte_filem_base_framework.framework_output,
+                                 "%s filem:raw: could not set mode on %s",
+                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), incoming->fullpath));
         }
         free(tmp);
         incoming->pending = true;
@@ -1065,7 +1831,7 @@ static void write_handler(int fd, short event, void *cbdata)
     pmix_list_item_t *item;
     prte_filem_raw_output_t *output;
     int num_written;
-    char *dirname, *cmd;
+    char *dirname, *cmd, *quoted;
     char homedir[PRTE_PATH_MAX];
     int rc;
     PRTE_HIDE_UNUSED_PARAMS(fd, event);
@@ -1089,34 +1855,57 @@ static void write_handler(int fd, short event, void *cbdata)
             /* close the file descriptor */
             close(sink->fd);
             sink->fd = -1;
+            /* we are done with this EOF marker - release it so it isn't
+             * leaked on the finalize paths below
+             */
+            PMIX_RELEASE(output);
             if (PRTE_FILEM_TYPE_FILE == sink->type || PRTE_FILEM_TYPE_EXE == sink->type) {
-                /* just link to the top as this will be the
-                 * name we will want in each proc's session dir
+                /* the file itself is the one thing to place, under exactly
+                 * the relative name the app will open it by
                  */
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&sink->link_pts, sink->top);
+                PMIx_Argv_append_nosize(&sink->link_pts, sink->file);
                 send_complete(sink->file, PRTE_SUCCESS);
             } else {
-                /* unarchive the file */
+                /* Unarchive the file. It is unpacked at the root of the
+                 * session dir - the same point every link point is relative
+                 * to - rather than beside the archive itself: preloading an
+                 * archive means "unpack this in my working directory", so
+                 * "sub/bundle.tar" must still deliver its contents at the
+                 * paths the archive names them by, not under "sub/". The
+                 * archive is therefore named by its full path, since we are
+                 * about to chdir away from it.
+                 */
+                quoted = prte_filem_base_shell_quote(sink->fullpath);
+                if (NULL == quoted) {
+                    PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+                    send_complete(sink->file, PRTE_ERR_OUT_OF_RESOURCE);
+                    return;
+                }
                 if (PRTE_FILEM_TYPE_TAR == sink->type) {
-                    pmix_asprintf(&cmd, "tar xf %s", sink->file);
+                    pmix_asprintf(&cmd, "tar xf %s", quoted);
                 } else if (PRTE_FILEM_TYPE_BZIP == sink->type) {
-                    pmix_asprintf(&cmd, "tar xjf %s", sink->file);
+                    pmix_asprintf(&cmd, "tar xjf %s", quoted);
                 } else if (PRTE_FILEM_TYPE_GZIP == sink->type) {
-                    pmix_asprintf(&cmd, "tar xzf %s", sink->file);
+                    pmix_asprintf(&cmd, "tar xzf %s", quoted);
                 } else {
                     PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
                     send_complete(sink->file, PRTE_ERR_FILE_WRITE_FAILURE);
+                    free(quoted);
                     return;
                 }
+                free(quoted);
                 if (NULL == getcwd(homedir, sizeof(homedir))) {
                     PRTE_ERROR_LOG(PRTE_ERROR);
                     send_complete(sink->file, PRTE_ERR_FILE_WRITE_FAILURE);
+                    free(cmd);
                     return;
                 }
-                dirname = pmix_dirname(sink->fullpath);
+                dirname = strdup(prte_process_info.top_session_dir);
                 if (0 != chdir(dirname)) {
                     PRTE_ERROR_LOG(PRTE_ERROR);
                     send_complete(sink->file, PRTE_ERR_FILE_WRITE_FAILURE);
+                    free(cmd);
+                    free(dirname);
                     return;
                 }
                 PMIX_OUTPUT_VERBOSE((1, prte_filem_base_framework.framework_output,
@@ -1125,11 +1914,21 @@ static void write_handler(int fd, short event, void *cbdata)
                 if (0 != system(cmd)) {
                     PRTE_ERROR_LOG(PRTE_ERROR);
                     send_complete(sink->file, PRTE_ERR_FILE_WRITE_FAILURE);
+                    /* best-effort restore of our working directory before
+                     * bailing; log but don't mask the original failure
+                     */
+                    if (0 != chdir(homedir)) {
+                        PRTE_ERROR_LOG(PRTE_ERROR);
+                    }
+                    free(cmd);
+                    free(dirname);
                     return;
                 }
                 if (0 != chdir(homedir)) {
                     PRTE_ERROR_LOG(PRTE_ERROR);
                     send_complete(sink->file, PRTE_ERR_FILE_WRITE_FAILURE);
+                    free(cmd);
+                    free(dirname);
                     return;
                 }
                 free(dirname);
@@ -1192,20 +1991,27 @@ static void xfer_construct(prte_filem_raw_xfer_t *ptr)
 {
     memset(&ptr->ev, 0, sizeof(prte_event_t));
     ptr->fd = -1;
+    ptr->mode = S_IRUSR | S_IWUSR;
     ptr->outbound = NULL;
-    ptr->app_idx = 0;
     ptr->pending = false;
     ptr->src = NULL;
     ptr->file = NULL;
     ptr->nchunk = 0;
     ptr->status = PRTE_SUCCESS;
+    ptr->inflight = 0;
+    ptr->paused = false;
+    ptr->retired = false;
+    ptr->nexpected = 0;
     ptr->nrecvd = 0;
+    PMIX_CONSTRUCT(&ptr->acked, pmix_bitmap_t);
+    ptr->horizon = 0;
 }
 static void xfer_destruct(prte_filem_raw_xfer_t *ptr)
 {
     if (ptr->pending) {
         prte_event_del(&ptr->ev);
     }
+    PMIX_DESTRUCT(&ptr->acked);
     if (NULL != ptr->src) {
         free(ptr->src);
     }
@@ -1234,12 +2040,11 @@ PMIX_CLASS_INSTANCE(prte_filem_raw_outbound_t,
 
 static void in_construct(prte_filem_raw_incoming_t *ptr)
 {
-    ptr->app_idx = 0;
     ptr->pending = false;
     ptr->fd = -1;
     ptr->file = NULL;
-    ptr->top = NULL;
     ptr->fullpath = NULL;
+    ptr->mode = S_IRUSR | S_IWUSR;
     ptr->link_pts = NULL;
     PMIX_CONSTRUCT(&ptr->outputs, pmix_list_t);
 }
@@ -1254,13 +2059,10 @@ static void in_destruct(prte_filem_raw_incoming_t *ptr)
     if (NULL != ptr->file) {
         free(ptr->file);
     }
-    if (NULL != ptr->top) {
-        free(ptr->top);
-    }
     if (NULL != ptr->fullpath) {
         free(ptr->fullpath);
     }
-    PMIX_ARGV_FREE_COMPAT(ptr->link_pts);
+    PMIx_Argv_free(ptr->link_pts);
     PMIX_LIST_DESTRUCT(&ptr->outputs);
 }
 PMIX_CLASS_INSTANCE(prte_filem_raw_incoming_t,

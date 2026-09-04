@@ -3,10 +3,12 @@
  * Copyright (c) 2014-2017 Research Organization for Information Science
  *                         and Technology (RIST). All rights reserved.
  * Copyright (c) 2018-2020 Cisco Systems, Inc.  All rights reserved
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * Copyright (c) 2021      The University of Tennessee and The University
  *                         of Tennessee Research Foundation.  All rights
  *                         reserved.
+ * Copyright (c) 2026      Barcelona Supercomputing Center (BSC-CNS).
+ *                         All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -52,8 +54,10 @@ bool prte_get_attribute(pmix_list_t *attributes, prte_attribute_key_t key, void 
     {
         if (key == kv->key) {
             if (kv->data.type != type) {
+                pmix_output(0, "PRTE ERROR: attribute %s holds %s, requested as %s",
+                            prte_attr_key_to_str(key), PMIx_Data_type_string(kv->data.type),
+                            PMIx_Data_type_string(type));
                 PRTE_ERROR_LOG(PRTE_ERR_TYPE_MISMATCH);
-                pmix_output(0, "KV %s TYPE %s", PMIx_Data_type_string(kv->data.type), PMIx_Data_type_string(type));
                 return false;
             }
             if (NULL != data) {
@@ -168,6 +172,23 @@ int prte_prepend_attribute(pmix_list_t *attributes, prte_attribute_key_t key, bo
     return PRTE_SUCCESS;
 }
 
+int prte_append_attribute(pmix_list_t *attributes, prte_attribute_key_t key, bool local,
+                          void *data, pmix_data_type_t type)
+{
+    prte_attribute_t *kv;
+    int rc;
+
+    kv = PMIX_NEW(prte_attribute_t);
+    kv->key = key;
+    kv->local = local;
+    if (PRTE_SUCCESS != (rc = prte_attr_load(kv, data, type))) {
+        PMIX_RELEASE(kv);
+        return rc;
+    }
+    pmix_list_append(attributes, &kv->super);
+    return PRTE_SUCCESS;
+}
+
 void prte_remove_attribute(pmix_list_t *attributes, prte_attribute_key_t key)
 {
     prte_attribute_t *kv;
@@ -209,11 +230,11 @@ char *prte_attr_print_list(pmix_list_t *attributes)
 
     PMIX_LIST_FOREACH(attr, attributes, prte_attribute_t)
     {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&cache, prte_attr_key_to_str(attr->key));
+        PMIx_Argv_append_nosize(&cache, prte_attr_key_to_str(attr->key));
     }
     if (NULL != cache) {
-        out1 = PMIX_ARGV_JOIN_COMPAT(cache, '\n');
-        PMIX_ARGV_FREE_COMPAT(cache);
+        out1 = PMIx_Argv_join(cache, '\n');
+        PMIx_Argv_free(cache);
     } else {
         out1 = NULL;
     }
@@ -237,6 +258,8 @@ const char *prte_attr_key_to_str(prte_attribute_key_t key)
             return "APP-DASH-HOST";
         case PRTE_APP_ADD_HOST:
             return "APP-ADD-HOST";
+        case PRTE_APP_ACTIVATE_HOSTS:
+            return "APP-ACTIVATE-HOSTS";
         case PRTE_APP_USER_CWD:
             return "APP-USER-CWD";
         case PRTE_APP_SSNDIR_CWD:
@@ -273,6 +296,42 @@ const char *prte_attr_key_to_str(prte_attribute_key_t key)
             return "PRTE_APP_ADD_ENVAR";
         case PRTE_APP_PSET_NAME:
             return "PRTE_APP_PSET_NAME";
+        case PRTE_APP_PES_PER_PROC:
+            return "PRTE_APP_PES_PER_PROC";
+        case PRTE_APP_PPR:
+            return "PRTE_APP_PPR";
+        case PRTE_APP_MAPBY:
+            return "PRTE_APP_MAPBY";
+        case PRTE_APP_RANKBY:
+            return "PRTE_APP_RANKBY";
+        case PRTE_APP_BINDTO:
+            return "PRTE_APP_BINDTO";
+        case PRTE_APP_MAP_FILE:
+            return "PRTE_APP_MAP_FILE";
+        case PRTE_APP_MAP_DEVICE:
+            return "PRTE_APP_MAP_DEVICE";
+        case PRTE_APP_MAP_INTERLEAVE:
+            return "PRTE_APP_MAP_INTERLEAVE";
+        case PRTE_APP_MAP_SHARED:
+            return "PRTE_APP_MAP_SHARED";
+        case PRTE_APP_MAP_NDEV:
+            return "PRTE_APP_MAP_NDEV";
+        case PRTE_APP_HWT_CPUS:
+            return "PRTE_APP_HWT_CPUS";
+        case PRTE_APP_CORE_CPUS:
+            return "PRTE_APP_CORE_CPUS";
+        case PRTE_APP_CPUSET:
+            return "PRTE_APP_CPUSET";
+        case PRTE_APP_BINDING_LIMIT:
+            return "PRTE_APP_BINDING_LIMIT";
+        case PRTE_APP_RESOLVED_MAPBY:
+            return "PRTE_APP_RESOLVED_MAPBY";
+        case PRTE_APP_RESOLVED_RANKBY:
+            return "PRTE_APP_RESOLVED_RANKBY";
+        case PRTE_APP_RESOLVED_BINDTO:
+            return "PRTE_APP_RESOLVED_BINDTO";
+        case PRTE_APP_LAST_MAPPER:
+            return "PRTE_APP_LAST_MAPPER";
 
         case PRTE_NODE_USERNAME:
             return "NODE-USERNAME";
@@ -286,6 +345,8 @@ const char *prte_attr_key_to_str(prte_attribute_key_t key)
             return "NODE-SERIAL-NUM";
         case PRTE_NODE_ADD_SLOTS:
             return "NODE-ADD-SLOTS";
+        case PRTE_NODE_ALLOC_ID:
+            return "PRTE-NODE-ALLOC-ID";
 
         case PRTE_JOB_LAUNCH_MSG_SENT:
             return "JOB-LAUNCH-MSG-SENT";
@@ -398,7 +459,7 @@ const char *prte_attr_key_to_str(prte_attribute_key_t key)
         case PRTE_JOB_APPEND_ENVAR:
             return "PRTE_JOB_APPEND_ENVAR";
         case PRTE_JOB_ADD_ENVAR:
-            return "PRTE_APP_ADD_ENVAR";
+            return "PRTE_JOB_ADD_ENVAR";
         case PRTE_JOB_APP_SETUP_DATA:
             return "PRTE_JOB_APP_SETUP_DATA";
         case PRTE_JOB_OUTPUT_TO_DIRECTORY:
@@ -433,8 +494,14 @@ const char *prte_attr_key_to_str(prte_attribute_key_t key)
             return "JOB_INHERIT";
         case PRTE_JOB_PES_PER_PROC:
             return "JOB_PES_PER_PROC";
-        case PRTE_JOB_DIST_DEVICE:
-            return "JOB_DIST_DEVICE";
+        case PRTE_JOB_MAP_DEVICE:
+            return "JOB_MAP_DEVICE";
+        case PRTE_JOB_MAP_INTERLEAVE:
+            return "JOB_MAP_INTERLEAVE";
+        case PRTE_JOB_MAP_SHARED:
+            return "JOB_MAP_SHARED";
+        case PRTE_JOB_MAP_NDEV:
+            return "JOB_MAP_NDEV";
         case PRTE_JOB_HWT_CPUS:
             return "JOB_HWT_CPUS";
         case PRTE_JOB_CORE_CPUS:
@@ -457,6 +524,14 @@ const char *prte_attr_key_to_str(prte_attribute_key_t key)
             return "STOP-IN-INIT";
         case PRTE_JOB_STOP_IN_APP:
             return "STOP-IN-APP";
+        case PRTE_JOB_BREAKPOINT:
+            return "BREAKPOINT";
+        case PRTE_JOB_SPAWN_ALLOC:
+            return "SPAWN-ALLOCATION-REQUEST";
+        case PRTE_JOB_SPAWN_ALLOC_ID:
+            return "SPAWN-ALLOCATION-ID";
+        case PRTE_JOB_SPAWN_ALLOC_STATUS:
+            return "SPAWN-ALLOCATION-HELD-STATUS";
         case PRTE_JOB_ENVARS_HARVESTED:
             return "ENVARS-HARVESTED";
         case PRTE_JOB_OUTPUT_NOCOPY:
@@ -469,6 +544,10 @@ const char *prte_attr_key_to_str(prte_attribute_key_t key)
             return "EXEC-AGENT";
         case PRTE_JOB_NOAGG_HELP:
             return "DO-NOT-AGGREGATE-HELP";
+        case PRTE_JOB_REPORT_CHILD_SEP:
+            return "REPORT-CHILD-JOBS-SEPARATELY";
+        case PRTE_JOB_NO_IOF_INHERIT:
+            return "JOB-DOES-NOT-INHERIT-OUTPUT-FORWARDING";
         case PRTE_JOB_COLOCATE_PROCS:
             return "COLOCATE PROCS";
         case PRTE_JOB_COLOCATE_NPERPROC:
@@ -521,6 +600,13 @@ const char *prte_attr_key_to_str(prte_attribute_key_t key)
             return "REPORT PHYSICAL CPUS";
         case PRTE_JOB_ALLOC_DISPLAYED:
             return "ALLOCATION DISPLAYED";
+        case PRTE_JOB_DO_NOT_SPAWN:
+            return "DO_NOT_SPAWN";
+        case PRTE_JOB_SPAWN_TARGET:
+            return "SPAWN_TARGET";
+
+        case PRTE_JOB_OUTPUT_FILE_PATTERN:
+            return "JOB-OUTPUT-FILE-PATTERN";
 
         case PRTE_PROC_NOBARRIER:
             return "PROC-NOBARRIER";
@@ -542,6 +628,8 @@ const char *prte_attr_key_to_str(prte_attribute_key_t key)
             return "PROC-NODENAME";
         case PRTE_PROC_CGROUP:
             return "PROC-CGROUP";
+        case PRTE_PROC_DEVICE_ID:
+            return "PROC_DEVICE_ID";
         case PRTE_PROC_NBEATS:
             return "PROC-NBEATS";
 
@@ -733,11 +821,18 @@ int prte_attr_load(prte_attribute_t *kv, void *data, pmix_data_type_t type)
     case PMIX_ENVAR:
         envar = (pmix_envar_t *) data;
         if (NULL != envar) {
+            /* clear both fields as they are released: only the ones the new
+             * value supplies were being reassigned, so reloading an
+             * attribute with an envar that carries no value (or no name)
+             * left a pointer to freed storage behind - and the destructor
+             * then freed it again */
             if (NULL != kv->data.data.envar.envar) {
                 free(kv->data.data.envar.envar);
+                kv->data.data.envar.envar = NULL;
             }
             if (NULL != kv->data.data.envar.value) {
                 free(kv->data.data.envar.value);
+                kv->data.data.envar.value = NULL;
             }
             if (NULL != envar->envar) {
                 kv->data.data.envar.envar = strdup(envar->envar);
@@ -750,9 +845,15 @@ int prte_attr_load(prte_attribute_t *kv, void *data, pmix_data_type_t type)
         break;
 
     case PMIX_DATA_ARRAY:
+        /* release any array this attribute is already carrying, and hand
+         * back a PRTE status like every other branch here does */
+        if (NULL != kv->data.data.darray) {
+            PMIX_VALUE_DESTRUCT(&kv->data);
+            kv->data.type = type;
+            kv->data.data.darray = NULL;
+        }
         rc = PMIx_Data_copy((void**)&kv->data.data.darray, data, PMIX_DATA_ARRAY);
-        return rc;
-        break;
+        return prte_pmix_convert_status(rc);
 
     default:
         PRTE_ERROR_LOG(PRTE_ERR_NOT_SUPPORTED);
@@ -939,56 +1040,56 @@ char* prte_print_proc_flags(struct prte_proc_t *ptr)
     char *ans;
 
     // start with the proc name
-    PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, PRTE_NAME_PRINT(&p->name));
-    PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, ": ");
+    PMIx_Argv_append_nosize(&tmp, PRTE_NAME_PRINT(&p->name));
+    PMIx_Argv_append_nosize(&tmp, ": ");
 
     if (PRTE_FLAG_TEST(p, PRTE_PROC_FLAG_ALIVE)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "ALIVE");
+        PMIx_Argv_append_nosize(&tmp, "ALIVE");
     }
     if (PRTE_FLAG_TEST(p, PRTE_PROC_FLAG_ABORT)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "ABORT");
+        PMIx_Argv_append_nosize(&tmp, "ABORT");
     }
     if (PRTE_FLAG_TEST(p, PRTE_PROC_FLAG_UPDATED)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "UPDATED");
+        PMIx_Argv_append_nosize(&tmp, "UPDATED");
     }
     if (PRTE_FLAG_TEST(p, PRTE_PROC_FLAG_LOCAL)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "LOCAL");
+        PMIx_Argv_append_nosize(&tmp, "LOCAL");
     }
     if (PRTE_FLAG_TEST(p, PRTE_PROC_FLAG_REPORTED)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "REPORTED");
+        PMIx_Argv_append_nosize(&tmp, "REPORTED");
     }
     if (PRTE_FLAG_TEST(p, PRTE_PROC_FLAG_REG)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "REGISTERED");
+        PMIx_Argv_append_nosize(&tmp, "REGISTERED");
     }
     if (PRTE_FLAG_TEST(p, PRTE_PROC_FLAG_HAS_DEREG)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "DEREGISTERED");
+        PMIx_Argv_append_nosize(&tmp, "DEREGISTERED");
     }
     if (PRTE_FLAG_TEST(p, PRTE_PROC_FLAG_AS_MPI)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "MPI");
+        PMIx_Argv_append_nosize(&tmp, "MPI");
     }
     if (PRTE_FLAG_TEST(p, PRTE_PROC_FLAG_IOF_COMPLETE)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "IOF-COMPLETE");
+        PMIx_Argv_append_nosize(&tmp, "IOF-COMPLETE");
     }
     if (PRTE_FLAG_TEST(p, PRTE_PROC_FLAG_WAITPID)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "WAITPID");
+        PMIx_Argv_append_nosize(&tmp, "WAITPID");
     }
     if (PRTE_FLAG_TEST(p, PRTE_PROC_FLAG_RECORDED)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "RECORDED");
+        PMIx_Argv_append_nosize(&tmp, "RECORDED");
     }
     if (PRTE_FLAG_TEST(p, PRTE_PROC_FLAG_DATA_IN_SM)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "DATA-IN-SM");
+        PMIx_Argv_append_nosize(&tmp, "DATA-IN-SM");
     }
     if (PRTE_FLAG_TEST(p, PRTE_PROC_FLAG_DATA_RECVD)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "DATA-RECVD");
+        PMIx_Argv_append_nosize(&tmp, "DATA-RECVD");
     }
     if (PRTE_FLAG_TEST(p, PRTE_PROC_FLAG_SM_ACCESS)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "SM-ACCESS");
+        PMIx_Argv_append_nosize(&tmp, "SM-ACCESS");
     }
     if (PRTE_FLAG_TEST(p, PRTE_PROC_FLAG_TERM_REPORTED)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "TERMINATED");
+        PMIx_Argv_append_nosize(&tmp, "TERMINATED");
     }
-    ans = PMIX_ARGV_JOIN_COMPAT(tmp, '|');
-    PMIX_ARGV_FREE_COMPAT(tmp);
+    ans = PMIx_Argv_join(tmp, '|');
+    PMIx_Argv_free(tmp);
     return ans;
 }
 
@@ -999,29 +1100,29 @@ char* prte_print_node_flags(struct prte_node_t *ptr)
     char *ans;
 
     // start with the node name
-    PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, p->name);
-    PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, ": ");
+    PMIx_Argv_append_nosize(&tmp, p->name);
+    PMIx_Argv_append_nosize(&tmp, ": ");
 
     if (PRTE_FLAG_TEST(p, PRTE_NODE_FLAG_DAEMON_LAUNCHED)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "DAEMON-LAUNCHED");
+        PMIx_Argv_append_nosize(&tmp, "DAEMON-LAUNCHED");
     }
     if (PRTE_FLAG_TEST(p, PRTE_NODE_FLAG_LOC_VERIFIED)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "LOCATION");
+        PMIx_Argv_append_nosize(&tmp, "LOCATION");
     }
     if (PRTE_FLAG_TEST(p, PRTE_NODE_FLAG_OVERSUBSCRIBED)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "OVERSUBSCRIBED");
+        PMIx_Argv_append_nosize(&tmp, "OVERSUBSCRIBED");
     }
     if (PRTE_FLAG_TEST(p, PRTE_NODE_FLAG_MAPPED)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "MAPPED");
+        PMIx_Argv_append_nosize(&tmp, "MAPPED");
     }
     if (PRTE_FLAG_TEST(p, PRTE_NODE_FLAG_SLOTS_GIVEN)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "SLOTS-GIVEN");
+        PMIx_Argv_append_nosize(&tmp, "SLOTS-GIVEN");
     }
     if (PRTE_FLAG_TEST(p, PRTE_NODE_NON_USABLE)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "NONUSABLE");
+        PMIx_Argv_append_nosize(&tmp, "NONUSABLE");
     }
-    ans = PMIX_ARGV_JOIN_COMPAT(tmp, '|');
-    PMIX_ARGV_FREE_COMPAT(tmp);
+    ans = PMIx_Argv_join(tmp, '|');
+    PMIx_Argv_free(tmp);
     return ans;
 }
 
@@ -1032,23 +1133,23 @@ char* prte_print_app_flags(struct prte_app_context_t *ptr)
     char *ans;
 
     // start with the app command
-    PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, p->app);
-    PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, ": ");
+    PMIx_Argv_append_nosize(&tmp, p->app);
+    PMIx_Argv_append_nosize(&tmp, ": ");
 
     if (PRTE_FLAG_TEST(p, PRTE_APP_FLAG_USED_ON_NODE)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "USED-LOCAL-NODE");
+        PMIx_Argv_append_nosize(&tmp, "USED-LOCAL-NODE");
     }
 
     if (PRTE_FLAG_TEST(p, PRTE_APP_FLAG_TOOL)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "TOOL");
+        PMIx_Argv_append_nosize(&tmp, "TOOL");
     }
 
     if (PRTE_FLAG_TEST(p, PRTE_APP_FLAG_COMPUTED)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "NPROCS-COMPUTED");
+        PMIx_Argv_append_nosize(&tmp, "NPROCS-COMPUTED");
     }
 
-    ans = PMIX_ARGV_JOIN_COMPAT(tmp, '|');
-    PMIX_ARGV_FREE_COMPAT(tmp);
+    ans = PMIx_Argv_join(tmp, '|');
+    PMIx_Argv_free(tmp);
     return ans;
 }
 
@@ -1059,46 +1160,74 @@ char* prte_print_job_flags(struct prte_job_t *ptr)
     char *ans;
 
     // start with the job name
-    PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, PRTE_JOBID_PRINT(p->nspace));
-    PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, ": ");
+    PMIx_Argv_append_nosize(&tmp, PRTE_JOBID_PRINT(p->nspace));
+    PMIx_Argv_append_nosize(&tmp, ": ");
 
     if (PRTE_FLAG_TEST(p, PRTE_JOB_FLAG_UPDATED)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "UPDATED");
+        PMIx_Argv_append_nosize(&tmp, "UPDATED");
     }
     if (PRTE_FLAG_TEST(p, PRTE_JOB_FLAG_RESTARTED)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "RESTARTED");
+        PMIx_Argv_append_nosize(&tmp, "RESTARTED");
     }
     if (PRTE_FLAG_TEST(p, PRTE_JOB_FLAG_ABORTED)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "ABORTED");
+        PMIx_Argv_append_nosize(&tmp, "ABORTED");
     }
     if (PRTE_FLAG_TEST(p, PRTE_JOB_FLAG_FORWARD_OUTPUT)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "FORWARD-OUTPUT");
+        PMIx_Argv_append_nosize(&tmp, "FORWARD-OUTPUT");
     }
     if (PRTE_FLAG_TEST(p, PRTE_JOB_FLAG_DO_NOT_MONITOR)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "DO-NOT-MONITOR");
+        PMIx_Argv_append_nosize(&tmp, "DO-NOT-MONITOR");
     }
     if (PRTE_FLAG_TEST(p, PRTE_JOB_FLAG_FORWARD_COMM)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "FWD-COM");
+        PMIx_Argv_append_nosize(&tmp, "FWD-COM");
     }
     if (PRTE_FLAG_TEST(p, PRTE_JOB_FLAG_RESTART)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "RESTART");
+        PMIx_Argv_append_nosize(&tmp, "RESTART");
     }
     if (PRTE_FLAG_TEST(p, PRTE_JOB_FLAG_PROCS_MIGRATING)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "MIGRATING");
+        PMIx_Argv_append_nosize(&tmp, "MIGRATING");
     }
     if (PRTE_FLAG_TEST(p, PRTE_JOB_FLAG_OVERSUBSCRIBED)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "OVERSUBSCRIBED");
+        PMIx_Argv_append_nosize(&tmp, "OVERSUBSCRIBED");
     }
     if (PRTE_FLAG_TEST(p, PRTE_JOB_FLAG_TOOL)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "TOOL");
+        PMIx_Argv_append_nosize(&tmp, "TOOL");
     }
     if (PRTE_FLAG_TEST(p, PRTE_JOB_FLAG_LAUNCHER)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "LAUNCHER");
+        PMIx_Argv_append_nosize(&tmp, "LAUNCHER");
     }
     if (PRTE_FLAG_TEST(p, PRTE_JOB_FLAG_ERR_REPORTED)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "ERROR-REPORTED");
+        PMIx_Argv_append_nosize(&tmp, "ERROR-REPORTED");
     }
-    ans = PMIX_ARGV_JOIN_COMPAT(tmp, '|');
-    PMIX_ARGV_FREE_COMPAT(tmp);
+    ans = PMIx_Argv_join(tmp, '|');
+    PMIx_Argv_free(tmp);
+    return ans;
+}
+
+char* prte_print_session_flags(struct prte_session_t *ptr)
+{
+    prte_session_t *p = (prte_session_t*)ptr;
+    char **tmp = NULL;
+    char *ans;
+
+    if (PRTE_FLAG_TEST(p, PRTE_SESSION_FLAG_DYNAMIC)) {
+        PMIx_Argv_append_nosize(&tmp, "DYNAMIC");
+    } else {
+        PMIx_Argv_append_nosize(&tmp, "STATIC");
+    }
+    if (PRTE_FLAG_TEST(p, PRTE_SESSION_FLAG_RESERVED)) {
+        PMIx_Argv_append_nosize(&tmp, "RESERVED");
+    }
+    if (PRTE_FLAG_TEST(p, PRTE_SESSION_FLAG_DETACHED)) {
+        PMIx_Argv_append_nosize(&tmp, "DETACHED");
+    }
+    if (PRTE_FLAG_TEST(p, PRTE_SESSION_FLAG_PAUSED)) {
+        PMIx_Argv_append_nosize(&tmp, "PAUSED");
+    }
+    if (PRTE_FLAG_TEST(p, PRTE_SESSION_FLAG_SCHEDULER)) {
+        PMIx_Argv_append_nosize(&tmp, "SCHEDULER");
+    }
+    ans = PMIx_Argv_join(tmp, '|');
+    PMIx_Argv_free(tmp);
     return ans;
 }

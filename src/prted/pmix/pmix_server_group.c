@@ -19,7 +19,7 @@
  * Copyright (c) 2014-2019 Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2020      IBM Corporation.  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -30,31 +30,12 @@
 
 #include "prte_config.h"
 
-#ifdef HAVE_UNISTD_H
-#    include <unistd.h>
-#endif
-
-#include "src/hwloc/hwloc-internal.h"
 #include "src/pmix/pmix-internal.h"
-#include "src/util/pmix_argv.h"
 #include "src/util/pmix_output.h"
 
-#include "src/mca/errmgr/errmgr.h"
-#include "src/mca/grpcomm/base/base.h"
-#include "src/mca/iof/base/base.h"
-#include "src/mca/iof/iof.h"
-#include "src/mca/plm/base/plm_private.h"
-#include "src/mca/plm/plm.h"
-#include "src/mca/plm/base/plm_private.h"
-#include "src/mca/rmaps/rmaps_types.h"
-#include "src/rml/rml.h"
-#include "src/mca/schizo/schizo.h"
-#include "src/mca/state/state.h"
+#include "src/grpcomm/grpcomm.h"
 #include "src/runtime/prte_globals.h"
-#include "src/runtime/prte_locks.h"
-#include "src/threads/pmix_threads.h"
 #include "src/util/name_fns.h"
-#include "src/util/pmix_show_help.h"
 
 #include "src/prted/pmix/pmix_server_internal.h"
 
@@ -75,7 +56,7 @@ pmix_status_t pmix_server_group_fn(pmix_group_operation_t op, char *grpid,
         return PMIX_ERR_BAD_PARAM;
     }
 
-    rc = prte_grpcomm.group(op, grpid, procs, nprocs,
+    rc = prte_grpcomm_group(op, grpid, procs, nprocs,
                             directives, ndirs, cbfunc, cbdata);
     if (PRTE_SUCCESS != rc) {
         rc = prte_pmix_convert_rc(rc);

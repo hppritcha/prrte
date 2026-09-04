@@ -16,7 +16,8 @@
  * Copyright (c) 2013-2019 Intel, Inc.  All rights reserved.
  * Copyright (c) 2016-2019 Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2026      Sandia National Laboratories  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -50,13 +51,13 @@
 #include <ctype.h>
 
 #include "src/include/prte_socket_errno.h"
-#include "src/runtime/prte_progress_threads.h"
 #include "src/util/pmix_argv.h"
 #include "src/util/error.h"
 #include "src/util/pmix_if.h"
 #include "src/util/pmix_net.h"
 #include "src/util/pmix_output.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 
 #include "src/mca/errmgr/errmgr.h"
 #include "src/mca/ess/ess.h"
@@ -64,7 +65,6 @@
 #include "src/threads/pmix_threads.h"
 #include "src/util/name_fns.h"
 #include "src/util/pmix_parse_options.h"
-#include "src/util/pmix_show_help.h"
 
 #include "src/rml/oob/oob_tcp.h"
 #include "src/rml/oob/oob_tcp_common.h"
@@ -75,13 +75,11 @@
 
 prte_oob_base_t prte_oob_base = {
     .output = -1,
-    .addr_count = 0,
-    .num_links = 0,
     .max_retries = 0,
     .max_uri_length = -1,
-    .events = PMIX_LIST_STATIC_INIT,
+    .events = PMIX_LIST_STATIC_INIT(prte_oob_base.events),
     .peer_limit = 0,
-    .peers = PMIX_LIST_STATIC_INIT,
+    .peers = PMIX_LIST_STATIC_INIT(prte_oob_base.peers),
 
     .tcp_sndbuf = 0,
     .tcp_rcvbuf = 0,
@@ -98,10 +96,10 @@ prte_oob_base_t prte_oob_base = {
     .ipv6conns = NULL,
     .ipv6ports = NULL,
 
-    .local_ifs = PMIX_LIST_STATIC_INIT,
+    .local_ifs = PMIX_LIST_STATIC_INIT(prte_oob_base.local_ifs),
     .if_masks = NULL,
     .num_hnp_ports = 1,
-    .listeners = PMIX_LIST_STATIC_INIT,
+    .listeners = PMIX_LIST_STATIC_INIT(prte_oob_base.listeners),
     .listen_thread_active = false,
     .listen_thread_tv = {3600, 0},
     .stop_thread = {-1, -1},
@@ -111,9 +109,6 @@ prte_oob_base_t prte_oob_base = {
     .retry_delay = 0,
     .max_recon_attempts = 0
 };
-
-static void split_and_resolve(char **orig_str, char *name,
-                              char ***interfaces);
 
 int prte_oob_open(void)
 {
@@ -136,7 +131,6 @@ int prte_oob_open(void)
         prte_oob_base.listen_thread_tv.tv_sec = 3600;
         prte_oob_base.listen_thread_tv.tv_usec = 0;
     }
-    prte_oob_base.addr_count = 0;
     prte_oob_base.ipv4conns = NULL;
     prte_oob_base.ipv4ports = NULL;
     prte_oob_base.ipv6conns = NULL;
@@ -152,12 +146,12 @@ int prte_oob_open(void)
      * subnet+mask
      */
     if (NULL != prte_if_include) {
-        split_and_resolve(&prte_if_include,
-                          "include", &interfaces);
+        prte_oob_split_and_resolve(&prte_if_include,
+                                   "include", &interfaces);
         including = true;
     } else if (NULL != prte_if_exclude) {
-        split_and_resolve(&prte_if_exclude,
-                          "exclude", &interfaces);
+        prte_oob_split_and_resolve(&prte_if_exclude,
+                                   "exclude", &interfaces);
     }
 
     /* if we are the master, then check the interfaces for loopbacks
@@ -209,8 +203,8 @@ int prte_oob_open(void)
              * error out as we can't do what was requested
              */
             if (PRTE_ERR_NETWORK_NOT_PARSEABLE == rc) {
-                pmix_show_help("help-oob-tcp.txt", "not-parseable", true);
-                PMIX_ARGV_FREE_COMPAT(interfaces);
+                prte_show_help("help-oob-tcp.txt", "not-parseable", true);
+                PMIx_Argv_free(interfaces);
                 return PRTE_ERR_BAD_PARAM;
             }
             /* if we are including, then ignore this if not present */
@@ -247,7 +241,7 @@ int prte_oob_open(void)
                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                                 pmix_net_get_hostname((struct sockaddr *) &my_ss),
                                 (AF_INET == my_ss.ss_family) ? "V4" : "V6");
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&prte_oob_base.ipv4conns,
+            PMIx_Argv_append_nosize(&prte_oob_base.ipv4conns,
                                            pmix_net_get_hostname((struct sockaddr *) &my_ss));
         } else if (AF_INET6 == my_ss.ss_family) {
 #if PRTE_ENABLE_IPV6
@@ -256,7 +250,7 @@ int prte_oob_open(void)
                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                                 pmix_net_get_hostname((struct sockaddr *) &my_ss),
                                 (AF_INET == my_ss.ss_family) ? "V4" : "V6");
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&prte_oob_base.ipv6conns,
+            PMIx_Argv_append_nosize(&prte_oob_base.ipv6conns,
                                            pmix_net_get_hostname((struct sockaddr *) &my_ss));
 #endif // PRTE_ENABLE_IPV6
         } else {
@@ -268,6 +262,7 @@ int prte_oob_open(void)
         }
         copied_interface = PMIX_NEW(pmix_pif_t);
         if (NULL == copied_interface) {
+            PMIx_Argv_free(interfaces);
             return PRTE_ERR_OUT_OF_RESOURCE;
         }
         pmix_string_copy(copied_interface->if_name, selected_interface->if_name, PMIX_IF_NAMESIZE);
@@ -288,23 +283,29 @@ int prte_oob_open(void)
         copied_interface->ifmtu = selected_interface->ifmtu;
         /* Add the if_mask to the list */
         snprintf(string, 50, "%d", selected_interface->if_mask);
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&prte_oob_base.if_masks, string);
+        PMIx_Argv_append_nosize(&prte_oob_base.if_masks, string);
         pmix_list_append(&prte_oob_base.local_ifs, &(copied_interface->super));
     }
     if (NULL != interfaces) {
-        PMIX_ARGV_FREE_COMPAT(interfaces);
+        PMIx_Argv_free(interfaces);
     }
 
-    if (0 == PMIX_ARGV_COUNT_COMPAT(prte_oob_base.ipv4conns)
+    if (0 == PMIx_Argv_count(prte_oob_base.ipv4conns)
 #if PRTE_ENABLE_IPV6
-        && 0 == PMIX_ARGV_COUNT_COMPAT(prte_oob_base.ipv6conns)
+        && 0 == PMIx_Argv_count(prte_oob_base.ipv6conns)
 #endif
     ) {
+        /* say so: this is reachable straight from user input (an if_include or
+         * if_exclude that leaves nothing), and the caller can only turn the
+         * bare error code into an abort */
+        prte_show_help("help-oob-tcp.txt", "no-interfaces", true,
+                       prte_process_info.nodename);
         return PRTE_ERR_NOT_AVAILABLE;
     }
 
     // start the listeners
     if (PRTE_SUCCESS != (rc = prte_oob_tcp_start_listening())) {
+        prte_show_help("help-oob-tcp.txt", "no-listeners", true);
         PRTE_ERROR_LOG(rc);
     }
     return rc;
@@ -327,26 +328,55 @@ void prte_oob_close(void)
 
     }
 
+    /* Peer sockets are serviced on the process-wide worker pool, which we do
+     * not own and therefore do not harvest here.  Nothing is running on it by
+     * now either: prte_finalize stops every progress thread before it calls
+     * prte_ess.finalize(), which is the only path that reaches this
+     * function - so no worker is inside a send handler reading a peer we are
+     * about to destruct. */
     PMIX_LIST_DESTRUCT(&prte_oob_base.local_ifs);
     PMIX_LIST_DESTRUCT(&prte_oob_base.peers);
+    /* the listener objects and the parsed port ranges are ours too - this tree
+     * is kept valgrind-clean, so tear down everything prte_oob_open and
+     * prte_oob_register built */
+    PMIX_LIST_DESTRUCT(&prte_oob_base.listeners);
+
+    if (NULL != prte_oob_base.tcp_static_ports) {
+        PMIx_Argv_free(prte_oob_base.tcp_static_ports);
+        prte_oob_base.tcp_static_ports = NULL;
+    }
+    if (NULL != prte_oob_base.tcp_dyn_ports) {
+        PMIx_Argv_free(prte_oob_base.tcp_dyn_ports);
+        prte_oob_base.tcp_dyn_ports = NULL;
+    }
+#if PRTE_ENABLE_IPV6
+    if (NULL != prte_oob_base.tcp6_static_ports) {
+        PMIx_Argv_free(prte_oob_base.tcp6_static_ports);
+        prte_oob_base.tcp6_static_ports = NULL;
+    }
+    if (NULL != prte_oob_base.tcp6_dyn_ports) {
+        PMIx_Argv_free(prte_oob_base.tcp6_dyn_ports);
+        prte_oob_base.tcp6_dyn_ports = NULL;
+    }
+#endif
 
     if (NULL != prte_oob_base.ipv4conns) {
-        PMIX_ARGV_FREE_COMPAT(prte_oob_base.ipv4conns);
+        PMIx_Argv_free(prte_oob_base.ipv4conns);
     }
     if (NULL != prte_oob_base.ipv4ports) {
-        PMIX_ARGV_FREE_COMPAT(prte_oob_base.ipv4ports);
+        PMIx_Argv_free(prte_oob_base.ipv4ports);
     }
 
 #if PRTE_ENABLE_IPV6
     if (NULL != prte_oob_base.ipv6conns) {
-        PMIX_ARGV_FREE_COMPAT(prte_oob_base.ipv6conns);
+        PMIx_Argv_free(prte_oob_base.ipv6conns);
     }
     if (NULL != prte_oob_base.ipv6ports) {
-        PMIX_ARGV_FREE_COMPAT(prte_oob_base.ipv6ports);
+        PMIx_Argv_free(prte_oob_base.ipv6ports);
     }
 #endif
     if (NULL != prte_oob_base.if_masks) {
-        PMIX_ARGV_FREE_COMPAT(prte_oob_base.if_masks);
+        PMIx_Argv_free(prte_oob_base.if_masks);
     }
 
     if (0 <= prte_oob_base.output) {
@@ -401,7 +431,7 @@ int prte_oob_register(void)
     if (NULL != static_port_string) {
         pmix_util_parse_range_options(static_port_string, &prte_oob_base.tcp_static_ports);
         if (0 == strcmp(prte_oob_base.tcp_static_ports[0], "-1")) {
-            PMIX_ARGV_FREE_COMPAT(prte_oob_base.tcp_static_ports);
+            PMIx_Argv_free(prte_oob_base.tcp_static_ports);
             prte_oob_base.tcp_static_ports = NULL;
         }
     } else {
@@ -420,7 +450,7 @@ int prte_oob_register(void)
         pmix_util_parse_range_options(static_port_string6,
                                       &prte_oob_base.tcp6_static_ports);
         if (0 == strcmp(prte_oob_base.tcp6_static_ports[0], "-1")) {
-            PMIX_ARGV_FREE_COMPAT(prte_oob_base.tcp6_static_ports);
+            PMIx_Argv_free(prte_oob_base.tcp6_static_ports);
             prte_oob_base.tcp6_static_ports = NULL;
         }
     } else {
@@ -442,14 +472,14 @@ int prte_oob_register(void)
     if (NULL != dyn_port_string) {
         /* can't have both static and dynamic ports! */
         if (prte_static_ports) {
-            char *err = PMIX_ARGV_JOIN_COMPAT(prte_oob_base.tcp_static_ports, ',');
-            pmix_show_help("help-oob-tcp.txt", "static-and-dynamic", true, err, dyn_port_string);
+            char *err = PMIx_Argv_join(prte_oob_base.tcp_static_ports, ',');
+            prte_show_help("help-oob-tcp.txt", "static-and-dynamic", true, err, dyn_port_string);
             free(err);
             return PRTE_ERROR;
         }
         pmix_util_parse_range_options(dyn_port_string, &prte_oob_base.tcp_dyn_ports);
         if (0 == strcmp(prte_oob_base.tcp_dyn_ports[0], "-1")) {
-            PMIX_ARGV_FREE_COMPAT(prte_oob_base.tcp_dyn_ports);
+            PMIx_Argv_free(prte_oob_base.tcp_dyn_ports);
             prte_oob_base.tcp_dyn_ports = NULL;
         }
     } else {
@@ -468,12 +498,12 @@ int prte_oob_register(void)
         if (prte_static_ports) {
             char *err4 = NULL, *err6 = NULL;
             if (NULL != prte_oob_base.tcp_static_ports) {
-                err4 = PMIX_ARGV_JOIN_COMPAT(prte_oob_base.tcp_static_ports, ',');
+                err4 = PMIx_Argv_join(prte_oob_base.tcp_static_ports, ',');
             }
             if (NULL != prte_oob_base.tcp6_static_ports) {
-                err6 = PMIX_ARGV_JOIN_COMPAT(prte_oob_base.tcp6_static_ports, ',');
+                err6 = PMIx_Argv_join(prte_oob_base.tcp6_static_ports, ',');
             }
-            pmix_show_help("help-oob-tcp.txt", "static-and-dynamic-ipv6", true,
+            prte_show_help("help-oob-tcp.txt", "static-and-dynamic-ipv6", true,
                            (NULL == err4) ? "N/A" : err4, (NULL == err6) ? "N/A" : err6,
                            dyn_port_string6);
             if (NULL != err4) {
@@ -486,7 +516,7 @@ int prte_oob_register(void)
         }
         pmix_util_parse_range_options(dyn_port_string6, &prte_oob_base.tcp6_dyn_ports);
         if (0 == strcmp(prte_oob_base.tcp6_dyn_ports[0], "-1")) {
-            PMIX_ARGV_FREE_COMPAT(prte_oob_base.tcp6_dyn_ports);
+            PMIx_Argv_free(prte_oob_base.tcp6_dyn_ports);
             prte_oob_base.tcp6_dyn_ports = NULL;
         }
     } else {
@@ -543,13 +573,76 @@ int prte_oob_register(void)
                                         "Max number of times to attempt connection before giving up (-1 -> never give up)",
                                         PMIX_MCA_BASE_VAR_TYPE_INT,
                                         &prte_oob_base.max_recon_attempts);
+
+    prte_oob_base.retry_max_delay = 0;
+    (void) pmix_mca_base_var_register("prte", "prte", NULL, "retry_max_delay",
+                                        "Maximum delay (in sec) between connection retries. When larger than retry_delay, the delay backs off exponentially up to this cap; 0 keeps the delay fixed at retry_delay",
+                                        PMIX_MCA_BASE_VAR_TYPE_INT,
+                                        &prte_oob_base.retry_max_delay);
+
+    prte_oob_base.connect_max_time = 0;
+    (void) pmix_mca_base_var_register("prte", "prte", NULL, "connect_max_time",
+                                        "Maximum time (in sec) to keep retrying a connection to a non-lifeline peer before giving up so the routing tree can heal to an ancestor; 0 means retry forever",
+                                        PMIX_MCA_BASE_VAR_TYPE_INT,
+                                        &prte_oob_base.connect_max_time);
+
+    /* Fault injection, and deliberately NOT restricted to a debug build - the
+     * behavior it exists to reach is in the build that ships, and a hook that
+     * only exists elsewhere cannot demonstrate it.  It costs one comparison
+     * on a path that runs when a connection is already being torn down.
+     *
+     * Losing a daemon has two shapes, and only one of them is easy to arrange.
+     * Normally this process sees the socket close, reports the loss, the node
+     * is marked down, and every later message for it is refused before it
+     * reaches the oob at all.  The other shape is a daemon that has gone away
+     * while this process still believes in it: the next message then has to
+     * open a fresh connection, and it is that attempt failing which tells the
+     * user their daemon is unreachable.  Reaching it by timing alone is a race
+     * nobody wins reliably, so this names a vpid whose departure is to be
+     * ignored, and the race disappears. */
+    prte_oob_base.silent_loss_vpid = -1;
+    (void) pmix_mca_base_var_register("prte", "prte", NULL, "oob_silent_loss_vpid",
+                                        "Fault injection: pretend not to notice the departure of "
+                                        "this daemon vpid, so the next message for it must open a "
+                                        "fresh connection [default: -1 => notice every departure]",
+                                        PMIX_MCA_BASE_VAR_TYPE_INT,
+                                        &prte_oob_base.silent_loss_vpid);
+
     prte_oob_base.max_msg_size = 100;
     (void) pmix_mca_base_var_register("prte", "prte", NULL, "max_msg_size",
                                         "Max size of an OOB message in Megabytes(default = 100)",
                                         PMIX_MCA_BASE_VAR_TYPE_INT,
-                                        &prte_oob_base.max_recon_attempts);
+                                        &prte_oob_base.max_msg_size);
 
     return PRTE_SUCCESS;
+}
+
+void prte_oob_simulate_node_failure(void)
+{
+    /* We're about to raise SIGKILL, so no cleanup necessary. Just ungracefully
+     * close the sockets */
+    prte_oob_tcp_peer_t *peer;
+    PMIX_LIST_FOREACH(peer, &prte_oob_base.peers, prte_oob_tcp_peer_t){
+        if(peer->state == MCA_OOB_TCP_FAILED) continue;
+        if(peer->state == MCA_OOB_TCP_CLOSED) continue;
+        if(peer->state == MCA_OOB_TCP_UNCONNECTED) continue;
+
+        /* Close TCP connection with an rst instead of a fin, i.e. don't send
+         * an EOF, finish sending queued data, continue ACKS/resends, etc.
+         * Slightly better simulation of a node failure than just killing the
+         * daemon - it will be interpreted by the remote as a communication
+         * failure, not just a closed socket.
+         */
+        struct linger opt = {
+            /* sychronously close the socket */
+            .l_onoff = 1,
+            /* but with RST timeout immediately */
+            .l_linger = 0
+        };
+        setsockopt(peer->sd, SOL_SOCKET, SO_LINGER, &opt, sizeof(opt));
+        close(peer->sd);
+        peer->state = MCA_OOB_TCP_FAILED;
+    }
 }
 
 /*
@@ -576,52 +669,6 @@ void prte_oob_accept_connection(const int accepted_fd, const struct sockaddr *ad
      *  process ident message to complete this connection
      */
     PRTE_ACTIVATE_TCP_ACCEPT_STATE(accepted_fd, addr, recv_handler);
-}
-
-/* API functions */
-void prte_oob_ping(const pmix_proc_t *proc)
-{
-    prte_oob_tcp_peer_t *peer;
-
-    pmix_output_verbose(2, prte_oob_base.output,
-                        "%s:[%s:%d] processing ping to peer %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                        __FILE__, __LINE__, PRTE_NAME_PRINT(proc));
-
-    /* do we know this peer? */
-    if (NULL == (peer = prte_oob_tcp_peer_lookup(proc))) {
-        /* push this back to the component so it can try
-         * another module within this transport. If no
-         * module can be found, the component can push back
-         * to the framework so another component can try
-         */
-        pmix_output_verbose(2, prte_oob_base.output,
-                            "%s:[%s:%d] hop %s unknown", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                            __FILE__, __LINE__, PRTE_NAME_PRINT(proc));
-        PRTE_ACTIVATE_TCP_MSG_ERROR(NULL, NULL, proc, prte_mca_oob_tcp_component_hop_unknown);
-        return;
-    }
-
-    /* if we are already connected, there is nothing to do */
-    if (MCA_OOB_TCP_CONNECTED == peer->state) {
-        pmix_output_verbose(2, prte_oob_base.output,
-                            "%s:[%s:%d] already connected to peer %s",
-                            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), __FILE__, __LINE__,
-                            PRTE_NAME_PRINT(proc));
-        return;
-    }
-
-    /* if we are already connecting, there is nothing to do */
-    if (MCA_OOB_TCP_CONNECTING == peer->state || MCA_OOB_TCP_CONNECT_ACK == peer->state) {
-        pmix_output_verbose(2, prte_oob_base.output,
-                            "%s:[%s:%d] already connecting to peer %s",
-                            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), __FILE__, __LINE__,
-                            PRTE_NAME_PRINT(proc));
-        return;
-    }
-
-    /* attempt the connection */
-    peer->state = MCA_OOB_TCP_CONNECTING;
-    PRTE_ACTIVATE_TCP_CONN_STATE(peer, prte_oob_tcp_peer_try_connect);
 }
 
 /*
@@ -651,7 +698,12 @@ static void recv_handler(int sd, short flg, void *cbdata)
 
     /* finish processing ident */
     if (MCA_OOB_TCP_IDENT == hdr.type) {
-        if (NULL == (peer = prte_oob_tcp_peer_lookup(&hdr.origin))) {
+        pmix_proc_t sender;
+
+        /* the header carries the sender as a rank plus the nspace it
+         * belongs to, so put the two back together */
+        PRTE_OOB_TCP_HDR_PROC(&hdr, hdr.origin, &sender);
+        if (NULL == (peer = prte_oob_tcp_peer_lookup(&sender))) {
             /* should never happen */
             goto cleanup;
         }
@@ -677,7 +729,7 @@ static void recv_handler(int sd, short flg, void *cbdata)
                             "%s-%s prte_oob_tcp_recv_connect: "
                             "rejected connection from %s connection state %d",
                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(&(peer->name)),
-                            PRTE_NAME_PRINT(&(hdr.origin)), peer->state);
+                            PRTE_NAME_PRINT(&sender), peer->state);
             }
             CLOSE_THE_SOCKET(sd);
         }
@@ -692,8 +744,8 @@ cleanup:
  * (a.b.c.d/e), resolve them to an interface name (Currently only
  * supporting IPv4).  If unresolvable, warn and remove.
  */
-static void split_and_resolve(char **orig_str, char *name,
-                              char ***interfaces)
+void prte_oob_split_and_resolve(char **orig_str, char *name,
+                                char ***interfaces)
 {
     pmix_pif_t *selected_interface;
     int i, n, ret, match_count;
@@ -708,7 +760,16 @@ static void split_and_resolve(char **orig_str, char *name,
         return;
     }
 
-    argv = PMIX_ARGV_SPLIT_COMPAT(*orig_str, ',');
+    /* If there is no list to collect into, then there is nothing to
+     * resolve against and nothing for the caller to consult afterwards -
+     * just discard the specification */
+    if (NULL == interfaces) {
+        free(*orig_str);
+        *orig_str = NULL;
+        return;
+    }
+
+    argv = PMIx_Argv_split(*orig_str, ',');
     if (NULL == argv) {
         return;
     }
@@ -716,9 +777,9 @@ static void split_and_resolve(char **orig_str, char *name,
         if (isalpha(argv[i][0])) {
             /* This is an interface name. If not already in the interfaces array, add it */
             found = false;
-            if (NULL != interfaces) {
-                for (n = 0; NULL != interfaces[n]; n++) {
-                    if (0 == strcmp(argv[i], *interfaces[n])) {
+            if (NULL != *interfaces) {
+                for (n = 0; NULL != (*interfaces)[n]; n++) {
+                    if (0 == strcmp(argv[i], (*interfaces)[n])) {
                         found = true;
                         break;
                     }
@@ -728,7 +789,7 @@ static void split_and_resolve(char **orig_str, char *name,
                 pmix_output_verbose(20,
                                     prte_oob_base.output,
                                     "oob:tcp: Using interface: %s ", argv[i]);
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(interfaces, argv[i]);
+                PMIx_Argv_append_nosize(interfaces, argv[i]);
             }
             continue;
         }
@@ -739,10 +800,9 @@ static void split_and_resolve(char **orig_str, char *name,
         tmp = strdup(argv[i]);
         str = strchr(argv[i], '/');
         if (NULL == str) {
-            pmix_show_help("help-oob-tcp.txt", "invalid if_inexclude",
+            prte_show_help("help-oob-tcp.txt", "invalid if_inexclude",
                            true, name, prte_process_info.nodename,
                            tmp, "Invalid specification (missing \"/\")");
-            free(argv[i]);
             free(tmp);
             continue;
         }
@@ -753,10 +813,9 @@ static void split_and_resolve(char **orig_str, char *name,
         ((struct sockaddr*) &argv_inaddr)->sa_family = AF_INET;
         ret = inet_pton(AF_INET, argv[i],
                         &((struct sockaddr_in*) &argv_inaddr)->sin_addr);
-        free(argv[i]);
 
         if (1 != ret) {
-            pmix_show_help("help-oob-tcp.txt", "invalid if_inexclude",
+            prte_show_help("help-oob-tcp.txt", "invalid if_inexclude",
                            true, name, prte_process_info.nodename, tmp,
                            "Invalid specification (inet_pton() failed)");
             free(tmp);
@@ -769,14 +828,21 @@ static void split_and_resolve(char **orig_str, char *name,
                             pmix_net_get_hostname((struct sockaddr*) &argv_inaddr),
                             argv_prefix);
 
-        /* Go through all interfaces and see if we can find a match */
+        /* Go through all interfaces and see if we can find a match.
+         *
+         * Compare against each entry's own address, not the one
+         * pmix_ifkindextoaddr() returns for its kernel index: an interface
+         * carrying both an IPv4 and an IPv6 address appears in the list
+         * once per address, and both entries share a kernel index, so that
+         * lookup answers with whichever entry the kernel reported first.
+         * On Linux that is routinely the IPv6 one (loopback always), and
+         * an IPv4 subnet then fails to match the very interface it names.
+         */
         match_count = 0;
         PMIX_LIST_FOREACH(selected_interface, &pmix_if_list, pmix_pif_t) {
-            ret = pmix_ifkindextoaddr(selected_interface->if_kernel_index,
-                                     (struct sockaddr*) &if_inaddr,
-                                     sizeof(if_inaddr));
-            if (PMIX_SUCCESS == ret &&
-                pmix_net_samenetwork((struct sockaddr_storage*) &argv_inaddr,
+            memcpy(&if_inaddr, &selected_interface->if_addr,
+                   MIN(sizeof(if_inaddr), sizeof(selected_interface->if_addr)));
+            if (pmix_net_samenetwork((struct sockaddr_storage*) &argv_inaddr,
                                      (struct sockaddr_storage*) &if_inaddr,
                                      argv_prefix)) {
                 /* We found a match. If it's not already in the interfaces array,
@@ -784,9 +850,9 @@ static void split_and_resolve(char **orig_str, char *name,
                 match_count = match_count + 1;
                 pmix_ifkindextoname(selected_interface->if_kernel_index, if_name, sizeof(if_name));
                 found = false;
-                if (NULL != interfaces) {
-                    for (n = 0; NULL != interfaces[n]; n++) {
-                        if (0 == strcmp(if_name, *interfaces[n])) {
+                if (NULL != *interfaces) {
+                    for (n = 0; NULL != (*interfaces)[n]; n++) {
+                        if (0 == strcmp(if_name, (*interfaces)[n])) {
                             found = true;
                             break;
                         }
@@ -798,13 +864,13 @@ static void split_and_resolve(char **orig_str, char *name,
                                         "oob:tcp: Found match: %s (%s)",
                                         pmix_net_get_hostname((struct sockaddr*) &if_inaddr),
                                         if_name);
-                    PMIX_ARGV_APPEND_NOSIZE_COMPAT(interfaces, if_name);
+                    PMIx_Argv_append_nosize(interfaces, if_name);
                 }
             }
         }
         /* If we didn't find a match, keep trying */
         if (0 == match_count) {
-            pmix_show_help("help-oob-tcp.txt", "invalid if_inexclude",
+            prte_show_help("help-oob-tcp.txt", "invalid if_inexclude",
                            true, name, prte_process_info.nodename, tmp,
                            "Did not find interface matching this subnet");
             free(tmp);
@@ -815,13 +881,9 @@ static void split_and_resolve(char **orig_str, char *name,
     }
 
     // cleanup and construct output string
-    free(argv);
+    PMIx_Argv_free(argv);
     free(*orig_str);
-    if (NULL != interfaces) {
-        *orig_str = PMIX_ARGV_JOIN_COMPAT(*interfaces, ',');
-    } else {
-        *orig_str = NULL;
-    }
+    *orig_str = PMIx_Argv_join(*interfaces, ',');
     return;
 }
 

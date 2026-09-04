@@ -35,6 +35,7 @@
 
 #include "src/util/proc_info.h"
 
+#include "src/mca/common/slurm/common_slurm.h"
 #include "src/mca/ess/ess.h"
 #include "src/mca/ess/slurm/ess_slurm.h"
 
@@ -45,7 +46,7 @@ extern prte_ess_base_module_t prte_ess_slurm_module;
  * and pointers to our public functions in it
  */
 prte_ess_base_component_t prte_mca_ess_slurm_component = {
-    PRTE_ESS_BASE_VERSION_3_0_0,
+    PRTE_MCA_BASE_VERSION(ess),
 
     /* Component name and version */
     .pmix_mca_component_name = "slurm",
@@ -74,7 +75,7 @@ int prte_mca_ess_slurm_component_query(pmix_mca_base_module_t **module, int *pri
      * by mpirun in a slurm world, so make ourselves available
      */
 
-    if (PRTE_PROC_IS_DAEMON && NULL != getenv("SLURM_JOBID")
+    if (PRTE_PROC_IS_DAEMON && NULL != prte_common_slurm_jobid()
         && NULL != prte_process_info.my_hnp_uri) {
         *priority = 50;
         *module = (pmix_mca_base_module_t *) &prte_ess_slurm_module;

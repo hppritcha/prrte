@@ -1,0 +1,23 @@
+# $COPYRIGHT$
+# Additional copyrights may follow
+# $HEADER$
+
+SUBDIRS = rmaps runtime errmgr ess event filem grpcomm hwloc include odls iof plm pmix prted rml ras schizo state tools util
+
+# Source scans rather than programs, so they are distributed as-is and
+# need no configure substitution - see the header of each script.
+# check_static_init.pl is kept identical to the copy in PMIx
+# (test/unit/check_static_init.pl); fix one and copy it across rather
+# than letting the two drift.
+# check_ctor_coverage.py is kept identical to the copy in PMIx
+# (test/unit/check_ctor_coverage.py); fix one and copy it across rather
+# than letting the two drift.  Their baselines differ, being records of
+# two different code bases, and are not interchangeable.
+dist_check_SCRIPTS = check_static_init.pl check_query_authority.py \
+                     check_ctor_coverage.py
+
+# check_ctor_coverage.py reads its baseline from the source directory, so it
+# has to travel with the script rather than only being in the repository.
+EXTRA_DIST = ctor_coverage_baseline.txt
+
+TESTS = check_static_init.pl check_query_authority.py check_ctor_coverage.py

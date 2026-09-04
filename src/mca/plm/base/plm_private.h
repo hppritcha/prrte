@@ -15,7 +15,7 @@
  * Copyright (c) 2017-2019 Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -57,25 +57,18 @@ typedef struct {
     char *base_nspace;
     /* next jobid */
     uint32_t next_jobid;
-    /* time when daemons started launch */
-    struct timeval daemonlaunchstart;
-    /* tree spawn cmd */
-    pmix_data_buffer_t tree_spawn_cmd;
     /* daemon nodes assigned at launch */
     bool daemon_nodes_assigned_at_launch;
+    /* include MCA params found in our environment on the prted cmd line.
+     * Set false by a component (e.g., ssh, via plm_ssh_pass_environ_mca_params)
+     * when the resulting command line would be too long for the launcher */
+    bool pass_environ_mca_params;
     size_t node_regex_threshold;
-    pmix_list_t daemon_cache;
-    bool daemon1_has_reported;
 } prte_plm_globals_t;
 /**
  * Global instance of PLM framework data
  */
 PRTE_EXPORT extern prte_plm_globals_t prte_plm_globals;
-
-/**
- * Utility routine to set progress engine schedule
- */
-PRTE_EXPORT int prte_plm_base_set_progress_sched(int sched);
 
 /*
  * Launch support
@@ -86,24 +79,50 @@ PRTE_EXPORT void prte_plm_base_daemon_callback(int status, pmix_proc_t *sender,
 PRTE_EXPORT void prte_plm_base_daemon_failed(int status, pmix_proc_t *sender,
                                              pmix_data_buffer_t *buffer, prte_rml_tag_t tag,
                                              void *cbdata);
-PRTE_EXPORT void prte_plm_base_daemon_topology(int status, pmix_proc_t *sender,
-                                               pmix_data_buffer_t *buffer, prte_rml_tag_t tag,
-                                               void *cbdata);
 PRTE_EXPORT void prte_plm_base_stack_trace_recv(int status, pmix_proc_t *sender,
                                                 pmix_data_buffer_t *buffer,
                                                 prte_rml_tag_t tag, void *cbdata);
 
 PRTE_EXPORT int prte_plm_base_create_jobid(prte_job_t *jdata);
 PRTE_EXPORT int prte_plm_base_set_hnp_name(void);
-PRTE_EXPORT void prte_plm_base_reset_job(prte_job_t *jdata);
 PRTE_EXPORT int prte_plm_base_setup_prted_cmd(int *argc, char ***argv);
-PRTE_EXPORT void prte_plm_base_check_all_complete(int fd, short args, void *cbdata);
 PRTE_EXPORT int prte_plm_base_setup_virtual_machine(prte_job_t *jdata);
+PRTE_EXPORT void prte_plm_base_fence_release(void);
+PRTE_EXPORT void prte_plm_base_abort_premap_held(void);
+PRTE_EXPORT void prte_plm_base_grow_drain(bool success);
+PRTE_EXPORT bool prte_plm_base_grow_target_failed(pmix_rank_t rank);
+PRTE_EXPORT void prte_plm_base_reset_dvm_node(prte_node_t *node);
+PRTE_EXPORT bool prte_plm_base_job_needs_remap(prte_job_t *jdata);
+PRTE_EXPORT void prte_plm_base_reset_proc_map(prte_job_t *jdata);
+/* Record a requester for the NEXT grow campaign to answer.  A grow normally
+ * resolves its requesters from the session that owns the nodes it launches
+ * on; an activation creates no session (it names nodes the allocation already
+ * held), so its requester is carried here from the moment the request is
+ * granted until a campaign exists to answer it.  Only worth calling where a
+ * campaign is expected - i.e. in elastic mode - though an entry no campaign
+ * adopts is answered rather than stranded. */
+PRTE_EXPORT int prte_plm_base_add_grow_requester(const pmix_proc_t *requester,
+                                                 const char *alloc_id,
+                                                 const char *req_id);
+
+/* Answer, with failure, every requester still waiting for a campaign that
+ * will now never be recorded.  Called when the framework closes. */
+PRTE_EXPORT void prte_plm_base_flush_grow_requesters(void);
+
+/* emit the spec's phase-two completion event to the size-change requester:
+ * PMIX_DVM_IS_READY when success, else PMIX_ERR_DVM_MOD carrying `cause`.
+ * Compiles to a no-op when PMIx lacks the DVM modification event codes. */
+PRTE_EXPORT void prte_plm_base_dvm_mod_notify(const pmix_proc_t *requester,
+                                              const char *alloc_id,
+                                              const char *req_id,
+                                              bool success,
+                                              pmix_status_t cause);
 
 /**
  * Utilities for plm components that use proxy daemons
  */
 PRTE_EXPORT int prte_plm_base_prted_exit(prte_daemon_cmd_flag_t command);
+PRTE_EXPORT int prte_plm_base_prted_exit_late(const pmix_proc_t *daemon);
 PRTE_EXPORT int prte_plm_base_prted_terminate_job(pmix_nspace_t jobid);
 PRTE_EXPORT int prte_plm_base_prted_kill_local_procs(pmix_pointer_array_t *procs);
 PRTE_EXPORT int prte_plm_base_prted_signal_local_procs(pmix_nspace_t job, int32_t signal);
@@ -121,14 +140,6 @@ PRTE_EXPORT void prte_plm_base_recv(int status, pmix_proc_t *sender, pmix_data_b
  */
 PRTE_EXPORT int prte_plm_base_prted_append_basic_args(int *argc, char ***argv, char *ess_module,
                                                       int *proc_vpid_index);
-
-/*
- * Proxy functions for use by daemons and application procs
- * needing dynamic operations
- */
-PRTE_EXPORT int prte_plm_proxy_init(void);
-PRTE_EXPORT int prte_plm_proxy_spawn(prte_job_t *jdata);
-PRTE_EXPORT int prte_plm_proxy_finalize(void);
 
 END_C_DECLS
 

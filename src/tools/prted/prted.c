@@ -19,7 +19,7 @@
  * Copyright (c) 2013-2020 Intel, Inc.  All rights reserved.
  * Copyright (c) 2015-2019 Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * Copyright (c) 2022      Triad National Security, LLC. All rights
  *                         reserved.
  * $COPYRIGHT$
@@ -85,11 +85,11 @@
 #include "src/util/proc_info.h"
 #include "src/util/session_dir.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 
 #include "src/mca/errmgr/errmgr.h"
 #include "src/mca/ess/base/base.h"
-#include "src/mca/grpcomm/base/base.h"
-#include "src/mca/grpcomm/grpcomm.h"
+#include "src/grpcomm/grpcomm.h"
 #include "src/mca/odls/base/base.h"
 #include "src/mca/plm/plm.h"
 #include "src/mca/ras/ras.h"
@@ -128,33 +128,6 @@ static bool node_regex_waiting = false;
 static char *prte_parent_uri = NULL;
 static pmix_cli_result_t results;
 
-typedef struct {
-    prte_pmix_lock_t lock;
-    pmix_info_t *info;
-    size_t ninfo;
-} myxfer_t;
-
-static void infocbfunc(pmix_status_t status, pmix_info_t *info, size_t ninfo, void *cbdata,
-                       pmix_release_cbfunc_t release_fn, void *release_cbdata)
-{
-    myxfer_t *xfer = (myxfer_t *) cbdata;
-    size_t n;
-    PRTE_HIDE_UNUSED_PARAMS(status);
-
-    if (NULL != info) {
-        xfer->ninfo = ninfo;
-        PMIX_INFO_CREATE(xfer->info, xfer->ninfo);
-        for (n = 0; n < ninfo; n++) {
-            PMIX_INFO_XFER(&xfer->info[n], &info[n]);
-        }
-    }
-
-    if (NULL != release_fn) {
-        release_fn(release_cbdata);
-    }
-    PRTE_PMIX_WAKEUP_THREAD(&xfer->lock);
-}
-
 static int wait_pipe[2];
 
 static int wait_dvm(pid_t pid)
@@ -187,10 +160,8 @@ int main(int argc, char *argv[])
     pmix_value_t val;
     pmix_proc_t proc;
     pmix_status_t prc;
-    myxfer_t xfer;
-    pmix_data_buffer_t pbuf, *wbuf;
+    pmix_data_buffer_t *wbuf;
     pmix_byte_object_t pbo;
-    int8_t flag;
     char **nonlocal, *aliases, *personality;
     int n;
     pmix_value_t *vptr;
@@ -199,12 +170,18 @@ int main(int argc, char *argv[])
     prte_schizo_base_module_t *schizo;
     pmix_cli_item_t *opt;
     prte_job_t *jdata;
+    pmix_data_buffer_t data;
+    pmix_topology_t ptopo;
+    bool compressed;
+    bool bootstrap_controller = false;
 
     char *umask_str = getenv("PRTE_DAEMON_UMASK_VALUE");
     if (NULL != umask_str) {
-        char *endptr;
-        long mask = strtol(umask_str, &endptr, 8);
-        if ((!(0 == mask && (EINVAL == errno || ERANGE == errno))) && (*endptr == '\0')) {
+        mode_t mask;
+        /* an unparsable value is ignored, not obeyed - reading an empty
+         * or malformed string as 0 would leave every file we create
+         * world-writable */
+        if (prte_parse_umask(umask_str, &mask)) {
             umask(mask);
         }
     }
@@ -212,6 +189,7 @@ int main(int argc, char *argv[])
     /* ensure we aren't misdirected on choice of proxy since
      * some environments forward their envars */
     unsetenv("PRTE_MCA_schizo_proxy");
+    unsetenv("PRTE_MCA_personality");
 
     /* initialize the globals */
     PMIX_DATA_BUFFER_CREATE(bucket);
@@ -230,40 +208,67 @@ int main(int argc, char *argv[])
     for (i=0; NULL != environ[i]; i++) {
         if (0 != strncmp(environ[i], "PMIX_", 5) &&
             0 != strncmp(environ[i], "PRTE_", 5)) {
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&prte_launch_environ, environ[i]);
+            PMIx_Argv_append_nosize(&prte_launch_environ, environ[i]);
         }
     }
 
-    ret = prte_init_minimum();
-    if (PRTE_SUCCESS != ret) {
-        return ret;
-    }
-
-    /* we always need the prrte and pmix params */
+    /* we always need the prrte and pmix params.  Every failure from here
+     * until we have a runtime exits with 1: main() hands the shell the low
+     * eight bits of what it returns, so a PRRTE error code would arrive as
+     * a meaningless 251 or 255 */
     ret = prte_schizo_base_parse_prte(pargc, 0, pargv, NULL);
     if (PRTE_SUCCESS != ret) {
-        return ret;
+        return 1;
     }
 
     ret = prte_schizo_base_parse_pmix(pargc, 0, pargv, NULL);
     if (PRTE_SUCCESS != ret) {
-        return ret;
+        return 1;
     }
 
-    /* init the tiny part of PRTE we initially use */
-    prte_init_util(PRTE_PROC_DAEMON);
+    /* A bootstrapping daemon must publish the DVM-wide MCA parameters (ports,
+     * address family, networks, radix, retry/heal timers, ...) BEFORE they are
+     * first registered - an MCA variable reads its environment only at that
+     * first registration, which happens inside prte_init_util.  We detect
+     * --bootstrap directly from the argument vector here, ahead of the CLI
+     * parse, and record it; prte_init_util runs the parameter-publishing phase
+     * itself once the install directories (and thus the config-file path) are
+     * known.  Identity resolution needs the hostname and is deferred to
+     * prte_ess_base_bootstrap() below. */
+    for (i = 0; NULL != pargv[i]; i++) {
+        if (0 == strcmp(pargv[i], "--" PRTE_CLI_BOOTSTRAP)) {
+            prte_bootstrap_setup = true;
+            /* A bootstrapped DVM is persistent by construction: its daemons
+             * are started independently and stand waiting for work.  There
+             * is also no launcher to tell us so - the HNP appends
+             * prte_persistent to the command lines it builds, and nobody
+             * built ours.  Set it here, ahead of prte_register_params(),
+             * which takes the current value as the parameter's default and
+             * so leaves this in place unless someone overrides it. */
+            prte_persistent = true;
+            break;
+        }
+    }
+
+    /* init the tiny part of PRTE we initially use.  Every later step -
+     * schizo, the CLI parse, prte_init - assumes the install dirs and
+     * the output system this establishes */
+    ret = prte_init_util(PRTE_PROC_DAEMON);
+    if (PRTE_SUCCESS != ret) {
+        return 1;
+    }
 
     /* open the SCHIZO framework */
     ret = pmix_mca_base_framework_open(&prte_schizo_base_framework,
                                        PMIX_MCA_BASE_OPEN_DEFAULT);
     if (PRTE_SUCCESS != ret) {
         PRTE_ERROR_LOG(ret);
-        return ret;
+        return 1;
     }
 
     if (PRTE_SUCCESS != (ret = prte_schizo_base_select())) {
         PRTE_ERROR_LOG(ret);
-        return ret;
+        return 1;
     }
 
     /* look for any personality specification */
@@ -278,7 +283,7 @@ int main(int argc, char *argv[])
     /* get our schizo module */
     schizo = prte_schizo_base_detect_proxy(personality);
     if (NULL == schizo) {
-        pmix_show_help("help-schizo-base.txt", "no-proxy", true, prte_tool_basename, personality);
+        prte_show_help("help-schizo-base.txt", "no-proxy", true, prte_tool_basename, personality);
         return 1;
     }
 
@@ -293,13 +298,24 @@ int main(int argc, char *argv[])
             fprintf(stderr, "%s: command line error (%s)\n", prte_tool_basename,
                     prte_strerror(ret));
         }
-        return ret;
+        return 1;
+    }
+
+    /* second bootstrap phase: now that init_util has established our hostname,
+     * resolve our identity within the DVM and learn whether we are the
+     * controller.  The parameter-publishing phase already ran ahead of
+     * prte_init_util (see above); prte_bootstrap_setup records that. */
+    if (prte_bootstrap_setup) {
+        ret = prte_ess_base_bootstrap(&bootstrap_controller);
+        if (PRTE_SUCCESS != ret) {
+            return 1;
+        }
     }
 
     /* Register all global MCA Params */
     if (PRTE_SUCCESS != (ret = prte_register_params())) {
         if (PRTE_ERR_SILENT != ret) {
-            pmix_show_help("help-prte-runtime", "prte_init:startup:internal-failure", true,
+            prte_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true,
                            "prte register params",
                            PRTE_ERROR_NAME(ret), ret);
         }
@@ -315,9 +331,6 @@ int main(int argc, char *argv[])
     }
 
     /* check for debug options */
-    if (pmix_cmd_line_is_taken(&results, PRTE_CLI_DEBUG)) {
-        prte_debug_flag = true;
-    }
     if (pmix_cmd_line_is_taken(&results, PRTE_CLI_DEBUG_DAEMONS)) {
         prte_debug_daemons_flag = true;
     }
@@ -328,9 +341,9 @@ int main(int argc, char *argv[])
         prte_leave_session_attached = true;
     }
 
-    // check for hetero nodes
-    if (pmix_cmd_line_is_taken(&results, PRTE_CLI_HETERO_NODES)) {
-        prte_hetero_nodes = true;
+    // check for homo nodes
+    if (pmix_cmd_line_is_taken(&results, PRTE_CLI_HOMO_NODES)) {
+        prte_homo_nodes = true;
     }
 
     /* if prte_daemon_debug is set, let someone know we are alive right
@@ -341,10 +354,29 @@ int main(int argc, char *argv[])
                 prte_process_info.nodename);
     }
 
-    /* detach from controlling terminal
-     * otherwise, remain attached so output can get to us
+    /* Detach from the controlling terminal - but ONLY if our launcher said
+     * to.  Forking and calling setsid() leaves the process the launcher is
+     * tracking behind: our parent exits as soon as we signal we are up, and
+     * whether that is a favor or a fatal mistake depends entirely on who
+     * launched us.  plm/ssh wants it (the ssh session closes and its
+     * concurrency slot frees for the next group), and says so with
+     * --daemonize.  A resource manager does NOT: srun, lsb_launch and palsd
+     * each hand us a task slot and watch the process they started, so the
+     * detach tells the RM the task finished.  Under Slurm that ends the step,
+     * and slurmstepd then SIGKILLs everything still in the step's cgroup -
+     * which includes us, because setsid() escapes a process tree and not a
+     * cgroup.  Those launchers therefore withhold --daemonize and we stay put.
+     *
+     * A bootstrapped daemon has no launcher at all - it is started by hand
+     * or by a service manager on every node - so nothing is tracking it and
+     * it detaches as it always has.
+     *
+     * --leave-session-attached and --debug-daemons override in the other
+     * direction: they exist so the daemon's output reaches the user, and a
+     * fork to /dev/null would defeat them.
      */
-    if (!prte_leave_session_attached && !prte_debug_daemons_flag) {
+    if ((pmix_cmd_line_is_taken(&results, PRTE_CLI_DAEMONIZE) || prte_bootstrap_setup) &&
+        !prte_leave_session_attached && !prte_debug_daemons_flag) {
         if (0 > pipe(wait_pipe)) {
             return PRTE_ERROR;
         }
@@ -352,6 +384,14 @@ int main(int argc, char *argv[])
         prte_daemon_init_callback(NULL, wait_dvm);
         close(wait_pipe[0]);
     } else {
+        if (!prte_leave_session_attached && !prte_debug_daemons_flag) {
+            /* we are staying in our launcher's process, but that is no reason
+             * to write on its terminal - take the half of the daemonization
+             * that only silences us */
+            if (PRTE_SUCCESS != prte_daemon_detach_io()) {
+                return PRTE_ERROR;
+            }
+        }
         // the daemon_init_callback fn already setsid, so don't
         // do it twice!
     #if defined(HAVE_SETSID)
@@ -363,21 +403,22 @@ int main(int argc, char *argv[])
     }
 
     /* ensure we silence any compression warnings */
-    PMIX_SETENV_COMPAT("PMIX_MCA_compress_base_silence_warning", "1", true, &environ);
+    PMIx_Setenv("PMIX_MCA_compress_base_silence_warning", "1", true, &environ);
 
-    /* check for bootstrap operation */
-    if (pmix_cmd_line_is_taken(&results, PRTE_CLI_BOOTSTRAP)) {
-        /* fill in our procID and other information
-         * from the configuration file */
-        ret = prte_ess_base_bootstrap();
-        if (PRTE_SUCCESS != ret) {
-            return ret;
-        }
+    /* A bootstrapped daemon that discovered it is running on the controller
+     * host promotes itself to the HNP.  prte_init_util() already ran (from the
+     * early parameter phase) and stamped our proc_type as DAEMON; because
+     * prte_init() will find prte_init_util already initialized and skip the
+     * proc_type assignment, we must upgrade proc_type to MASTER here so the ess
+     * framework selects the HNP module rather than the daemon module. */
+    if (bootstrap_controller) {
+        prte_process_info.proc_type = PRTE_PROC_MASTER;
     }
-
-    if (PRTE_SUCCESS != (ret = prte_init(&argc, &argv, PRTE_PROC_DAEMON))) {
+    if (PRTE_SUCCESS != (ret = prte_init(&argc, &argv,
+                                         bootstrap_controller ? PRTE_PROC_MASTER
+                                                              : PRTE_PROC_DAEMON))) {
         PRTE_ERROR_LOG(ret);
-        return ret;
+        return 1;
     }
     // get the daemon job object
     jdata = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
@@ -403,7 +444,7 @@ int main(int argc, char *argv[])
                 core = strtoul(cores[i], NULL, 10);
                 if (NULL == (pu = prte_hwloc_base_get_pu(prte_hwloc_topology, false, core))) {
                     /* the message will now come out locally */
-                    pmix_show_help("help-prted.txt", "orted:cannot-bind", true,
+                    prte_show_help("help-prted.txt", "orted:cannot-bind", true,
                                    prte_process_info.nodename, prte_daemon_cores);
                     ret = PRTE_ERR_NOT_SUPPORTED;
                     hwloc_bitmap_free(ours);
@@ -426,7 +467,7 @@ int main(int argc, char *argv[])
             /* cleanup */
             hwloc_bitmap_free(ours);
             hwloc_bitmap_free(res);
-            PMIX_ARGV_FREE_COMPAT(cores);
+            PMIx_Argv_free(cores);
         }
     }
 
@@ -444,16 +485,17 @@ int main(int argc, char *argv[])
                 pmix_output(0, "%s is executing clean abnormal termination",
                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME));
 
-                /* do -not- call finalize as this will send a message to the HNP
-                 * indicating clean termination! Instead, just forcibly cleanup
-                 * the local session_dir tree and exit
+                /* do -not- call finalize as this will send a message to the
+                 * HNP indicating clean termination! Instead, just forcibly
+                 * cleanup the local session_dir tree and exit.  Releasing
+                 * the daemon job removes it from the global array and takes
+                 * its session directory with it, so we must not then fall
+                 * into the DONE path - that runs prte_finalize, which is
+                 * exactly what this branch exists to avoid.
                  */
-                jdata = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
+                prte_finalizing = true;
                 PMIX_RELEASE(jdata);
-
-                /* return with non-zero status */
-                ret = PRTE_ERROR_DEFAULT_EXIT_CODE;
-                goto DONE;
+                exit(PRTE_ERROR_DEFAULT_EXIT_CODE);
             }
         }
     }
@@ -461,14 +503,35 @@ int main(int argc, char *argv[])
     /* setup the primary daemon command receive function */
     PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_DAEMON,
                   PRTE_RML_PERSISTENT, prte_daemon_recv, NULL);
+    /* The launch message rides its own tag so grpcomm can tell it apart from
+     * the commands, but it is the same command stream and the same handler -
+     * prte_daemon_recv ignores the tag it was delivered on. */
+    PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_DAEMON_LAUNCH,
+                  PRTE_RML_PERSISTENT, prte_daemon_recv, NULL);
+    /* The half of the launch message addressed to us alone: the bindings
+     * of the procs we are about to fork. */
+    PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_LAUNCH_SLICE,
+                  PRTE_RML_PERSISTENT, prte_odls_base_recv_cpuset_slice, NULL);
 
     /* output a message indicating we are alive, our name, and our pid
      * for debugging purposes
      */
-    if (prte_debug_flag) {
+    if (prte_debug_daemons_flag) {
         fprintf(stderr, "Daemon %s checking in as pid %ld on host %s\n",
                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), (long) prte_process_info.pid,
                 prte_process_info.nodename);
+    }
+
+    if (bootstrap_controller) {
+        /* We are the self-promoted DVM controller (HNP).  The daemons were
+         * started independently on every node and are already phoning home, so
+         * we do NOT perform the daemon report-back sequence below.  Instead we
+         * drive the HNP state machine: ALLOCATE loads the configured node list
+         * into the pool (ras/bootstrap), and prte_plm_base_allocation_complete
+         * then builds the virtual machine and waits for the running daemons to
+         * report in.  Once all have reported, the DVM reaches VM_READY. */
+        PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_ALLOCATE);
+        goto bootstrap_wait;
     }
 
     /* add the DVM master's URI to our info */
@@ -492,6 +555,20 @@ int main(int argc, char *argv[])
                                       "URI for the parent if tree launch is enabled.",
                                       PMIX_MCA_BASE_VAR_TYPE_STRING,
                                       &prte_parent_uri);
+    /* In a bootstrapped DVM there is no launcher to hand us a parent URI, and in
+     * a deep radix tree our parent is another daemon whose contact info no
+     * nidmap has yet delivered.  prte_init has by now built the routing tree and
+     * set PRTE_PROC_MY_PARENT->rank, so synthesize the parent's URI from the
+     * configuration exactly as we did the controller's.  For a flat tree the
+     * parent is the HNP (already stored above), so this is skipped. */
+    if (prte_bootstrap_setup && NULL == prte_parent_uri &&
+        PRTE_PROC_MY_PARENT->rank != PRTE_PROC_MY_HNP->rank) {
+        ret = prte_ess_base_bootstrap_peer_uri(PRTE_PROC_MY_PARENT->rank, &prte_parent_uri);
+        if (PRTE_SUCCESS != ret) {
+            PRTE_ERROR_LOG(ret);
+            goto DONE;
+        }
+    }
     if (NULL != prte_parent_uri) {
         /* set the contact info into our local database */
         ret = prte_rml_parse_uris(prte_parent_uri, PRTE_PROC_MY_PARENT, NULL);
@@ -516,6 +593,18 @@ int main(int argc, char *argv[])
     /* setup the rollup callback */
     PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_PRTED_CALLBACK,
                   PRTE_RML_PERSISTENT, rollup, NULL);
+
+    /* In a bootstrapped DVM, announce our appearance one hop up to our parent.
+     * On a first boot the parent finds our rank live and drops the notice, so
+     * the root is never involved; if our node had left and rebooted, the parent
+     * (which had us marked absent) escalates to the HNP, which broadcasts a
+     * revival so the DVM re-inserts us into the routing tree (the unheal path).
+     * Only bootstrap daemons do this -- launched daemons cannot return with
+     * their original vpid, so nothing revives them. The controller took the
+     * bootstrap_wait branch above and never reaches here. */
+    if (prte_bootstrap_setup) {
+        prte_rml_send_return_notice();
+    }
 
     if (prte_static_ports || NULL != prte_parent_uri) {
         /* since we will be waiting for any children to send us
@@ -548,6 +637,7 @@ int main(int argc, char *argv[])
     if (PMIX_SUCCESS != prc) {
         PMIX_ERROR_LOG(prc);
         PMIX_DATA_BUFFER_RELEASE(buffer);
+        ret = PRTE_ERROR;
         goto DONE;
     }
 
@@ -556,9 +646,41 @@ int main(int argc, char *argv[])
     if (PMIX_SUCCESS != prc) {
         PMIX_ERROR_LOG(prc);
         PMIX_DATA_BUFFER_RELEASE(buffer);
+        ret = PRTE_ERROR;
         goto DONE;
     }
     prc = PMIx_Data_pack(NULL, buffer, &vptr->data.string, 1, PMIX_STRING);
+    PMIX_VALUE_RELEASE(vptr);
+    if (PMIX_SUCCESS != prc) {
+        PMIX_ERROR_LOG(prc);
+        ret = PRTE_ERROR;
+        PMIX_DATA_BUFFER_RELEASE(buffer);
+        goto DONE;
+    }
+
+    /* include our PMIx server's rendezvous URI. This is NOT how daemons
+     * reach each other - that is the RML's job, and the URI above is what
+     * it uses. This one exists solely so the master can answer a TOOL that
+     * asks "where is the PMIx server on node X?" (a hostname- or
+     * nodeid-qualified PMIX_SERVER_URI query - see pmix_server_queries.c
+     * and examples/tool.c). Only useful to a remote tool when the server
+     * was told to accept remote connections, but that is the requester's
+     * business, not ours.
+     *
+     * A PMIx that will not tell us our own server URI is not a reason to
+     * fail the launch - this is auxiliary information. Pack a NULL and let
+     * the master record nothing. */
+    vptr = NULL;
+    prc = PMIx_Get(&prte_process_info.myproc, PMIX_SERVER_URI, NULL, 0, &vptr);
+    if (PMIX_SUCCESS == prc && NULL != vptr && PMIX_STRING == vptr->type) {
+        prc = PMIx_Data_pack(NULL, buffer, &vptr->data.string, 1, PMIX_STRING);
+    } else {
+        char *nulluri = NULL;
+        prc = PMIx_Data_pack(NULL, buffer, &nulluri, 1, PMIX_STRING);
+    }
+    if (NULL != vptr) {
+        PMIX_VALUE_RELEASE(vptr);
+    }
     if (PMIX_SUCCESS != prc) {
         PMIX_ERROR_LOG(prc);
         ret = PRTE_ERROR;
@@ -571,6 +693,7 @@ int main(int argc, char *argv[])
     if (PMIX_SUCCESS != prc) {
         PMIX_ERROR_LOG(prc);
         PMIX_DATA_BUFFER_RELEASE(buffer);
+        ret = PRTE_ERROR;
         goto DONE;
     }
 
@@ -580,7 +703,7 @@ int main(int argc, char *argv[])
         if (0 != strcmp(prte_process_info.aliases[n], "localhost") &&
             0 != strcmp(prte_process_info.aliases[n], "127.0.0.1") &&
             0 != strcmp(prte_process_info.aliases[n], prte_process_info.nodename)) {
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&nonlocal, prte_process_info.aliases[n]);
+            PMIx_Argv_append_nosize(&nonlocal, prte_process_info.aliases[n]);
         }
     }
     if (NULL == nonlocal) {
@@ -593,25 +716,16 @@ int main(int argc, char *argv[])
     if (NULL != aliases) {
         free(aliases);
     }
-    PMIX_ARGV_FREE_COMPAT(nonlocal);
+    PMIx_Argv_free(nonlocal);
     if (PMIX_SUCCESS != prc) {
         PMIX_ERROR_LOG(prc);
         PMIX_DATA_BUFFER_RELEASE(buffer);
-        goto DONE;
-    }
-    prc = PMIx_Data_pack(NULL, buffer, &prte_topo_signature, 1, PMIX_STRING);
-    if (PMIX_SUCCESS != prc) {
-        PMIX_ERROR_LOG(prc);
-        PMIX_DATA_BUFFER_RELEASE(buffer);
+        ret = PRTE_ERROR;
         goto DONE;
     }
 
-    /* if we are rank=1 or designated as having hetero node, then send our
-     * topology back - otherwise, prte will request it if necessary */
-    if (1 == PRTE_PROC_MY_NAME->rank || prte_hetero_nodes) {
-        pmix_data_buffer_t data;
-        pmix_topology_t ptopo;
-        bool compressed;
+    if (!prte_homo_nodes || 1 == PRTE_PROC_MY_NAME->rank) {
+        /* send our topology back */
 
         /* setup an intermediate buffer */
         PMIX_DATA_BUFFER_CONSTRUCT(&data);
@@ -623,6 +737,7 @@ int main(int argc, char *argv[])
             PMIX_ERROR_LOG(prc);
             PMIX_DATA_BUFFER_RELEASE(buffer);
             PMIX_DATA_BUFFER_DESTRUCT(&data);
+            ret = PRTE_ERROR;
             goto DONE;
         }
         if (PMIx_Data_compress((uint8_t *) data.base_ptr, data.bytes_used, (uint8_t **) &pbo.bytes,
@@ -642,6 +757,7 @@ int main(int argc, char *argv[])
             PMIX_ERROR_LOG(prc);
             PMIX_DATA_BUFFER_RELEASE(buffer);
             PMIX_BYTE_OBJECT_DESTRUCT(&pbo);
+            ret = PRTE_ERROR;
             goto DONE;
         }
         /* pack the data */
@@ -650,68 +766,10 @@ int main(int argc, char *argv[])
             PMIX_ERROR_LOG(prc);
             PMIX_DATA_BUFFER_RELEASE(buffer);
             PMIX_BYTE_OBJECT_DESTRUCT(&pbo);
+            ret = PRTE_ERROR;
             goto DONE;
         }
         PMIX_BYTE_OBJECT_DESTRUCT(&pbo);
-    }
-
-    /* collect our network inventory */
-    memset(&xfer, 0, sizeof(myxfer_t));
-    PRTE_PMIX_CONSTRUCT_LOCK(&xfer.lock);
-    if (PMIX_SUCCESS != (prc = PMIx_server_collect_inventory(NULL, 0, infocbfunc, &xfer))) {
-        PMIX_ERROR_LOG(prc);
-        ret = PRTE_ERR_NOT_SUPPORTED;
-        goto DONE;
-    }
-    PRTE_PMIX_WAIT_THREAD(&xfer.lock);
-    if (NULL != xfer.info) {
-        /* pack a flag indicating that the inventory is included */
-        flag = 1;
-        prc = PMIx_Data_pack(NULL, buffer, &flag, 1, PMIX_INT8);
-        if (PMIX_SUCCESS != prc) {
-            PMIX_ERROR_LOG(prc);
-            PMIX_DATA_BUFFER_RELEASE(buffer);
-            goto DONE;
-        }
-        PMIX_DATA_BUFFER_CONSTRUCT(&pbuf);
-        if (PMIX_SUCCESS != (prc = PMIx_Data_pack(NULL, &pbuf, &xfer.ninfo, 1, PMIX_SIZE))) {
-            PMIX_ERROR_LOG(prc);
-            ret = PRTE_ERROR;
-            PMIX_DATA_BUFFER_RELEASE(buffer);
-            PMIX_DATA_BUFFER_DESTRUCT(&pbuf);
-            goto DONE;
-        }
-        if (PMIX_SUCCESS != (prc = PMIx_Data_pack(NULL, &pbuf, xfer.info, xfer.ninfo, PMIX_INFO))) {
-            PMIX_ERROR_LOG(prc);
-            ret = PRTE_ERROR;
-            PMIX_DATA_BUFFER_RELEASE(buffer);
-            PMIX_DATA_BUFFER_DESTRUCT(&pbuf);
-            goto DONE;
-        }
-        prc = PMIx_Data_unload(&pbuf, &pbo);
-        if (PMIX_SUCCESS != prc) {
-            PMIX_ERROR_LOG(prc);
-            PMIX_DATA_BUFFER_RELEASE(buffer);
-            PMIX_DATA_BUFFER_DESTRUCT(&pbuf);
-            goto DONE;
-        }
-        prc = PMIx_Data_pack(NULL, buffer, &pbo, 1, PMIX_BYTE_OBJECT);
-        if (PMIX_SUCCESS != prc) {
-            PMIX_ERROR_LOG(prc);
-            PMIX_DATA_BUFFER_RELEASE(buffer);
-            PMIX_DATA_BUFFER_DESTRUCT(&pbuf);
-            goto DONE;
-        }
-        PMIX_DATA_BUFFER_DESTRUCT(&pbuf);
-    } else {
-        /* pack a flag indicating no inventory was provided */
-        flag = 0;
-        prc = PMIx_Data_pack(NULL, buffer, &flag, 1, PMIX_INT8);
-        if (PMIX_SUCCESS != prc) {
-            PMIX_ERROR_LOG(prc);
-            PMIX_DATA_BUFFER_RELEASE(buffer);
-            goto DONE;
-        }
     }
 
     if (pmix_cmd_line_is_taken(&results, PRTE_CLI_TREE_SPAWN)) {
@@ -724,7 +782,7 @@ int main(int argc, char *argv[])
         }
     } else {
         /* send it to the HNP */
-        PRTE_RML_SEND(ret, PRTE_PROC_MY_HNP->rank, buffer, PRTE_RML_TAG_PRTED_CALLBACK);
+        PRTE_RML_RELIABLE_SEND(ret, PRTE_PROC_MY_HNP->rank, buffer, PRTE_RML_TAG_PRTED_CALLBACK);
         if (PRTE_SUCCESS != ret) {
             PRTE_ERROR_LOG(ret);
             PMIX_DATA_BUFFER_RELEASE(buffer);
@@ -752,7 +810,12 @@ int main(int argc, char *argv[])
         if (NULL != opt) {
             // cycle across found values
             for (i=0; NULL != opt->values[i]; i++) {
+                /* the CLI parser always hands us "name=value", but this
+                 * is a bare pointer deref if it ever does not */
                 char *t = strchr(opt->values[i], '=');
+                if (NULL == t) {
+                    continue;
+                }
                 *t = '\0';
                 ++t;
                 ignore = false;
@@ -764,9 +827,9 @@ int main(int argc, char *argv[])
                     }
                 }
                 if (!ignore) {
-                    PMIX_ARGV_APPEND_NOSIZE_COMPAT(&prted_cmd_line, "--"PRTE_CLI_PRTEMCA);
-                    PMIX_ARGV_APPEND_NOSIZE_COMPAT(&prted_cmd_line, opt->values[i]);
-                    PMIX_ARGV_APPEND_NOSIZE_COMPAT(&prted_cmd_line, t);
+                    PMIx_Argv_append_nosize(&prted_cmd_line, "--"PRTE_CLI_PRTEMCA);
+                    PMIx_Argv_append_nosize(&prted_cmd_line, opt->values[i]);
+                    PMIx_Argv_append_nosize(&prted_cmd_line, t);
                 }
                 --t;
                 *t = '=';
@@ -777,22 +840,35 @@ int main(int argc, char *argv[])
             // cycle across found values - we always pass PMIx values
             for (i=0; NULL != opt->values[i]; i++) {
                 char *t = strchr(opt->values[i], '=');
+                if (NULL == t) {
+                    continue;
+                }
                 *t = '\0';
                 ++t;
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&prted_cmd_line, "--"PRTE_CLI_PMIXMCA);
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&prted_cmd_line, opt->values[i]);
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&prted_cmd_line, t);
+                PMIx_Argv_append_nosize(&prted_cmd_line, "--"PRTE_CLI_PMIXMCA);
+                PMIx_Argv_append_nosize(&prted_cmd_line, opt->values[i]);
+                PMIx_Argv_append_nosize(&prted_cmd_line, t);
                 --t;
                 *t = '=';
             }
         }
     }
 
-    if (prte_debug_flag) {
+bootstrap_wait:
+    if (prte_debug_daemons_flag) {
         pmix_output(0, "%s prted: up and running - waiting for commands!",
                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME));
     }
     ret = PRTE_SUCCESS;
+
+    /* if we daemonized, then the parent from the fork is blocked
+     * waiting to hear that we are up and running - release it */
+    if (0 <= prte_state_base.parent_fd) {
+        char ok = 'K';
+        pmix_fd_write(prte_state_base.parent_fd, 1, &ok);
+        close(prte_state_base.parent_fd);
+        prte_state_base.parent_fd = -1;
+    }
 
     /* loop the event lib until an exit event is detected */
     while (prte_event_base_active) {
@@ -807,13 +883,23 @@ DONE:
     /* update the exit status, in case it wasn't done */
     PRTE_UPDATE_EXIT_STATUS(ret);
 
+    /* the rollup bucket is only consumed on the tree-spawn path, so on
+     * every other one it is still ours to release */
+    if (NULL != bucket) {
+        PMIX_DATA_BUFFER_RELEASE(bucket);
+    }
+    if (NULL != mybucket) {
+        PMIX_DATA_BUFFER_RELEASE(mybucket);
+    }
+    PMIX_DESTRUCT(&results);
+
     /* cleanup and leave */
     prte_finalize();
 
     /* cleanup the process info */
     prte_proc_info_finalize();
 
-    if (prte_debug_flag) {
+    if (prte_debug_daemons_flag) {
         fprintf(stderr, "exiting with status %d\n", prte_exit_status);
     }
     exit(prte_exit_status);
@@ -908,7 +994,7 @@ static void report_prted(void)
     int nreqd, ret;
 
     /* get the number of children */
-    nreqd = pmix_list_get_size(&prte_rml_base.children) + 1;
+    nreqd = prte_rml_base.n_children + 1;
     if (nreqd == ncollected && NULL != mybucket && !node_regex_waiting) {
         /* add the collection of our children's buckets to ours */
         ret = PMIx_Data_copy_payload(mybucket, bucket);
@@ -922,6 +1008,10 @@ static void report_prted(void)
         if (PRTE_SUCCESS != ret) {
             PRTE_ERROR_LOG(ret);
             PMIX_DATA_BUFFER_RELEASE(mybucket);
+        } else {
+            /* the RML owns it now - drop our reference so teardown does
+             * not release it a second time */
+            mybucket = NULL;
         }
     }
 }
@@ -941,8 +1031,13 @@ static void node_regex_report(int status, pmix_proc_t *sender, pmix_data_buffer_
 
     *active = false;
 
-    /* now launch any child daemons of ours */
-    prte_plm.remote_spawn();
+    /* now launch any child daemons of ours - but only if the active launcher
+     * spawns the tree recursively (e.g. ssh). In a bootstrapped DVM every
+     * daemon is started externally and wires itself in, so no plm is selected
+     * and remote_spawn is NULL; there is nothing for us to launch. */
+    if (NULL != prte_plm.remote_spawn) {
+        prte_plm.remote_spawn();
+    }
 
     report_prted();
 }

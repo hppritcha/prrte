@@ -19,7 +19,7 @@
  * Copyright (c) 2014-2019 Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2020      IBM Corporation.  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -40,12 +40,11 @@
 #include "src/util/pmix_output.h"
 
 #include "src/mca/errmgr/errmgr.h"
-#include "src/mca/grpcomm/base/base.h"
+#include "src/grpcomm/grpcomm.h"
 #include "src/mca/iof/base/base.h"
 #include "src/mca/iof/iof.h"
 #include "src/mca/plm/base/plm_private.h"
 #include "src/mca/plm/plm.h"
-#include "src/mca/plm/base/plm_private.h"
 #include "src/mca/rmaps/rmaps_types.h"
 #include "src/rml/rml.h"
 #include "src/mca/schizo/schizo.h"
@@ -191,7 +190,59 @@ pmix_status_t pmix_server_client_connected2_fn(const pmix_proc_t *proc,
     PMIX_POST_OBJECT(cd);
     prte_event_active(&(cd->ev), PRTE_EV_WRITE, 1);
 
-    return PRTE_SUCCESS;
+    return PMIX_SUCCESS;
+}
+
+/* Report that a tool has left us.
+ *
+ * On the DVM master the tool's job object is right here, so drive its proc
+ * into TERMINATED and let the state machine retire the namespace. Anywhere
+ * else there is nothing local to drive: a daemon relays a tool connection to
+ * the master and keeps no job object of its own, so the departure has to
+ * travel the same way the connection did. It goes as its own command rather
+ * than as a proc-state update because only the master can tell a tool from
+ * anything else it holds - it checks the job's TOOL flag before acting on
+ * this, and an update naming a namespace it could not vet would be a way to
+ * terminate somebody else's job.
+ *
+ * Getting this wrong is quiet rather than loud: the master is told the tool
+ * arrived and never told it left, so the tool's job object - and any
+ * allocation it reserved - outlives it by the life of the DVM.
+ */
+void prte_pmix_server_tool_departed(pmix_proc_t *tool)
+{
+    pmix_data_buffer_t *alert;
+    prte_plm_cmd_flag_t cmd = PRTE_PLM_TOOL_DEPARTED_CMD;
+    prte_job_t *jdata;
+    pmix_status_t ret;
+    int rc;
+
+    if (PRTE_PROC_IS_MASTER) {
+        jdata = prte_get_job_data_object(tool->nspace);
+        if (NULL != jdata && PRTE_FLAG_TEST(jdata, PRTE_JOB_FLAG_TOOL)) {
+            PRTE_ACTIVATE_PROC_STATE(tool, PRTE_PROC_STATE_TERMINATED);
+        }
+        return;
+    }
+
+    PMIX_DATA_BUFFER_CREATE(alert);
+    ret = PMIx_Data_pack(NULL, alert, &cmd, 1, PMIX_UINT8);
+    if (PMIX_SUCCESS != ret) {
+        PMIX_ERROR_LOG(ret);
+        PMIX_DATA_BUFFER_RELEASE(alert);
+        return;
+    }
+    ret = PMIx_Data_pack(NULL, alert, tool, 1, PMIX_PROC);
+    if (PMIX_SUCCESS != ret) {
+        PMIX_ERROR_LOG(ret);
+        PMIX_DATA_BUFFER_RELEASE(alert);
+        return;
+    }
+    PRTE_RML_RELIABLE_SEND(rc, PRTE_PROC_MY_HNP->rank, alert, PRTE_RML_TAG_PLM);
+    if (PRTE_SUCCESS != rc) {
+        PRTE_ERROR_LOG(rc);
+        PMIX_DATA_BUFFER_RELEASE(alert);
+    }
 }
 
 static void _client_finalized(int sd, short args, void *cbdata)
@@ -203,11 +254,27 @@ static void _client_finalized(int sd, short args, void *cbdata)
     PMIX_ACQUIRE_OBJECT(cd);
 
     if (NULL != cd->server_object) {
-        /* we were passed back the prte_proc_t */
+        /* we were passed back the prte_proc_t - so this is a process we
+         * launched, and the ODLS will see it go away. Nothing more to do:
+         * its termination is driven by waitpid and IOF completion, and
+         * declaring it terminated here would do so before either. */
         p = (prte_proc_t *) cd->server_object;
         PRTE_FLAG_SET(p, PRTE_PROC_FLAG_HAS_DEREG);
+        goto release;
     }
 
+    /* No server object means we did not register this peer as a client of
+     * ours - it attached as a tool. A tool that finalized cleanly gets us
+     * here and nowhere else: it is not a child, so no waitpid fires for it,
+     * and the connection drop that follows raises no lost-connection event
+     * either, because PMIx has already marked the peer finalized. Nothing
+     * else would ever retire the tool's job object - and with it the
+     * inheritance disposition that hangs off the owning namespace
+     * terminating, which is what hands the nodes of an allocation the tool
+     * reserved back to the general pool. */
+    prte_pmix_server_tool_departed(&cd->proc);
+
+release:
     /* release the caller */
     if (NULL != cd->cbfunc) {
         cd->cbfunc(PMIX_SUCCESS, cd->cbdata);
@@ -223,7 +290,7 @@ pmix_status_t pmix_server_client_finalized_fn(const pmix_proc_t *proc, void *ser
     PRTE_SERVER_PMIX_THREADSHIFT(proc, server_object, PRTE_SUCCESS,
                           NULL, NULL, 0, _client_finalized,
                           cbfunc, cbdata);
-    return PRTE_SUCCESS;
+    return PMIX_SUCCESS;
 }
 
 /* the fields being passed include:
@@ -259,7 +326,10 @@ static void _client_abort(int sd, short args, void *cbdata)
     prte_job_t *jdata;
     pmix_proc_t pname;
     prte_proc_t *p;
-    pmix_status_t rc;
+    /* the loop below is what normally sets this, and an empty procs array
+     * skips it entirely - release: reads it either way and hands it to the
+     * caller's completion */
+    pmix_status_t rc = PMIX_SUCCESS;
     size_t n;
     PRTE_HIDE_UNUSED_PARAMS(sd, args);
 
@@ -341,7 +411,25 @@ pmix_status_t pmix_server_abort_fn(const pmix_proc_t *proc, void *server_object,
     PRTE_SERVER_PMIX_THREADSHIFT(proc, server_object, status,
                                  msg, procs, nprocs, _client_abort,
                                  cbfunc, cbdata);
-    return PRTE_SUCCESS;
+    return PMIX_SUCCESS;
+}
+
+/* completion of a tool registration - executes on the PRRTE
+ * progress thread */
+static void tconn_reg_complete(pmix_status_t status, void *cbdata)
+{
+    prte_pmix_server_req_t *req = (prte_pmix_server_req_t *) cbdata;
+
+    if (PMIX_SUCCESS != status) {
+        PMIX_ERROR_LOG(status);
+        // we can live without it
+    }
+    if (NULL != req->toolcbfunc) {
+        req->toolcbfunc(req->pstatus, &req->target, req->cbdata);
+    }
+
+    /* cleanup */
+    PMIX_RELEASE(req);
 }
 
 void pmix_server_tconn_return(int status, pmix_proc_t *sender,
@@ -376,9 +464,10 @@ void pmix_server_tconn_return(int status, pmix_proc_t *sender,
     pmix_pointer_array_set_item(&prte_pmix_server_globals.local_reqs, room, NULL);
 
     if (NULL == req) {
-        /* we are hosed */
+        /* we are hosed - note that the jobid has not been unpacked yet,
+         * so it must not be reported here */
         PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
-        pmix_output(0, "UNABLE TO RETRIEVE SPWN_REQ FOR JOB %s [room=%d]", jobid, room);
+        pmix_output(0, "UNABLE TO RETRIEVE TOOL CONNECTION REQ [room=%d]", room);
         return;
     }
 
@@ -388,15 +477,20 @@ void pmix_server_tconn_return(int status, pmix_proc_t *sender,
         rc = PMIx_Data_unpack(NULL, buffer, &jobid, &cnt, PMIX_PROC_NSPACE);
         if (PMIX_SUCCESS != rc) {
             PMIX_ERROR_LOG(rc);
+            PMIX_RELEASE(req);
             return;
         }
         PMIX_LOAD_NSPACE(req->target.nspace, jobid);
-        /* the tool is not a client of ours, but we can provide at least some information */
-        rc = prte_pmix_server_register_tool(req);
-        if (PRTE_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
-            // we can live without it
+        /* the tool is not a client of ours, but we can provide at
+         * least some information - the registration completes
+         * asynchronously */
+        req->pstatus = ret;
+        rc = prte_pmix_server_register_tool(req, tconn_reg_complete, req);
+        if (PRTE_SUCCESS == rc) {
+            return;
         }
+        PMIX_ERROR_LOG(rc);
+        // we can live without it
     }
 
     req->toolcbfunc(ret, &req->target, req->cbdata);
@@ -405,11 +499,24 @@ void pmix_server_tconn_return(int status, pmix_proc_t *sender,
     PMIX_RELEASE(req);
 }
 
+/* completion of the local tool registration - executes on the
+ * PRRTE progress thread */
+static void toolconn_reg_complete(pmix_status_t status, void *cbdata)
+{
+    prte_pmix_server_req_t *cd = (prte_pmix_server_req_t *) cbdata;
+
+    if (NULL != cd->toolcbfunc) {
+        cd->toolcbfunc(status, &cd->target, cd->cbdata);
+    }
+    PMIX_RELEASE(cd);
+}
+
 static void _toolconn(int sd, short args, void *cbdata)
 {
     prte_pmix_server_req_t *cd = (prte_pmix_server_req_t *) cbdata;
     int rc;
     char *tmp;
+    uint32_t u32;
     size_t n;
     pmix_data_buffer_t *buf;
     prte_plm_cmd_flag_t command = PRTE_PLM_TOOL_ATTACHED_CMD;
@@ -435,13 +542,13 @@ static void _toolconn(int sd, short args, void *cbdata)
                 /* we ignore this for now */
 
             } else if (PMIX_CHECK_KEY(&cd->info[n], PMIX_USERID)) {
-                PMIX_VALUE_GET_NUMBER(trc, &cd->info[n].value, cd->uid, uid_t);
+                trc = PMIx_Value_get_number(&cd->info[n].value, (void*)&cd->uid, PMIX_UINT32);
                 if (PMIX_SUCCESS == xrc && PMIX_SUCCESS != trc) {
                     xrc = trc;
                 }
 
             } else if (PMIX_CHECK_KEY(&cd->info[n], PMIX_GRPID)) {
-                PMIX_VALUE_GET_NUMBER(trc, &cd->info[n].value, cd->gid, gid_t);
+                trc = PMIx_Value_get_number(&cd->info[n].value, (void*)&cd->gid, PMIX_UINT32);
                 if (PMIX_SUCCESS == xrc && PMIX_SUCCESS != trc) {
                     xrc = trc;
                 }
@@ -451,14 +558,31 @@ static void _toolconn(int sd, short args, void *cbdata)
                 nspace_given = true;
 
             } else if (PMIX_CHECK_KEY(&cd->info[n], PMIX_RANK)) {
-                cd->target.rank = cd->info[n].value.data.rank;
-                rank_given = true;
+                trc = PMIx_Value_get_number(&cd->info[n].value, (void*)&cd->target.rank,
+                                            PMIX_PROC_RANK);
+                if (PMIX_SUCCESS != trc) {
+                    if (PMIX_SUCCESS == xrc) {
+                        xrc = trc;
+                    }
+                } else {
+                    rank_given = true;
+                }
 
+                /* These two are strings the connecting tool composed, and a
+                 * PMIX_STRING carrying no string survives the wire as a NULL
+                 * (the packer writes a zero length, the unpacker hands back
+                 * NULL) - so strdup'ing it unchecked let any tool segfault the
+                 * daemon it attached to.  A tool may also send the same key
+                 * twice; keep the first rather than stranding it. */
             } else if (PMIX_CHECK_KEY(&cd->info[n], PMIX_HOSTNAME)) {
-                cd->operation = strdup(cd->info[n].value.data.string);
+                if (NULL != cd->info[n].value.data.string && NULL == cd->operation) {
+                    cd->operation = strdup(cd->info[n].value.data.string);
+                }
 
             } else if (PMIX_CHECK_KEY(&cd->info[n], PMIX_CMD_LINE)) {
-                cd->cmdline = strdup(cd->info[n].value.data.string);
+                if (NULL != cd->info[n].value.data.string && NULL == cd->cmdline) {
+                    cd->cmdline = strdup(cd->info[n].value.data.string);
+                }
 
             } else if (PMIX_CHECK_KEY(&cd->info[n], PMIX_LAUNCHER)) {
                 cd->launcher = PMIX_INFO_TRUE(&cd->info[n]);
@@ -470,7 +594,7 @@ static void _toolconn(int sd, short args, void *cbdata)
                 primary = PMIX_INFO_TRUE(&cd->info[n]);
 
             } else if (PMIX_CHECK_KEY(&cd->info[n], PMIX_PROC_PID)) {
-                PMIX_VALUE_GET_NUMBER(trc, &cd->info[n].value, cd->pid, pid_t);
+                trc = PMIx_Value_get_number(&cd->info[n].value, (void*)&cd->pid, PMIX_PID);
                 if (PMIX_SUCCESS == xrc && PMIX_SUCCESS != trc) {
                     xrc = trc;
                 }
@@ -506,7 +630,9 @@ static void _toolconn(int sd, short args, void *cbdata)
      * this is not allowed */
     if (cd->scheduler) {
         if (!PRTE_PROC_IS_MASTER) {
-            cd->toolcbfunc(PMIX_ERR_NOT_SUPPORTED, NULL, cd->cbdata);
+            if (NULL != cd->toolcbfunc) {
+                cd->toolcbfunc(PMIX_ERR_NOT_SUPPORTED, NULL, cd->cbdata);
+            }
             PMIX_RELEASE(cd);
             return;
         } else {
@@ -514,7 +640,9 @@ static void _toolconn(int sd, short args, void *cbdata)
             prte_pmix_server_globals.scheduler_connected = true;
             // the scheduler always self-assigns its ID
             if (!nspace_given || !rank_given) {
-                cd->toolcbfunc(PMIX_ERR_NOT_SUPPORTED, NULL, cd->cbdata);
+                if (NULL != cd->toolcbfunc) {
+                    cd->toolcbfunc(PMIX_ERR_NOT_SUPPORTED, NULL, cd->cbdata);
+                }
                 PMIX_RELEASE(cd);
                 return;
             }
@@ -529,7 +657,9 @@ static void _toolconn(int sd, short args, void *cbdata)
                 goto complete;
             }
             // it has been recorded in the library, so record it here
-            prte_pmix_server_globals.scheduler_set_as_server = true;
+            PMIX_XFER_PROCID(&prte_pmix_server_globals.primary_server,
+                             &prte_pmix_server_globals.scheduler);
+            prte_pmix_server_globals.primary_server_set = true;
             goto complete;
         }
     }
@@ -548,70 +678,96 @@ static void _toolconn(int sd, short args, void *cbdata)
             free(tmp);
             prte_plm_globals.next_jobid++;
         }
-        // register this job - will add to our array of jobs
-        rc = prte_pmix_server_register_tool(cd);
-        if (PMIX_SUCCESS != rc) {
-            rc = prte_pmix_convert_rc(rc);
+        // register this job - will add to our array of jobs. The
+        // registration completes asynchronously
+        rc = prte_pmix_server_register_tool(cd, toolconn_reg_complete, cd);
+        if (PRTE_SUCCESS == rc) {
+            return;
         }
+        rc = prte_pmix_convert_rc(rc);
         goto complete;
     }
 
     /* not the DVM master, so we have to alert the HNP that
      * a tool has connected to a daemon so the DVM doesn't
      * shut down until the tool has disconnected */
+    /* Every pack below used to log its failure and carry on, which sends the
+     * master a buffer it cannot read: the master then has no index to answer
+     * under, so the tool waits for the life of the DVM.  A relay that cannot
+     * build its request has to fail the request, not ship a truncated one. */
     PMIX_DATA_BUFFER_CREATE(buf);
-    rc = PMIx_Data_pack(NULL, buf, &command, 1, PMIX_UINT8);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
+    xrc = PMIx_Data_pack(NULL, buf, &command, 1, PMIX_UINT8);
+    if (PMIX_SUCCESS != xrc) {
+        goto packfail;
     }
     // record the request and pass the location along
     cd->local_index = pmix_pointer_array_add(&prte_pmix_server_globals.local_reqs, cd);
-    rc = PMIx_Data_pack(NULL, buf, &cd->local_index, 1, PMIX_INT);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
+    xrc = PMIx_Data_pack(NULL, buf, &cd->local_index, 1, PMIX_INT);
+    if (PMIX_SUCCESS != xrc) {
+        goto packfail;
     }
     // flag if we need a jobid assigned
-    rc = PMIx_Data_pack(NULL, buf, &nspace_given, 1, PMIX_BOOL);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
+    xrc = PMIx_Data_pack(NULL, buf, &nspace_given, 1, PMIX_BOOL);
+    if (PMIX_SUCCESS != xrc) {
+        goto packfail;
     }
     // if we do, then pass along the rank so they have it
-    if (nspace_given) {
-        rc = PMIx_Data_pack(NULL, buf, &cd->target.rank, 1, PMIX_PROC_RANK);
-        if (PMIX_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
-        }
+    if (!nspace_given) {
+        xrc = PMIx_Data_pack(NULL, buf, &cd->target.rank, 1, PMIX_PROC_RANK);
     } else {
         // if not, then pass along the full procID
-        rc = PMIx_Data_pack(NULL, buf, &cd->target, 1, PMIX_PROC);
-        if (PMIX_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
-        }
+        xrc = PMIx_Data_pack(NULL, buf, &cd->target, 1, PMIX_PROC);
+    }
+    if (PMIX_SUCCESS != xrc) {
+        goto packfail;
     }
     // pass along the cmd line
-    rc = PMIx_Data_pack(NULL, buf, &cd->cmdline, 1, PMIX_STRING);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
+    xrc = PMIx_Data_pack(NULL, buf, &cd->cmdline, 1, PMIX_STRING);
+    if (PMIX_SUCCESS != xrc) {
+        goto packfail;
     }
     // and the pid
-    rc = PMIx_Data_pack(NULL, buf, &cd->pid, 1, PMIX_PID);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
+    xrc = PMIx_Data_pack(NULL, buf, &cd->pid, 1, PMIX_PID);
+    if (PMIX_SUCCESS != xrc) {
+        goto packfail;
+    }
+    // and who is running it - the master records this on the tool's job so a
+    // reservation the tool creates can be reached by another command the same
+    // user runs. Only the master keeps a job object for a tool, so this is the
+    // only chance to tell it.
+    u32 = (uint32_t) cd->uid;
+    xrc = PMIx_Data_pack(NULL, buf, &u32, 1, PMIX_UINT32);
+    if (PMIX_SUCCESS != xrc) {
+        goto packfail;
+    }
+    u32 = (uint32_t) cd->gid;
+    xrc = PMIx_Data_pack(NULL, buf, &u32, 1, PMIX_UINT32);
+    if (PMIX_SUCCESS != xrc) {
+        goto packfail;
     }
 
     /* send it to the HNP for processing - might be myself! */
-    PRTE_RML_SEND(rc, PRTE_PROC_MY_HNP->rank,
+    PRTE_RML_RELIABLE_SEND(rc, PRTE_PROC_MY_HNP->rank,
                   buf, PRTE_RML_TAG_PLM);
     if (PRTE_SUCCESS != rc) {
         PRTE_ERROR_LOG(rc);
         xrc = prte_pmix_convert_rc(rc);
-        pmix_pointer_array_set_item(&prte_pmix_server_globals.local_reqs, cd->local_index, NULL);
-        PMIX_DATA_BUFFER_RELEASE(buf);
-        if (NULL != cd->toolcbfunc) {
-            cd->toolcbfunc(xrc, NULL, cd->cbdata);
-        }
-        PMIX_RELEASE(cd);
+        goto packfail;
     }
+    return;
+
+packfail:
+    PMIX_ERROR_LOG(xrc);
+    PMIX_DATA_BUFFER_RELEASE(buf);
+    /* the slot is only ours from the add above; the constructor leaves it -1 */
+    if (0 <= cd->local_index) {
+        pmix_pointer_array_set_item(&prte_pmix_server_globals.local_reqs,
+                                    cd->local_index, NULL);
+    }
+    if (NULL != cd->toolcbfunc) {
+        cd->toolcbfunc(xrc, NULL, cd->cbdata);
+    }
+    PMIX_RELEASE(cd);
     return;
 
 
@@ -673,10 +829,61 @@ pmix_status_t pmix_tool_connected2_fn(pmix_info_t *info, size_t ninfo,
 }
 #endif
 
+void pmix_server_logging_resp(int status, pmix_proc_t *sender,
+                              pmix_data_buffer_t *buffer, prte_rml_tag_t tg,
+                              void *cbdata)
+{
+    prte_pmix_server_req_t *req;
+    int32_t cnt;
+    int local_index;
+    pmix_status_t rc, lstat;
+    PRTE_HIDE_UNUSED_PARAMS(status, sender, tg, cbdata);
+
+    pmix_output_verbose(2, prte_pmix_server_globals.output,
+                        "%s LOGGING RESPONSE RECVD",
+                        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME));
+
+    // unpack our local index
+    cnt = 1;
+    rc = PMIx_Data_unpack(NULL, buffer, &local_index, &cnt, PMIX_INT);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        return;
+    }
+
+    // lookup our req
+    req = (prte_pmix_server_req_t*)pmix_pointer_array_get_item(&prte_pmix_server_globals.local_reqs, local_index);
+    if (NULL == req) {
+        // nothing we can do
+        PMIX_ERROR_LOG(PMIX_ERR_NOT_FOUND);
+        return;
+    }
+    // clear the local tracker
+    pmix_pointer_array_set_item(&prte_pmix_server_globals.local_reqs, local_index, NULL);
+
+    // unpack the returned status
+    cnt = 1;
+    rc = PMIx_Data_unpack(NULL, buffer, &lstat, &cnt, PMIX_STATUS);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        lstat = rc;
+    }
+
+    // execute the callback
+    if (NULL != req->opcbfunc) {
+        req->opcbfunc(lstat, req->cbdata);
+    }
+
+    // cleanup
+    PMIX_RELEASE(req);
+}
+
 static void lgcbfn(int sd, short args, void *cbdata)
 {
     prte_pmix_server_op_caddy_t *cd = (prte_pmix_server_op_caddy_t *) cbdata;
     PRTE_HIDE_UNUSED_PARAMS(sd, args);
+
+    PMIX_ACQUIRE_OBJECT(cd);
 
     if (NULL != cd->cbfunc) {
         cd->cbfunc(cd->status, cd->cbdata);
@@ -684,96 +891,131 @@ static void lgcbfn(int sd, short args, void *cbdata)
     PMIX_RELEASE(cd);
 }
 
+static void process_log(int sd, short args, void *cbdata)
+{
+    prte_pmix_server_req_t *req = (prte_pmix_server_req_t*)cbdata;
+    pmix_data_buffer_t *buf;
+    pmix_status_t rc;
+    PRTE_HIDE_UNUSED_PARAMS(sd, args);
+
+    PMIX_ACQUIRE_OBJECT(req);
+
+    PMIX_DATA_BUFFER_CREATE(buf);
+
+    // cache the operation
+    req->local_index = pmix_pointer_array_add(&prte_pmix_server_globals.local_reqs, req);
+    // pack the local index
+    rc = PMIx_Data_pack(NULL, buf, &req->local_index, 1, PMIX_INT);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        PMIX_DATA_BUFFER_RELEASE(buf);
+        goto done;
+    }
+
+    /* pack the source of this log request */
+    rc = PMIx_Data_pack(NULL, buf, (void*)&req->proxy, 1, PMIX_PROC);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        PMIX_DATA_BUFFER_RELEASE(buf);
+        goto done;
+    }
+    /* pack number of info provided */
+    rc = PMIx_Data_pack(NULL, buf, &req->ninfo, 1, PMIX_SIZE);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        PMIX_DATA_BUFFER_RELEASE(buf);
+        goto done;
+    }
+    // pack the info
+    if (0 < req->ninfo) {
+        rc = PMIx_Data_pack(NULL, buf, req->info, req->ninfo, PMIX_INFO);
+        if (PMIX_SUCCESS != rc) {
+            PMIX_ERROR_LOG(rc);
+            PMIX_DATA_BUFFER_RELEASE(buf);
+            goto done;
+        }
+    }
+    /* pack number of directives given */
+    rc = PMIx_Data_pack(NULL, buf, &req->ndirs, 1, PMIX_SIZE);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        PMIX_DATA_BUFFER_RELEASE(buf);
+        goto done;
+    }
+    if (0 < req->ndirs) {
+        // pack directives
+        rc = PMIx_Data_pack(NULL, buf, req->directives, req->ndirs, PMIX_INFO);
+        if (PMIX_SUCCESS != rc) {
+            PMIX_ERROR_LOG(rc);
+            PMIX_DATA_BUFFER_RELEASE(buf);
+            goto done;
+        }
+    }
+
+    /* send the result to the HNP */
+    PRTE_RML_RELIABLE_SEND(rc, PRTE_PROC_MY_HNP->rank, buf,
+                  PRTE_RML_TAG_LOGGING);
+    if (PRTE_SUCCESS != rc) {
+        PRTE_ERROR_LOG(rc);
+        PMIX_DATA_BUFFER_RELEASE(buf);
+        rc = prte_pmix_convert_rc(rc);
+    }
+
+done:
+    if (PMIX_SUCCESS != rc) {
+        // must complete the callback to release the PMIx server
+        if (NULL != req->opcbfunc) {
+            req->opcbfunc(rc, req->cbdata);
+        }
+        // cleanup the local tracker
+        pmix_pointer_array_set_item(&prte_pmix_server_globals.local_reqs, req->local_index, NULL);
+        // cleanup memory
+        PMIX_RELEASE(req);
+    }
+}
+
 void pmix_server_log_fn(const pmix_proc_t *client, const pmix_info_t data[], size_t ndata,
                         const pmix_info_t directives[], size_t ndirs, pmix_op_cbfunc_t cbfunc,
                         void *cbdata)
 {
-    size_t n, cnt, dcnt;
-    pmix_data_buffer_t *buf;
-    int rc = PRTE_SUCCESS;
-    pmix_data_buffer_t pbuf, dbuf;
-    pmix_byte_object_t pbo, dbo;
-    pmix_status_t ret;
+    prte_pmix_server_req_t *req;
+    size_t n;
 
     pmix_output_verbose(2, prte_pmix_server_globals.output,
                         "%s logging info",
                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME));
 
-    PMIX_DATA_BUFFER_CONSTRUCT(&dbuf);
+    if (0 == ndata) {
+        goto done;
+    }
+
     /* if we are the one that passed it down, then we don't pass it back */
-    dcnt = 0;
     for (n = 0; n < ndirs; n++) {
         if (PMIX_CHECK_KEY(&directives[n], "prte.log.noloop")) {
             if (PMIX_INFO_TRUE(&directives[n])) {
-                rc = PMIX_SUCCESS;
                 goto done;
             }
         }
-        else {
-            ret = PMIx_Data_pack(NULL, &dbuf, (pmix_info_t *) &directives[n], 1, PMIX_INFO);
-            if (PMIX_SUCCESS != ret) {
-                PMIX_ERROR_LOG(ret);
-            }
-            dcnt++;
-        }
     }
 
-    PMIX_DATA_BUFFER_CONSTRUCT(&pbuf);
-    cnt = 0;
-
-    for (n = 0; n < ndata; n++) {
-        /* ship this to our HNP/MASTER for processing, even if that is us */
-        ret = PMIx_Data_pack(NULL, &pbuf, (pmix_info_t *) &data[n], 1, PMIX_INFO);
-        if (PMIX_SUCCESS != ret) {
-            PMIX_ERROR_LOG(ret);
-        }
-        ++cnt;
-    }
-    if (0 < cnt) {
-        PMIX_DATA_BUFFER_CREATE(buf);
-        /* pack the source of this log request */
-        rc = PMIx_Data_pack(NULL, buf, (void*)client, 1, PMIX_PROC);
-        if (PMIX_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
-        }
-        /* pack number of info provided */
-        rc = PMIx_Data_pack(NULL, buf, &cnt, 1, PMIX_SIZE);
-        if (PMIX_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
-        }
-        /* pack number of directives given */
-        rc = PMIx_Data_pack(NULL, buf, &dcnt, 1, PMIX_SIZE);
-        if (PMIX_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
-        }
-        /* bring over the packed info blob */
-        rc = PMIx_Data_unload(&pbuf, &pbo);
-        if (PMIX_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
-        }
-        rc = PMIx_Data_pack(NULL, buf, &pbo, 1, PMIX_BYTE_OBJECT);
-        PMIX_BYTE_OBJECT_DESTRUCT(&pbo);
-        /* pack the directives blob */
-        rc = PMIx_Data_unload(&dbuf, &dbo);
-        if (PMIX_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
-        }
-        rc = PMIx_Data_pack(NULL, buf, &dbo, 1, PMIX_BYTE_OBJECT);
-        PMIX_BYTE_OBJECT_DESTRUCT(&dbo);
-        /* send the result to the HNP */
-        PRTE_RML_SEND(rc, PRTE_PROC_MY_HNP->rank, buf,
-                      PRTE_RML_TAG_LOGGING);
-        if (PRTE_SUCCESS != rc) {
-            PRTE_ERROR_LOG(rc);
-            PMIX_DATA_BUFFER_RELEASE(buf);
-        }
-    }
+    // need to threadshift this to process
+    req = PMIX_NEW(prte_pmix_server_req_t);
+    memcpy(&req->proxy, client, sizeof(pmix_proc_t));
+    req->info = (pmix_info_t*)data;
+    req->ninfo = ndata;
+    req->directives = (pmix_info_t*)directives;
+    req->ndirs = ndirs;
+    req->opcbfunc = cbfunc;
+    req->cbdata = cbdata;
+    PRTE_PMIX_THREADSHIFT(req, prte_event_base, process_log);
+    return;
 
 done:
     /* we cannot directly execute the callback here
      * as it would threadlock - so shift to somewhere
      * safe */
-    PRTE_SERVER_PMIX_THREADSHIFT(PRTE_NAME_WILDCARD, NULL, rc, NULL, NULL, 0, lgcbfn, cbfunc, cbdata);
+    PRTE_SERVER_PMIX_THREADSHIFT(PRTE_NAME_WILDCARD, NULL, PMIX_OPERATION_SUCCEEDED,
+                                 NULL, NULL, 0, lgcbfn, cbfunc, cbdata);
 }
 
 #if PRTE_PMIX_SERVER2_UPCALLS
@@ -781,123 +1023,149 @@ pmix_status_t pmix_server_log2_fn(const pmix_proc_t *client, const pmix_info_t d
                                   const pmix_info_t directives[], size_t ndirs, pmix_op_cbfunc_t cbfunc,
                                   void *cbdata)
 {
-    size_t n, cnt, dcnt;
-    pmix_data_buffer_t *buf;
-    int rc = PRTE_SUCCESS;
-    pmix_data_buffer_t pbuf, dbuf;
-    pmix_byte_object_t pbo, dbo;
-    pmix_status_t ret;
+    prte_pmix_server_req_t *req;
+    size_t n;
 
     pmix_output_verbose(2, prte_pmix_server_globals.output,
                         "%s logging2 info",
                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME));
 
-    PMIX_DATA_BUFFER_CONSTRUCT(&dbuf);
+    if (0 == ndata) {
+        return PMIX_OPERATION_SUCCEEDED;
+    }
+
     /* if we are the one that passed it down, then we don't pass it back */
-    dcnt = 0;
     for (n = 0; n < ndirs; n++) {
         if (PMIX_CHECK_KEY(&directives[n], "prte.log.noloop")) {
             if (PMIX_INFO_TRUE(&directives[n])) {
-                rc = PMIX_SUCCESS;
-                goto done;
+                return PMIX_OPERATION_SUCCEEDED;
             }
         }
-        else {
-            ret = PMIx_Data_pack(NULL, &dbuf, (pmix_info_t *) &directives[n], 1, PMIX_INFO);
-            if (PMIX_SUCCESS != ret) {
-                PMIX_ERROR_LOG(ret);
-                return ret;
-            }
-            dcnt++;
-        }
     }
 
-    PMIX_DATA_BUFFER_CONSTRUCT(&pbuf);
-    cnt = 0;
-
-    for (n = 0; n < ndata; n++) {
-        /* ship this to our HNP/MASTER for processing, even if that is us */
-        ret = PMIx_Data_pack(NULL, &pbuf, (pmix_info_t *) &data[n], 1, PMIX_INFO);
-        if (PMIX_SUCCESS != ret) {
-            PMIX_ERROR_LOG(ret);
-            PMIX_DATA_BUFFER_DESTRUCT(&pbuf);
-            return ret;
-        }
-        ++cnt;
-    }
-    if (0 < cnt) {
-        PMIX_DATA_BUFFER_CREATE(buf);
-        /* pack the source of this log request */
-        rc = PMIx_Data_pack(NULL, buf, (void*)client, 1, PMIX_PROC);
-        if (PMIX_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
-            PMIX_DATA_BUFFER_RELEASE(buf);
-            PMIX_DATA_BUFFER_DESTRUCT(&pbuf);
-            return rc;
-        }
-        /* pack number of info provided */
-        rc = PMIx_Data_pack(NULL, buf, &cnt, 1, PMIX_SIZE);
-        if (PMIX_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
-            PMIX_DATA_BUFFER_RELEASE(buf);
-            PMIX_DATA_BUFFER_DESTRUCT(&pbuf);
-            return rc;
-        }
-        /* pack number of directives given */
-        rc = PMIx_Data_pack(NULL, buf, &dcnt, 1, PMIX_SIZE);
-        if (PMIX_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
-            PMIX_DATA_BUFFER_RELEASE(buf);
-            PMIX_DATA_BUFFER_DESTRUCT(&pbuf);
-            return rc;
-        }
-        /* bring over the packed info blob */
-        rc = PMIx_Data_unload(&pbuf, &pbo);
-        if (PMIX_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
-            PMIX_DATA_BUFFER_RELEASE(buf);
-            PMIX_DATA_BUFFER_DESTRUCT(&pbuf);
-            return rc;
-        }
-        rc = PMIx_Data_pack(NULL, buf, &pbo, 1, PMIX_BYTE_OBJECT);
-        PMIX_BYTE_OBJECT_DESTRUCT(&pbo);
-        /* pack the directives blob */
-        rc = PMIx_Data_unload(&dbuf, &dbo);
-        if (PMIX_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
-            PMIX_DATA_BUFFER_RELEASE(buf);
-            return rc;
-        }
-        rc = PMIx_Data_pack(NULL, buf, &dbo, 1, PMIX_BYTE_OBJECT);
-        PMIX_BYTE_OBJECT_DESTRUCT(&dbo);
-        /* send the result to the HNP */
-        PRTE_RML_SEND(rc, PRTE_PROC_MY_HNP->rank, buf,
-                      PRTE_RML_TAG_LOGGING);
-        if (PRTE_SUCCESS != rc) {
-            PRTE_ERROR_LOG(rc);
-            PMIX_DATA_BUFFER_RELEASE(buf);
-            return rc;
-        }
-    }
-
-done:
-    /* we cannot directly execute the callback here
-     * as it would threadlock - so shift to somewhere
-     * safe */
-    PRTE_SERVER_PMIX_THREADSHIFT(PRTE_NAME_WILDCARD, NULL, rc, NULL, NULL, 0, lgcbfn, cbfunc, cbdata);
+    // need to threadshift this to process
+    req = PMIX_NEW(prte_pmix_server_req_t);
+    memcpy(&req->proxy, client, sizeof(pmix_proc_t));
+    req->info = (pmix_info_t*)data;
+    req->ninfo = ndata;
+    req->directives = (pmix_info_t*)directives;
+    req->ndirs = ndirs;
+    req->opcbfunc = cbfunc;
+    req->cbdata = cbdata;
+    PRTE_PMIX_THREADSHIFT(req, prte_event_base, process_log);
     return PMIX_SUCCESS;
 }
 #endif
+
+/* Tell the HNP that somebody attached to US wants this job's output.
+ *
+ * A tool's IOF subscription is held by the PMIx server of the daemon it
+ * attached to, and only that server can deliver to it - so for output
+ * produced anywhere else to reach that tool, the HNP has to relay a copy
+ * here. It cannot know to do that unless we say so: this up-call is the
+ * only notice anyone gets, and it arrives HERE, at the daemon the tool
+ * attached to, which is precisely the daemon that needs recording. The
+ * requesting tool's own identity is not needed and is not supplied.
+ *
+ * The counterpart is the PRTE_IOF_PULL arm of prte_iof_hnp_recv().
+ */
+static void record_interest(const pmix_proc_t *proc)
+{
+    prte_job_t *jdata;
+    pmix_data_buffer_t *buf;
+    prte_iof_tag_t stream = PRTE_IOF_PULL;
+    pmix_proc_t job;
+    int rc;
+
+    /* name the job, not the rank: what gets relayed is a job's output */
+    PMIX_LOAD_PROCID(&job, proc->nspace, PMIX_RANK_WILDCARD);
+
+    if (PRTE_PROC_IS_MASTER) {
+        /* we are the HNP - record it directly */
+        jdata = prte_get_job_data_object(job.nspace);
+        if (NULL != jdata) {
+            pmix_bitmap_set_bit(&jdata->iof_daemons, (int) PRTE_PROC_MY_NAME->rank);
+        }
+        return;
+    }
+
+    PMIX_DATA_BUFFER_CREATE(buf);
+    rc = PMIx_Data_pack(NULL, buf, &stream, 1, PMIX_UINT16);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        PMIX_DATA_BUFFER_RELEASE(buf);
+        return;
+    }
+    rc = PMIx_Data_pack(NULL, buf, &job, 1, PMIX_PROC);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        PMIX_DATA_BUFFER_RELEASE(buf);
+        return;
+    }
+    /* PRTE_RML_TAG_IOF_HNP is the UPSTREAM tag - the one prte_iof_hnp_recv
+     * is registered on, and the one a prted forwards its own output to the
+     * HNP with. PRTE_RML_TAG_IOF_PROXY is the other direction: the HNP
+     * relaying down to a daemon. Sending this upstream on the downstream
+     * tag delivers it to the HNP and then drops it, with the reliable send
+     * still reporting success. */
+    PRTE_RML_RELIABLE_SEND(rc, PRTE_PROC_MY_HNP->rank, buf, PRTE_RML_TAG_IOF_HNP);
+    if (PRTE_SUCCESS != rc) {
+        PRTE_ERROR_LOG(rc);
+        PMIX_DATA_BUFFER_RELEASE(buf);
+    }
+}
+
+static void _iof_pull(int sd, short args, void *cbdata)
+{
+    prte_pmix_server_op_caddy_t *cd = (prte_pmix_server_op_caddy_t *) cbdata;
+    prte_iof_sink_t *sink;
+    size_t i;
+    PRTE_HIDE_UNUSED_PARAMS(sd, args);
+
+    PMIX_ACQUIRE_OBJECT(cd);
+
+    /* Set up I/O forwarding sinks and handlers for stdout and stderr for each proc
+     * requesting I/O forwarding */
+    for (i = 0; i < cd->nprocs; i++) {
+        /* whoever asked is attached to us, so record us as interested in
+         * this job before setting the sinks up - a stop request is the
+         * one case that must not, since it is asking for the opposite */
+        if (!cd->flag) {
+            record_interest(&cd->procs[i]);
+        }
+        if (cd->channels & PMIX_FWD_STDOUT_CHANNEL) {
+            if (cd->flag) {
+                /* ask the IOF to stop forwarding this channel */
+            } else {
+                PRTE_IOF_SINK_DEFINE(&sink, &cd->procs[i], fileno(stdout), PRTE_IOF_STDOUT,
+                                     prte_iof_base_write_handler);
+                PRTE_IOF_SINK_ACTIVATE(sink->wev);
+            }
+        }
+        if (cd->channels & PMIX_FWD_STDERR_CHANNEL) {
+            if (cd->flag) {
+                /* ask the IOF to stop forwarding this channel */
+            } else {
+                PRTE_IOF_SINK_DEFINE(&sink, &cd->procs[i], fileno(stderr), PRTE_IOF_STDERR,
+                                     prte_iof_base_write_handler);
+                PRTE_IOF_SINK_ACTIVATE(sink->wev);
+            }
+        }
+    }
+    if (NULL != cd->cbfunc) {
+        cd->cbfunc(PMIX_SUCCESS, cd->cbdata);
+    }
+    PMIX_RELEASE(cd);
+}
 
 pmix_status_t pmix_server_iof_pull_fn(const pmix_proc_t procs[], size_t nprocs,
                                       const pmix_info_t directives[], size_t ndirs,
                                       pmix_iof_channel_t channels, pmix_op_cbfunc_t cbfunc,
                                       void *cbdata)
 {
-    prte_iof_sink_t *sink;
+    prte_pmix_server_op_caddy_t *cd;
     size_t i;
     bool stop = false;
-    PRTE_HIDE_UNUSED_PARAMS(cbfunc, cbdata);
 
     /* no really good way to do this - we have to search the directives to
      * see if we are being asked to stop the specified channels before
@@ -909,49 +1177,95 @@ pmix_status_t pmix_server_iof_pull_fn(const pmix_proc_t procs[], size_t nprocs,
         }
     }
 
-    /* Set up I/O forwarding sinks and handlers for stdout and stderr for each proc
-     * requesting I/O forwarding */
-    for (i = 0; i < nprocs; i++) {
-        if (channels & PMIX_FWD_STDOUT_CHANNEL) {
-            if (stop) {
-                /* ask the IOF to stop forwarding this channel */
-            } else {
-                PRTE_IOF_SINK_DEFINE(&sink, &procs[i], fileno(stdout), PRTE_IOF_STDOUT,
-                                     prte_iof_base_write_handler);
-                PRTE_IOF_SINK_ACTIVATE(sink->wev);
-            }
-        }
-        if (channels & PMIX_FWD_STDERR_CHANNEL) {
-            if (stop) {
-                /* ask the IOF to stop forwarding this channel */
-            } else {
-                PRTE_IOF_SINK_DEFINE(&sink, &procs[i], fileno(stderr), PRTE_IOF_STDERR,
-                                     prte_iof_base_write_handler);
-                PRTE_IOF_SINK_ACTIVATE(sink->wev);
-            }
-        }
-    }
-    return PMIX_OPERATION_SUCCEEDED;
+    /* this upcall arrives on the PMIx progress thread, and setting up
+     * IOF sinks manipulates framework state and arms events on our
+     * event base - shift it. The procs array remains valid until we
+     * invoke the callback, which happens at the end of the shifted
+     * handler */
+    cd = PMIX_NEW(prte_pmix_server_op_caddy_t);
+    cd->procs = (pmix_proc_t *) procs;
+    cd->nprocs = nprocs;
+    cd->channels = channels;
+    cd->flag = stop;
+    cd->cbfunc = cbfunc;
+    cd->cbdata = cbdata;
+    prte_event_set(prte_event_base, &(cd->ev), -1, PRTE_EV_WRITE, _iof_pull, cd);
+    PMIX_POST_OBJECT(cd);
+    prte_event_active(&(cd->ev), PRTE_EV_WRITE, 1);
+    return PMIX_SUCCESS;
 }
 
 static void pmix_server_stdin_push(int sd, short args, void *cbdata)
 {
     prte_pmix_server_op_caddy_t *cd = (prte_pmix_server_op_caddy_t *) cbdata;
     pmix_byte_object_t *bo = (pmix_byte_object_t *) cd->server_object;
-    size_t n;
+    uint8_t *bytes;
+    size_t nbytes, n;
+#if PRTE_PMIX_IOF_FLOW_CONTROL
+    bool backed_up = false;
+#endif
     PRTE_HIDE_UNUSED_PARAMS(sd, args);
+
+    PMIX_ACQUIRE_OBJECT(cd);
+
+    /* a client that pushed no data at all leaves us no byte object - PMIx
+     * frees it rather than handing us an empty one - and that is precisely
+     * how a tool signals end-of-input, so treat it as the zero-length push
+     * it is rather than dereferencing it */
+    if (NULL == bo) {
+        bytes = NULL;
+        nbytes = 0;
+    } else {
+        bytes = (uint8_t *) bo->bytes;
+        nbytes = bo->size;
+    }
+
+    /* the vtable slot is optional, so a module that left it unset would
+     * otherwise take the daemon down with a NULL call - which is what used
+     * to happen on every daemon but the master, killing the very daemon the
+     * requesting tool was attached to */
+    if (NULL == prte_iof.push_stdin) {
+        cd->cbfunc(PMIX_ERR_NOT_SUPPORTED, cd->cbdata);
+        PMIX_RELEASE(cd);
+        return;
+    }
 
     for (n = 0; n < cd->nprocs; n++) {
         PMIX_OUTPUT_VERBOSE((1, prte_pmix_server_globals.output,
                              "%s pmix_server_stdin_push to dest %s: size %zu",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                              PRTE_NAME_PRINT(&cd->procs[n]),
-                             bo->size));
-        prte_iof.push_stdin(&cd->procs[n], (uint8_t *) bo->bytes, bo->size);
+                             nbytes));
+#if PRTE_PMIX_IOF_FLOW_CONTROL
+        if (PRTE_ERR_OUT_OF_RESOURCE == prte_iof.push_stdin(&cd->procs[n], bytes, nbytes)) {
+            /* a sink here has passed PRTE_IOF_MAX_INPUT_BUFFERS. The data
+             * was still queued - the module refuses nothing - so this is
+             * "taken, now slow down", not a failure. One backed-up target
+             * is enough to hold the whole push: we have no way to tell the
+             * producer to keep feeding the other targets and not this one,
+             * and the alternative is to keep taking data for a sink that is
+             * already unbounded. Keep pushing to the remaining targets
+             * first, so no target is starved by the order of this loop */
+            backed_up = true;
+        }
+#else
+        prte_iof.push_stdin(&cd->procs[n], bytes, nbytes);
+#endif
     }
 
-    if (NULL == bo->bytes || 0 == bo->size) {
+    if (NULL == bytes || 0 == nbytes) {
         cd->cbfunc(PMIX_ERR_IOF_COMPLETE, cd->cbdata);
+#if PRTE_PMIX_IOF_FLOW_CONTROL
+    } else if (backed_up) {
+        /* PMIx reads this as "I have the data, suspend the stream" and
+         * stops the producer at its source. It is not reported to the
+         * tool as an error, and nothing has been dropped. The XON that
+         * releases it comes from the hnp module's write handler when the
+         * sink drains - see release_flow_control() there. Against an older
+         * PMIx there is no such status, so we report success exactly as we
+         * always did and the sink simply queues */
+        cd->cbfunc(PMIX_ERR_IOF_XOFF, cd->cbdata);
+#endif
     } else {
         cd->cbfunc(PMIX_SUCCESS, cd->cbdata);
     }

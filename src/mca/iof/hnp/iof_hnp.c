@@ -18,7 +18,7 @@
  * Copyright (c) 2016-2020 Intel, Inc.  All rights reserved.
  * Copyright (c) 2017      Mellanox Technologies. All rights reserved.
  * Copyright (c) 2020      IBM Corporation.  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -75,6 +75,7 @@ static void hnp_complete(const prte_job_t *jdata);
 static int finalize(void);
 
 static int push_stdin(const pmix_proc_t *dst_name, uint8_t *data, size_t sz);
+static void release_flow_control(void);
 
 /* The API's in this module are solely used to support LOCAL
  * procs - i.e., procs that are co-located to the HNP. Remote
@@ -100,6 +101,13 @@ static int init(void)
      */
     PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_IOF_HNP,
                   PRTE_RML_PERSISTENT, prte_iof_hnp_recv, NULL);
+
+    /* we xcast wildcard stdin to every daemon, and the xcast delivers a
+     * copy back to us - so we must also listen on the proxy tag to service
+     * the procs we host ourselves
+     */
+    PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_IOF_PROXY,
+                  PRTE_RML_PERSISTENT, prte_iof_hnp_stdin_recv, NULL);
 
     PMIX_CONSTRUCT(&prte_mca_iof_hnp_component.procs, pmix_list_t);
 
@@ -203,7 +211,11 @@ static int push_stdin(const pmix_proc_t *dst_name, uint8_t *data, size_t sz)
                          PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(dst_name), sz));
 
     /* if I am the DVM master and this is a wildcard name, then we have to
-     * broadcast this to all daemons */
+     * broadcast this to all daemons. The xcast delivers a copy to us as
+     * well, and our own receive (prte_iof_hnp_stdin_recv) services the
+     * procs we host - so we are done here. Falling through would look up
+     * the daemon hosting a wildcard rank, which cannot resolve
+     */
     if (PMIX_RANK_WILDCARD == dst_name->rank) {
         PMIX_LOAD_PROCID(&p, PRTE_PROC_MY_NAME->nspace, PMIX_RANK_WILDCARD);
         rc = prte_iof_hnp_send_data_to_endpoint(&p, dst_name,
@@ -211,15 +223,17 @@ static int push_stdin(const pmix_proc_t *dst_name, uint8_t *data, size_t sz)
                                                 data, sz);
         if (PRTE_SUCCESS != rc) {
             PRTE_ERROR_LOG(rc);
-            return rc;
         }
+        return rc;
     }
 
     /* lookup the daemon hosting the target proc */
     PMIX_LOAD_PROCID(&p, PRTE_PROC_MY_NAME->nspace, PMIX_RANK_WILDCARD);
     p.rank = prte_get_proc_daemon_vpid(dst_name);
     if (PMIX_RANK_INVALID == p.rank) {
-        PRTE_ERROR_LOG(PRTE_ERR_ADDRESSEE_UNKNOWN);
+        // proc must have finalized, so we can just ignore
+        // it - no need to error log, this is just a
+        // race condition
         return PRTE_ERR_ADDRESSEE_UNKNOWN;
     }
 
@@ -260,11 +274,26 @@ static int push_stdin(const pmix_proc_t *dst_name, uint8_t *data, size_t sz)
                 if (PRTE_IOF_MAX_INPUT_BUFFERS < prte_iof_base_write_output(&proct->name,
                                                                             PRTE_IOF_STDIN, data, sz,
                                                                             proct->stdinev->wev)) {
-                    /* getting too backed up - stop the read event for now if it is still active */
-
+#if PRTE_PMIX_IOF_FLOW_CONTROL
+                    /* getting too backed up - the data is queued, so this is
+                     * "taken, now slow down" rather than a refusal. Latch it
+                     * so stdin_write_handler knows to send the matching XON
+                     * when this sink drains; without that pairing the
+                     * producer would stay suspended forever.
+                     *
+                     * Guarded exactly as release_flow_control() is, and that
+                     * symmetry is the point: the release is compiled out
+                     * against a PMIx with no flow-control API, so asserting
+                     * here regardless would set a latch nothing can ever
+                     * clear and log an XOFF no XON will ever answer. Without
+                     * the API the documented fallback is simply to queue,
+                     * bounded by iof_base_output_limit - which is what
+                     * falling through to PRTE_SUCCESS does. */
                     PMIX_OUTPUT_VERBOSE((1, prte_iof_base_framework.framework_output,
                                          "buffer backed up - holding"));
+                    prte_mca_iof_hnp_component.xoff = true;
                     return PRTE_ERR_OUT_OF_RESOURCE;
+#endif
                 }
             }
         }
@@ -346,11 +375,17 @@ static int hnp_close(const pmix_proc_t *peer, prte_iof_tag_t source_tag)
         if (PMIX_CHECK_PROCID(&proct->name, peer)) {
             if (PRTE_IOF_STDIN & source_tag) {
                 if (NULL != proct->stdinev) {
+                    /* a sink released here never reaches the write handler,
+                     * so this is the only chance to release an XOFF it was
+                     * responsible for. A sink is backed up precisely when
+                     * its proc stopped reading, which is precisely the proc
+                     * a close is likely to be tearing down */
+                    release_flow_control();
                     PMIX_RELEASE(proct->stdinev);
                 }
                 proct->stdinev = NULL;
             }
-            if ((PRTE_IOF_STDOUT & source_tag) || (PRTE_IOF_STDMERGE & source_tag)) {
+            if (PRTE_IOF_STDOUT & source_tag) {
                 if (NULL != proct->revstdout) {
                     PMIX_RELEASE(proct->revstdout);
                 }
@@ -382,14 +417,35 @@ static void hnp_complete(const prte_job_t *jdata)
     {
         if (PMIX_CHECK_NSPACE(jdata->nspace, proct->name.nspace)) {
             pmix_list_remove_item(&prte_mca_iof_hnp_component.procs, &proct->super);
+            /* The proc and its read events reference each other - the proc
+             * owns them, and PRTE_IOF_READ_EVENT retained the proc for each.
+             * So dropping the list's reference does NOT free a proc whose
+             * streams are still open: it orphans it, still holding its fds,
+             * with its read events still armed and pointing at a proc
+             * nothing else can reach. The next time one of those events
+             * fires it releases the last reference from inside its own
+             * destructor. Break the cycle explicitly, the way close() does,
+             * which is what "cleanout any lingering sinks" was always meant
+             * to mean. A job that reached IOF completion normally has all
+             * three slots empty already and this costs nothing; one that was
+             * killed does not, and that is the case this exists for.
+             */
+            if (NULL != proct->stdinev) {
+                /* as in close(): this sink will never reach the write
+                 * handler, so an XOFF it was responsible for has to be
+                 * released here or it outlives the job that caused it */
+                release_flow_control();
+                PMIX_RELEASE(proct->stdinev);
+                proct->stdinev = NULL;
+            }
             if (NULL != proct->revstdout) {
                 PMIX_RELEASE(proct->revstdout);
+                proct->revstdout = NULL;
             }
-            proct->revstdout = NULL;
             if (NULL != proct->revstderr) {
                 PMIX_RELEASE(proct->revstderr);
+                proct->revstderr = NULL;
             }
-            proct->revstderr = NULL;
             PMIX_RELEASE(proct);
         }
     }
@@ -398,12 +454,45 @@ static void hnp_complete(const prte_job_t *jdata)
 static int finalize(void)
 {
     PMIX_DESTRUCT(&prte_mca_iof_hnp_component.procs);
+    PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_IOF_HNP);
+    PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_IOF_PROXY);
     return PRTE_SUCCESS;
 }
 
 /* this function is called by the event library and thus
  * can access information global to the state machine
  */
+/* Release an XOFF we asserted because one of our own local procs' stdin
+ * sinks was backed up. A no-op unless we actually asserted one, so it is
+ * safe to call from every path a sink can leave the backed-up state by -
+ * including the paths where the sink is torn down rather than drained,
+ * which would otherwise leave the producers suspended forever.
+ *
+ * Against a PMIx that predates PMIx_server_IOF_flow_control there is
+ * nothing to release: push_stdin's PRTE_ERR_OUT_OF_RESOURCE is discarded
+ * by the glue rather than turned into an XOFF, so nothing was suspended. */
+static void release_flow_control(void)
+{
+#if PRTE_PMIX_IOF_FLOW_CONTROL
+    pmix_status_t prc;
+
+    if (!prte_mca_iof_hnp_component.xoff) {
+        return;
+    }
+    /* clear the latch first: the API completes inline, and a re-entrant
+     * assert would otherwise be lost */
+    prte_mca_iof_hnp_component.xoff = false;
+    PMIX_OUTPUT_VERBOSE((1, prte_iof_base_framework.framework_output,
+                         "%s iof:hnp releasing stdin flow control",
+                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+    prc = PMIx_server_IOF_flow_control(NULL, PMIX_FWD_STDIN_CHANNEL, false,
+                                       NULL, 0, NULL, NULL);
+    if (PMIX_SUCCESS != prc && PMIX_OPERATION_SUCCEEDED != prc) {
+        PMIX_ERROR_LOG(prc);
+    }
+#endif
+}
+
 static void stdin_write_handler(int fd, short event, void *cbdata)
 {
     prte_iof_sink_t *sink = (prte_iof_sink_t *) cbdata;
@@ -438,6 +527,9 @@ static void stdin_write_handler(int fd, short event, void *cbdata)
             PMIX_OUTPUT_VERBOSE((20, prte_iof_base_framework.framework_output,
                                  "%s iof:hnp closing fd %d on write event due to zero bytes output",
                                  PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), wev->fd));
+            /* the sentinel is off the list, so releasing the write event
+             * will not free it for us */
+            PMIX_RELEASE(output);
             goto finish;
         }
         num_written = write(wev->fd, output->data, output->numbytes);
@@ -466,9 +558,10 @@ static void stdin_write_handler(int fd, short event, void *cbdata)
             PMIX_OUTPUT_VERBOSE((1, prte_iof_base_framework.framework_output,
                                  "%s hnp:stdin:write:handler incomplete write %d - adjusting data",
                                  PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), num_written));
-            /* incomplete write - adjust data and count to avoid duplicate output */
-            output->numbytes -= num_written;
-            memmove(output->data, &output->data[num_written], output->numbytes);
+            /* incomplete write - drop what went out and re-base the
+             * remainder to avoid duplicate output
+             */
+            prte_iof_base_adjust_short_write(output, num_written);
             /* push this item back on the front of the list */
             pmix_list_prepend(&wev->outputs, item);
             /* leave the write event running so it will call us again
@@ -489,6 +582,11 @@ re_enter:
     PRTE_IOF_SINK_ACTIVATE(wev);
 
 check:
+    if (pmix_list_get_size(&wev->outputs) < PRTE_IOF_MAX_INPUT_BUFFERS) {
+        /* this proc has absorbed enough to justify restarting the producers
+         * we suspended */
+        release_flow_control();
+    }
     if (sink->closed && 0 == pmix_list_get_size(&wev->outputs)) {
         /* the sink has already been closed and everything was written, time to release it */
         PMIX_RELEASE(sink);
@@ -496,6 +594,10 @@ check:
     return;
 
 finish:
+    /* this sink is going away, so it will never drain - if it is the one
+     * that suspended the producers, they have to be let go here or they
+     * stay suspended for the life of the job */
+    release_flow_control();
     PMIX_RELEASE(wev);
     sink->wev = NULL;
     return;

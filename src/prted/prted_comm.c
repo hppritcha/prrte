@@ -18,7 +18,7 @@
  * Copyright (c) 2016-2019 Research Organization for Information Science
  *                         and Technology (RIST). All rights reserved.
  * Copyright (c) 2020      IBM Corporation.  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -62,13 +62,14 @@
 
 #include "src/mca/errmgr/errmgr.h"
 #include "src/mca/ess/ess.h"
-#include "src/mca/grpcomm/base/base.h"
+#include "src/grpcomm/grpcomm.h"
 #include "src/mca/iof/base/base.h"
 #include "src/mca/odls/base/base.h"
 #include "src/mca/plm/base/base.h"
 #include "src/mca/plm/plm.h"
 #include "src/mca/rmaps/rmaps_types.h"
 #include "src/rml/rml.h"
+#include "src/mca/state/base/base.h"
 #include "src/mca/state/state.h"
 
 #include "src/runtime/prte_globals.h"
@@ -81,17 +82,213 @@
 /*
  * Globals
  */
-static char *get_prted_comm_cmd_str(int command);
+static const char *get_prted_comm_cmd_str(int command);
 
-static void _notify_release(pmix_status_t status, void *cbdata)
+/*
+ * Continuations for the three daemon commands that cannot finish until PMIx
+ * has finished something for us.
+ *
+ * These used to be written as "issue the PMIx call, then block on a
+ * prte_pmix_lock_t until its completion callback wakes us up".  That works,
+ * but prte_daemon_recv runs on the thread that DRIVES prte_event_base - both
+ * prted and the HNP sit in a while (prte_event_base_active) prte_event_loop()
+ * loop, and an RML receive callback is dispatched from inside it.  Blocking
+ * there parks the daemon's entire event loop for the duration: no RML traffic
+ * is serviced, no timer fires, no other daemon command runs, and - the reason
+ * this is a correctness problem and not just a latency one - anything PMIx
+ * needs from us in order to complete the call can never run.  That is a
+ * deadlock waiting for a PMIx implementation detail to change underneath us;
+ * the "prte.notify.donotloop" marker on the notifications below is precisely
+ * a workaround for one instance of it.
+ *
+ * So none of them block.  The PMIx completion callback obeys the golden rule
+ * - capture and post, touch nothing - and everything that used to follow the
+ * wait now runs here, on the progress thread, out of the caddy.
+ *
+ * One consequence to keep in mind when editing these: the info array's
+ * lifetime is now ours.  PMIx needs it to stay valid until the callback
+ * fires, which happens after prte_daemon_recv has returned, so it must be
+ * heap-allocated and carried on the caddy rather than left on the stack.
+ */
+typedef enum {
+    PRTE_DAEMON_CONT_HALT_VM,
+    PRTE_DAEMON_CONT_SHRINK,
+    PRTE_DAEMON_CONT_CLEANUP_JOB
+} prte_daemon_cont_t;
+
+typedef struct {
+    pmix_object_t super;
+    pmix_event_t ev;
+    prte_daemon_cont_t what;
+    pmix_nspace_t job;      /* CLEANUP_JOB only */
+    pmix_info_t *info;      /* the notification array, ours to free */
+    size_t ninfo;
+} prte_daemon_caddy_t;
+
+static void dcdcon(prte_daemon_caddy_t *p)
 {
-    prte_pmix_lock_t *lk = (prte_pmix_lock_t *) cbdata;
-    PRTE_HIDE_UNUSED_PARAMS(status);
+    p->what = PRTE_DAEMON_CONT_HALT_VM;
+    PMIX_LOAD_NSPACE(p->job, NULL);
+    p->info = NULL;
+    p->ninfo = 0;
+}
+static void dcddes(prte_daemon_caddy_t *p)
+{
+    if (NULL != p->info) {
+        PMIX_INFO_FREE(p->info, p->ninfo);
+    }
+}
+static PMIX_CLASS_INSTANCE(prte_daemon_caddy_t, pmix_object_t, dcdcon, dcddes);
 
-    PRTE_PMIX_WAKEUP_THREAD(lk);
+/* is there anything local left to wait for before we can exit? */
+static bool nothing_left_locally(void)
+{
+    prte_proc_t *proct;
+    int i;
+
+    if (0 != prte_rml_base.n_children) {
+        return false;
+    }
+    for (i = 0; i < prte_local_children->size; i++) {
+        proct = (prte_proc_t *) pmix_pointer_array_get_item(prte_local_children, i);
+        if (NULL != proct && PRTE_FLAG_TEST(proct, PRTE_PROC_FLAG_ALIVE)) {
+            /* at least one is still alive */
+            return false;
+        }
+    }
+    return true;
 }
 
-static pmix_pointer_array_t *procs_prev_ordered_to_terminate = NULL;
+/* A daemon named as a target of a DVM shrink does not exit the instant it
+ * receives PRTE_DAEMON_SHRINK_CMD: it must stay alive long enough for its
+ * subtree's ACK of the shrink broadcast to reach the master, or the master's
+ * collective shrink-completion handler would never fire.  It therefore records
+ * that it is leaving and arms this bounded timer; the timer fires well after the
+ * broadcast has completed (broadcast ACKs propagate in milliseconds) and drives
+ * the actual departure.  A daemon leaves only once, so a file-static event
+ * suffices.  This is the "bounded self-exit fallback"; a lifeline-loss fast path
+ * (prte_rml_route_lost) departs sooner when the connection actually drops. */
+static prte_event_t prte_shrink_depart_ev;
+static struct timeval prte_shrink_depart_tv = {2, 0};
+
+static void prte_shrink_depart(int sd, short args, void *cbdata)
+{
+    PRTE_HIDE_UNUSED_PARAMS(sd, args, cbdata);
+    /* communications to the rest of the DVM can no longer be relied upon, so
+     * force a local termination exactly as the comm-failure path would */
+    prte_abnormal_term_ordered = true;
+    PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_DAEMONS_TERMINATED);
+}
+
+/* runs on the PRRTE progress thread once PMIx has completed the call the
+ * command issued - see the note above prte_daemon_caddy_t */
+static void _daemon_continue(int sd, short args, void *cbdata)
+{
+    prte_daemon_caddy_t *cd = (prte_daemon_caddy_t *) cbdata;
+    pmix_proc_t pname;
+    prte_job_t *jdata;
+    PRTE_HIDE_UNUSED_PARAMS(sd, args);
+
+    PMIX_ACQUIRE_OBJECT(cd);
+
+    switch (cd->what) {
+
+    case PRTE_DAEMON_CONT_HALT_VM:
+        // ensure daemons know we were ordered to terminate
+        prte_prteds_term_ordered = true;
+        if (PRTE_PROC_IS_MASTER && !nothing_left_locally()) {
+            /* something is still alive under us - the state machine will
+             * bring us down when it goes away */
+            break;
+        }
+        if (prte_debug_daemons_flag && PRTE_PROC_IS_MASTER) {
+            pmix_output(0, "%s prted_cmd: all routes and children gone - exiting",
+                        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME));
+        }
+        PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_DAEMONS_TERMINATED);
+        break;
+
+    case PRTE_DAEMON_CONT_SHRINK:
+        // mark abnormal exit status
+        PRTE_UPDATE_EXIT_STATUS(-1);
+        if (prte_elastic_mode) {
+            /* Elastic shrink: the master completes the campaign from the
+             * broadcast's completion, so we must NOT exit until our
+             * subtree's ACK of this broadcast has reached it.  Record that
+             * we are leaving - which also lets the lifeline-loss path treat
+             * a dropped connection as a cue to depart rather than recover -
+             * and arm a bounded departure timer; we exit when it fires or,
+             * if sooner, when our lifeline drops (prte_rml_route_lost
+             * departs early once prte_dvm_leaving is set).  Because the
+             * shrink command reached us through our own lifeline, setting
+             * this here can never race ahead of a genuine fault. */
+            prte_dvm_leaving = true;
+            prte_event_evtimer_set(prte_event_base, &prte_shrink_depart_ev,
+                                   prte_shrink_depart, NULL);
+            prte_event_evtimer_add(&prte_shrink_depart_ev, &prte_shrink_depart_tv);
+        } else {
+            /* legacy fire-and-forget shrink (no completion tracking): do a
+             * clean immediate exit, exactly as before.  The HNP detects our
+             * departure via the normal daemon-loss (comm-failure) path. */
+            prte_abnormal_term_ordered = true;
+            PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_DAEMONS_TERMINATED);
+        }
+        break;
+
+    case PRTE_DAEMON_CONT_CLEANUP_JOB:
+        /* the nspace is deregistered - now clear any server ops still
+         * holding a reference to it */
+        PMIX_LOAD_PROCID(&pname, cd->job, PMIX_RANK_WILDCARD);
+        prte_pmix_server_clear(&pname);
+        /* ...and now, finally, let the job object go.  A daemon holds it
+         * from the launch message until here, through its own procs
+         * finishing, because until the DVM says the job is over somebody
+         * may still ask it where one of those procs was placed and how it
+         * was bound - it is the only copy of that.  The master runs its own
+         * job lifecycle and is not part of this. */
+        if (!PRTE_PROC_IS_MASTER) {
+            jdata = prte_get_job_data_object(cd->job);
+            if (NULL != jdata) {
+                /* from here on the answer to a question about it is "not
+                 * found" rather than "wait" - the difference is a hang */
+                prte_pmix_server_job_departed(cd->job);
+                PMIX_RELEASE(jdata);
+            }
+        }
+        break;
+    }
+
+    PMIX_RELEASE(cd);
+}
+
+/* PMIx invokes this on ITS progress thread: capture and post, nothing else */
+static void _daemon_cont_cbfunc(pmix_status_t status, void *cbdata)
+{
+    prte_daemon_caddy_t *cd = (prte_daemon_caddy_t *) cbdata;
+    PRTE_HIDE_UNUSED_PARAMS(status);
+
+    PRTE_PMIX_THREADSHIFT(cd, prte_event_base, _daemon_continue);
+}
+
+/* Build the "job end" courtesy notification we send to any tools attached to
+ * us before we go away.  Returns a caddy owning the info array; the caller
+ * hands that array to PMIx and the caddy outlives the call. */
+static prte_daemon_caddy_t *notify_job_end(prte_daemon_cont_t what)
+{
+    prte_daemon_caddy_t *cd;
+
+    cd = PMIX_NEW(prte_daemon_caddy_t);
+    cd->what = what;
+    cd->ninfo = 4;
+    PMIX_INFO_CREATE(cd->info, cd->ninfo);
+    PMIX_INFO_LOAD(&cd->info[0], PMIX_EVENT_NON_DEFAULT, NULL, PMIX_BOOL);
+    PMIX_INFO_LOAD(&cd->info[1], PMIX_EVENT_AFFECTED_PROC,
+                   &prte_process_info.myproc, PMIX_PROC);
+    /* keep delivery local: do not loop back through our own server upcall */
+    PMIX_INFO_LOAD(&cd->info[2], "prte.notify.donotloop", NULL, PMIX_BOOL);
+    PMIX_INFO_LOAD(&cd->info[3], PMIX_EVENT_DO_NOT_CACHE, NULL, PMIX_BOOL);
+    return cd;
+}
 
 void prte_daemon_recv(int status, pmix_proc_t *sender,
                       pmix_data_buffer_t *buffer,
@@ -109,22 +306,15 @@ void prte_daemon_recv(int status, pmix_proc_t *sender,
     pmix_pointer_array_t procarray;
     prte_proc_t *proct;
     char *cmd_str = NULL;
-    pmix_pointer_array_t *procs_to_kill = NULL;
-    int32_t num_procs, num_new_procs = 0, p;
-    prte_proc_t *cur_proc = NULL, *prev_proc = NULL;
-    bool found = false;
-    bool compressed;
+    int32_t num_procs;
     FILE *fp;
     char gscmd[256], path[1035], *pathptr;
     char string[256], *string_ptr = string;
-    char *coprocessors;
-    prte_pmix_lock_t lk;
-    pmix_proc_t pname;
     pmix_byte_object_t pbo;
-    pmix_topology_t ptopo;
     char *tmp;
-    pmix_info_t info[4];
-    PRTE_HIDE_UNUSED_PARAMS(status, tag, cbdata);
+    pmix_rank_t *ranks;
+    prte_daemon_caddy_t *cd;
+    PRTE_HIDE_UNUSED_PARAMS(status, sender, tag, cbdata);
 
     /* unpack the command */
     n = 1;
@@ -134,12 +324,10 @@ void prte_daemon_recv(int status, pmix_proc_t *sender,
         return;
     }
 
-    cmd_str = get_prted_comm_cmd_str(command);
     PMIX_OUTPUT_VERBOSE((1, prte_debug_output,
                          "%s prted:comm:process_commands() Processing Command: %s",
-                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), cmd_str));
-    free(cmd_str);
-    cmd_str = NULL;
+                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                         get_prted_comm_cmd_str(command)));
 
     /* now process the command locally */
     switch (command) {
@@ -157,8 +345,11 @@ void prte_daemon_recv(int status, pmix_proc_t *sender,
         PMIX_CONSTRUCT(&procarray, pmix_pointer_array_t);
         pmix_pointer_array_init(&procarray, num_replies, PRTE_GLOBAL_ARRAY_MAX_SIZE, 16);
 
-        /* unpack the proc names into the array */
+        /* unpack the proc names into the array - reset the count first
+         * rather than inheriting whatever the command unpack left in it */
+        n = 1;
         while (PMIX_SUCCESS == (ret = PMIx_Data_unpack(NULL, buffer, &proc, &n, PMIX_PROC))) {
+            n = 1;
             proct = PMIX_NEW(prte_proc_t);
             PMIX_LOAD_PROCID(&proct->name, proc.nspace, proc.rank);
 
@@ -175,7 +366,6 @@ void prte_daemon_recv(int status, pmix_proc_t *sender,
             if (PRTE_SUCCESS != (ret = prte_odls.kill_local_procs(NULL))) {
                 PRTE_ERROR_LOG(ret);
             }
-            break;
         } else {
             /* kill the procs */
             if (PRTE_SUCCESS != (ret = prte_odls.kill_local_procs(&procarray))) {
@@ -183,11 +373,13 @@ void prte_daemon_recv(int status, pmix_proc_t *sender,
             }
         }
 
-        /* cleanup */
+        /* cleanup - these are PMIX_NEW'd class objects, so they must be
+         * released, not free()d: free() skips the destructor and leaks
+         * everything the proc object owns */
     KILL_PROC_CLEANUP:
         for (i = 0; i < procarray.size; i++) {
             if (NULL != (proct = (prte_proc_t *) pmix_pointer_array_get_item(&procarray, i))) {
-                free(proct);
+                PMIX_RELEASE(proct);
             }
         }
         PMIX_DESTRUCT(&procarray);
@@ -233,9 +425,28 @@ void prte_daemon_recv(int status, pmix_proc_t *sender,
                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), signal);
         }
 
-        /* signal them */
-        if (PRTE_SUCCESS != (ret = prte_odls.signal_local_procs(NULL, signal))) {
-            PRTE_ERROR_LOG(ret);
+        /* Signal them.  The command names a target job, so honor it:
+         * handing NULL to the ODLS means "every local child", which in a
+         * persistent DVM hosting several jobs would deliver the signal to
+         * jobs that were never named.  An empty nspace means "all jobs",
+         * which is what the job-control path packs when it is given no
+         * targets at all. */
+        if (0 == strlen(job)) {
+            if (PRTE_SUCCESS != (ret = prte_odls.signal_local_procs(NULL, signal))) {
+                PRTE_ERROR_LOG(ret);
+            }
+        } else {
+            for (i = 0; i < prte_local_children->size; i++) {
+                proct = (prte_proc_t *) pmix_pointer_array_get_item(prte_local_children, i);
+                if (NULL == proct ||
+                    !PMIX_CHECK_NSPACE(proct->name.nspace, job)) {
+                    continue;
+                }
+                ret = prte_odls.signal_local_procs(&proct->name, signal);
+                if (PRTE_SUCCESS != ret) {
+                    PRTE_ERROR_LOG(ret);
+                }
+            }
         }
         break;
 
@@ -255,90 +466,6 @@ void prte_daemon_recv(int status, pmix_proc_t *sender,
         }
         break;
 
-    case PRTE_DAEMON_ABORT_PROCS_CALLED:
-        if (prte_debug_daemons_flag) {
-            pmix_output(0, "%s prted_cmd: received abort_procs report",
-                        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME));
-        }
-
-        /* Number of processes */
-        n = 1;
-        ret = PMIx_Data_unpack(NULL, buffer, &num_procs, &n, PMIX_INT32);
-        if (PMIX_SUCCESS != ret) {
-            PRTE_ERROR_LOG(ret);
-            goto CLEANUP;
-        }
-
-        /* Retrieve list of processes */
-        procs_to_kill = PMIX_NEW(pmix_pointer_array_t);
-        pmix_pointer_array_init(procs_to_kill, num_procs, INT32_MAX, 2);
-
-        /* Keep track of previously terminated, so we don't keep ordering the
-         * same processes to die.
-         */
-        if (NULL == procs_prev_ordered_to_terminate) {
-            procs_prev_ordered_to_terminate = PMIX_NEW(pmix_pointer_array_t);
-            pmix_pointer_array_init(procs_prev_ordered_to_terminate, num_procs + 1, INT32_MAX, 8);
-        }
-
-        num_new_procs = 0;
-        for (i = 0; i < num_procs; ++i) {
-            cur_proc = PMIX_NEW(prte_proc_t);
-
-            n = 1;
-            ret = PMIx_Data_unpack(NULL, buffer, &(cur_proc->name), &n, PMIX_PROC);
-            if (PMIX_SUCCESS != ret) {
-                PMIX_ERROR_LOG(ret);
-                goto CLEANUP;
-            }
-
-            /* See if duplicate */
-            found = false;
-            for (p = 0; p < procs_prev_ordered_to_terminate->size; ++p) {
-                if (NULL
-                    == (prev_proc = (prte_proc_t *)
-                            pmix_pointer_array_get_item(procs_prev_ordered_to_terminate, p))) {
-                    continue;
-                }
-                if (PMIX_CHECK_PROCID(&cur_proc->name, &prev_proc->name)) {
-                    found = true;
-                    break;
-                }
-            }
-
-            PMIX_OUTPUT_VERBOSE(
-                (2, prte_debug_output,
-                 "%s prted:comm:abort_procs Application %s requests term. of %s (%2d of %2d) %3s.",
-                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(sender),
-                 PRTE_NAME_PRINT(&(cur_proc->name)), i, num_procs, (found ? "Dup" : "New")));
-
-            /* If not a duplicate, then add to the to_kill list */
-            if (!found) {
-                pmix_pointer_array_add(procs_to_kill, (void *) cur_proc);
-                PMIX_RETAIN(cur_proc);
-                pmix_pointer_array_add(procs_prev_ordered_to_terminate, (void *) cur_proc);
-                num_new_procs++;
-            }
-        }
-
-        /*
-         * Send the request to terminate
-         */
-        if (num_new_procs > 0) {
-            PMIX_OUTPUT_VERBOSE((2, prte_debug_output,
-                                 "%s prted:comm:abort_procs Terminating application requested "
-                                 "processes (%2d / %2d).",
-                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), num_new_procs, num_procs));
-            prte_plm.terminate_procs(procs_to_kill);
-        } else {
-            PMIX_OUTPUT_VERBOSE((2, prte_debug_output,
-                                 "%s prted:comm:abort_procs No new application processes to "
-                                 "terminating from request (%2d / %2d).",
-                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), num_new_procs, num_procs));
-        }
-
-        break;
-
         /****    DEFINE PSET    ****/
     case PRTE_DAEMON_DEFINE_PSET:
         // get pset name
@@ -352,20 +479,24 @@ void prte_daemon_recv(int status, pmix_proc_t *sender,
         n = 1;
         ret = PMIx_Data_unpack(NULL, buffer, &num_procs, &n, PMIX_INT32);
         if (PMIX_SUCCESS != ret) {
-            PRTE_ERROR_LOG(ret);
+            PMIX_ERROR_LOG(ret);
+            free(cmd_str);
             goto CLEANUP;
         }
         // create space for them
         pptr = PMIx_Proc_create(num_procs);
         if (NULL == pptr) {
             PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+            free(cmd_str);
             goto CLEANUP;
         }
         // unpack the targets
         n = num_procs;
         ret = PMIx_Data_unpack(NULL, buffer, pptr, &n, PMIX_PROC);
         if (PMIX_SUCCESS != ret) {
-            PRTE_ERROR_LOG(ret);
+            PMIX_ERROR_LOG(ret);
+            free(cmd_str);
+            PMIx_Proc_free(pptr, num_procs);
             goto CLEANUP;
         }
         // define the pset
@@ -384,7 +515,8 @@ void prte_daemon_recv(int status, pmix_proc_t *sender,
             pmix_output(0, "%s prted_cmd: received exit cmd", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME));
         }
         jdata = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
-        if (prte_get_attribute(&jdata->attributes, PRTE_JOB_DO_NOT_LAUNCH, NULL, PMIX_BOOL)) {
+        if (NULL != jdata &&
+            prte_get_attribute(&jdata->attributes, PRTE_JOB_DO_NOT_LAUNCH, NULL, PMIX_BOOL)) {
             PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_DAEMONS_TERMINATED);
             return;
         }
@@ -393,7 +525,7 @@ void prte_daemon_recv(int status, pmix_proc_t *sender,
         // ensure daemons know we were ordered to terminate
         prte_prteds_term_ordered = true;
         /* if all my routes and local children are gone, then terminate ourselves */
-        if (0 == (ret = pmix_list_get_size(&prte_rml_base.children))) {
+        if (0 == (ret = prte_rml_base.n_children)) {
             for (i = 0; i < prte_local_children->size; i++) {
                 proct = (prte_proc_t *) pmix_pointer_array_get_item(prte_local_children, i);
                 if (NULL != proct && PRTE_FLAG_TEST(proct, PRTE_PROC_FLAG_ALIVE)) {
@@ -428,46 +560,84 @@ void prte_daemon_recv(int status, pmix_proc_t *sender,
         prte_abnormal_term_ordered = true;
 
         jdata = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
-        if (prte_get_attribute(&jdata->attributes, PRTE_JOB_DO_NOT_LAUNCH, NULL, PMIX_BOOL)) {
+        if (NULL != jdata &&
+            prte_get_attribute(&jdata->attributes, PRTE_JOB_DO_NOT_LAUNCH, NULL, PMIX_BOOL)) {
             PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_DAEMONS_TERMINATED);
             return;
         }
         /* kill the local procs */
         prte_odls.kill_local_procs(NULL);
         /* any tools attached to us will have done so via PMIx, so
-         * let's provide them with a friendly "job end" notification */
-        PMIX_INFO_LOAD(&info[0], PMIX_EVENT_NON_DEFAULT, NULL, PMIX_BOOL);
-        PMIX_INFO_LOAD(&info[1], PMIX_EVENT_AFFECTED_PROC, &prte_process_info.myproc, PMIX_PROC);
-        PMIX_INFO_LOAD(&info[2], "prte.notify.donotloop", NULL, PMIX_BOOL);
-        PMIX_INFO_LOAD(&info[3], PMIX_EVENT_DO_NOT_CACHE, NULL, PMIX_BOOL);
-        PRTE_PMIX_CONSTRUCT_LOCK(&lk);
+         * let's provide them with a friendly "job end" notification.  We do
+         * NOT wait for it here - see the note above prte_daemon_caddy_t; the
+         * teardown that used to follow the wait now runs in the continuation */
+        cd = notify_job_end(PRTE_DAEMON_CONT_HALT_VM);
         ret = PMIx_Notify_event(PMIX_EVENT_JOB_END, &prte_process_info.myproc,
-                                PMIX_RANGE_SESSION, info, 4, _notify_release, &lk);
-        PRTE_PMIX_WAIT_THREAD(&lk);
-        PRTE_PMIX_DESTRUCT_LOCK(&lk);
-        // ensure daemons know we were ordered to terminate
-        prte_prteds_term_ordered = true;
-        if (PRTE_PROC_IS_MASTER) {
-            /* if all my routes and local children are gone, then terminate ourselves */
-            if (0 == pmix_list_get_size(&prte_rml_base.children)) {
-                for (i = 0; i < prte_local_children->size; i++) {
-                    proct = (prte_proc_t *) pmix_pointer_array_get_item(prte_local_children, i);
-                    if (NULL != proct && PRTE_FLAG_TEST(proct, PRTE_PROC_FLAG_ALIVE)) {
-                        /* at least one is still alive */
-                        return;
-                    }
-                }
-                /* call our appropriate exit procedure */
-                if (prte_debug_daemons_flag) {
-                    pmix_output(0, "%s prted_cmd: all routes and children gone - exiting",
-                                PRTE_NAME_PRINT(PRTE_PROC_MY_NAME));
-                }
-                PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_DAEMONS_TERMINATED);
+                                PMIX_RANGE_SESSION, cd->info, cd->ninfo,
+                                _daemon_cont_cbfunc, cd);
+        if (PMIX_SUCCESS != ret) {
+            /* the callback will not fire - we are already on the progress
+             * thread, so just run the continuation directly */
+            if (PMIX_OPERATION_SUCCEEDED != ret) {
+                PMIX_ERROR_LOG(ret);
             }
-        } else {
-            PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_DAEMONS_TERMINATED);
+            _daemon_continue(0, 0, cd);
         }
         return;
+
+        /****    SHRINK DVM    ****/
+    case PRTE_DAEMON_SHRINK_CMD:
+        // get number of daemon ranks to be terminated
+        n = 1;
+        ret = PMIx_Data_unpack(NULL, buffer, &num_procs, &n, PMIX_INT32);
+        if (PMIX_SUCCESS != ret) {
+            PRTE_ERROR_LOG(ret);
+            goto CLEANUP;
+        }
+        // create space for them
+        ranks = (pmix_rank_t*)malloc(num_procs * sizeof(pmix_rank_t));
+        if (NULL == ranks) {
+            PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+            goto CLEANUP;
+        }
+        // unpack the targets
+        n = num_procs;
+        ret = PMIx_Data_unpack(NULL, buffer, ranks, &n, PMIX_PROC_RANK);
+        if (PMIX_SUCCESS != ret) {
+            PRTE_ERROR_LOG(ret);
+            free(ranks);
+            goto CLEANUP;
+        }
+        // see if we are one of them
+        for (i=0; i < num_procs; i++) {
+            if (ranks[i] == PRTE_PROC_MY_NAME->rank) {
+                if (prte_dvm_leaving) {
+                    /* we are already on our way out - a repeat of the
+                     * broadcast must not re-arm the departure timer */
+                    break;
+                }
+                /* any tools attached to us will have done so via PMIx, so
+                 * let's provide them with a friendly "job end" notification.
+                 * We do NOT wait for it here - see the note above
+                 * prte_daemon_caddy_t; the departure that used to follow the
+                 * wait now runs in the continuation */
+                cd = notify_job_end(PRTE_DAEMON_CONT_SHRINK);
+                ret = PMIx_Notify_event(PMIX_EVENT_JOB_END, &prte_process_info.myproc,
+                                        PMIX_RANGE_SESSION, cd->info, cd->ninfo,
+                                        _daemon_cont_cbfunc, cd);
+                if (PMIX_SUCCESS != ret) {
+                    /* the callback will not fire - we are already on the
+                     * progress thread, so just run the continuation */
+                    if (PMIX_OPERATION_SUCCEEDED != ret) {
+                        PMIX_ERROR_LOG(ret);
+                    }
+                    _daemon_continue(0, 0, cd);
+                }
+                break;
+            }
+        }
+        free(ranks);
+        break;
 
         /****     DVM CLEANUP JOB COMMAND    ****/
     case PRTE_DAEMON_DVM_CLEANUP_JOB_CMD:
@@ -485,98 +655,42 @@ void prte_daemon_recv(int status, pmix_proc_t *sender,
              * was already cleaned up, or it was a tool */
             goto CLEANUP;
         }
-        /* if would be rare, but a very fast terminating job could conceivably
-         * reach here prior to the spawn requestor being notified of spawn */
-        ret = prte_plm_base_spawn_response(PMIX_SUCCESS, jdata);
-        if (PRTE_SUCCESS != ret) {
-            PRTE_ERROR_LOG(ret);
+        /* It would be rare, but a very fast terminating job could conceivably
+         * reach here prior to the spawn requestor being notified of spawn.
+         * Only two of us can say anything useful about that: the master, which
+         * knows the launch result, and the daemon hosting the requestor, whose
+         * notification is local. This command is xcast to every daemon, and the
+         * rest of them hold nothing but an unpacked copy of the job - having
+         * them each fire a spawn response at the requestor's daemon means it
+         * gets one real response and one per bystander, and every one after
+         * the first finds its request already retired and logs a spurious
+         * "not found". */
+        if (PRTE_PROC_IS_MASTER ||
+            PMIX_CHECK_PROCID_STRICT(&jdata->originator, PRTE_PROC_MY_NAME)) {
+            ret = prte_plm_base_spawn_response(PMIX_SUCCESS, jdata);
+            if (PRTE_SUCCESS != ret) {
+                PRTE_ERROR_LOG(ret);
+            }
         }
 
-        PRTE_PMIX_CONSTRUCT_LOCK(&lk);
-        PMIx_server_deregister_nspace(job, _notify_release, &lk);
-        PRTE_PMIX_WAIT_THREAD(&lk);
-        PRTE_PMIX_DESTRUCT_LOCK(&lk);
+        /* The namespace is over everywhere - which only the master can say,
+         * and this is it saying so.  Drop what this job published into OUR
+         * store: the local-range items its procs left behind, which no
+         * other process can reach and which nothing else will reclaim
+         * short of this daemon exiting. */
+        prte_state_base_purge_nspace(job);
 
-        /* cleanup any pending server ops */
-        PMIX_LOAD_PROCID(&pname, job, PMIX_RANK_WILDCARD);
-        prte_pmix_server_clear(&pname);
+        /* Deregister the nspace and, once that completes, clear any pending
+         * server ops that still reference it.  Deliberately not waited on
+         * here - see the note above prte_daemon_caddy_t.  This one matters
+         * most of the three: a job ending is a routine event on a busy
+         * persistent DVM, so parking the daemon's whole event loop on it
+         * stalls every other job the daemon is running. */
+        cd = PMIX_NEW(prte_daemon_caddy_t);
+        cd->what = PRTE_DAEMON_CONT_CLEANUP_JOB;
+        PMIX_LOAD_NSPACE(cd->job, job);
+        PMIx_server_deregister_nspace(job, _daemon_cont_cbfunc, cd);
 
-        break;
-
-        /****     REPORT TOPOLOGY COMMAND    ****/
-    case PRTE_DAEMON_REPORT_TOPOLOGY_CMD:
-        PMIX_DATA_BUFFER_CONSTRUCT(&data);
-        /* pack the topology signature */
-        ret = PMIx_Data_pack(NULL, &data, &prte_topo_signature, 1, PMIX_STRING);
-        if (PMIX_SUCCESS != ret) {
-            PMIX_ERROR_LOG(ret);
-            PMIX_DATA_BUFFER_DESTRUCT(&data);
-            goto CLEANUP;
-        }
-        /* pack the topology */
-        ptopo.source = "hwloc";
-        ptopo.topology = prte_hwloc_topology;
-        ret = PMIx_Data_pack(NULL, &data, &ptopo, 1, PMIX_TOPO);
-        if (PMIX_SUCCESS != ret) {
-            PRTE_ERROR_LOG(ret);
-            PMIX_DATA_BUFFER_DESTRUCT(&data);
-            goto CLEANUP;
-        }
-
-        /* detect and add any coprocessors */
-        coprocessors = prte_hwloc_base_find_coprocessors(prte_hwloc_topology);
-        ret = PMIx_Data_pack(NULL, &data, &coprocessors, 1, PMIX_STRING);
-        if (PMIX_SUCCESS != ret) {
-            PMIX_ERROR_LOG(ret);
-        }
-        if (NULL != coprocessors) {
-            free(coprocessors);
-        }
-        /* see if I am on a coprocessor */
-        coprocessors = prte_hwloc_base_check_on_coprocessor();
-        ret = PMIx_Data_pack(NULL, &data, &coprocessors, 1, PMIX_STRING);
-        if (PMIX_SUCCESS != ret) {
-            PMIX_ERROR_LOG(ret);
-        }
-        if (NULL != coprocessors) {
-            free(coprocessors);
-        }
-        PMIX_DATA_BUFFER_CREATE(answer);
-        if (PMIx_Data_compress((uint8_t *) data.base_ptr, data.bytes_used, (uint8_t **) &pbo.bytes,
-                               &pbo.size)) {
-            /* the data was compressed - mark that we compressed it */
-            compressed = true;
-        } else {
-            /* mark that it was not compressed */
-            compressed = false;
-            pbo.bytes = data.base_ptr;
-            pbo.size = data.bytes_used;
-            data.base_ptr = NULL;
-            data.bytes_used = 0;
-        }
-        PMIX_DATA_BUFFER_DESTRUCT(&data);
-        ret = PMIx_Data_pack(NULL, answer, &compressed, 1, PMIX_BOOL);
-        if (PMIX_SUCCESS != ret) {
-            PMIX_ERROR_LOG(ret);
-            PMIX_BYTE_OBJECT_DESTRUCT(&pbo);
-            PMIX_DATA_BUFFER_RELEASE(answer);
-            goto CLEANUP;
-        }
-        /* pack the payload */
-        ret = PMIx_Data_pack(NULL, answer, &pbo, 1, PMIX_BYTE_OBJECT);
-        if (PMIX_SUCCESS != ret) {
-            PMIX_ERROR_LOG(ret);
-            PMIX_BYTE_OBJECT_DESTRUCT(&pbo);
-            PMIX_DATA_BUFFER_RELEASE(answer);
-            goto CLEANUP;
-        }
-        PMIX_BYTE_OBJECT_DESTRUCT(&pbo);
-        /* send the data */
-        PRTE_RML_SEND(ret, sender->rank, answer, PRTE_RML_TAG_TOPOLOGY_REPORT);
-        if (PRTE_SUCCESS != ret) {
-            PRTE_ERROR_LOG(ret);
-            PMIX_DATA_BUFFER_RELEASE(answer);
-        }
         break;
 
     case PRTE_DAEMON_GET_STACK_TRACES:
@@ -589,6 +703,7 @@ void prte_daemon_recv(int status, pmix_proc_t *sender,
         ret = PMIx_Data_unpack(NULL, buffer, &job, &n, PMIX_PROC_NSPACE);
         if (PMIX_SUCCESS != ret) {
             PMIX_ERROR_LOG(ret);
+            PMIX_DATA_BUFFER_RELEASE(answer);
             goto CLEANUP;
         }
 
@@ -607,6 +722,7 @@ void prte_daemon_recv(int status, pmix_proc_t *sender,
             if (NULL != gstack_exec) {
                 free(gstack_exec);
             }
+            PMIX_DATA_BUFFER_RELEASE(answer);
             break;
         }
 
@@ -671,25 +787,31 @@ void prte_daemon_recv(int status, pmix_proc_t *sender,
                 }
                 /* close */
                 pclose(fp);
-                /* transfer this load */
+                /* Transfer this load.  PMIx_Data_unload hands us ownership
+                 * of the payload and PMIx_Data_pack copies it into the
+                 * answer, so the byte object is ours to release either way -
+                 * the error arm above does exactly that, and this one used
+                 * to leak one process's entire stack trace per process per
+                 * request. */
                 ret = PMIx_Data_unload(&data, &pbo);
                 if (PMIX_SUCCESS != ret) {
                     PMIX_ERROR_LOG(ret);
                     PMIX_DATA_BUFFER_DESTRUCT(&data);
                     break;
                 }
-                if (PMIX_SUCCESS != PMIx_Data_pack(NULL, answer, &pbo, 1, PMIX_BYTE_OBJECT)) {
-                    PMIX_DATA_BUFFER_DESTRUCT(&data);
+                ret = PMIx_Data_pack(NULL, answer, &pbo, 1, PMIX_BYTE_OBJECT);
+                PMIX_BYTE_OBJECT_DESTRUCT(&pbo);
+                PMIX_DATA_BUFFER_DESTRUCT(&data);
+                if (PMIX_SUCCESS != ret) {
                     break;
                 }
-                PMIX_DATA_BUFFER_DESTRUCT(&data);
             }
         }
         if (NULL != gstack_exec) {
             free(gstack_exec);
         }
         /* always send our response */
-        PRTE_RML_SEND(ret, PRTE_PROC_MY_HNP->rank, answer, PRTE_RML_TAG_STACK_TRACE);
+        PRTE_RML_RELIABLE_SEND(ret, PRTE_PROC_MY_HNP->rank, answer, PRTE_RML_TAG_STACK_TRACE);
         if (PRTE_SUCCESS != ret) {
             PRTE_ERROR_LOG(ret);
             PMIX_DATA_BUFFER_RELEASE(answer);
@@ -704,77 +826,94 @@ CLEANUP:
     return;
 }
 
-static char *get_prted_comm_cmd_str(int command)
+static const char *get_prted_comm_cmd_str(int command)
 {
     switch (command) {
     case PRTE_DAEMON_CONTACT_QUERY_CMD:
-        return strdup("PRTE_DAEMON_CONTACT_QUERY_CMD");
+        return "PRTE_DAEMON_CONTACT_QUERY_CMD";
+
     case PRTE_DAEMON_KILL_LOCAL_PROCS:
-        return strdup("PRTE_DAEMON_KILL_LOCAL_PROCS");
+        return "PRTE_DAEMON_KILL_LOCAL_PROCS";
+
     case PRTE_DAEMON_SIGNAL_LOCAL_PROCS:
-        return strdup("PRTE_DAEMON_SIGNAL_LOCAL_PROCS");
+        return "PRTE_DAEMON_SIGNAL_LOCAL_PROCS";
+
     case PRTE_DAEMON_ADD_LOCAL_PROCS:
-        return strdup("PRTE_DAEMON_ADD_LOCAL_PROCS");
+        return "PRTE_DAEMON_ADD_LOCAL_PROCS";
+
     case PRTE_DAEMON_HEARTBEAT_CMD:
-        return strdup("PRTE_DAEMON_HEARTBEAT_CMD");
+        return "PRTE_DAEMON_HEARTBEAT_CMD";
+
     case PRTE_DAEMON_EXIT_CMD:
-        return strdup("PRTE_DAEMON_EXIT_CMD");
+        return "PRTE_DAEMON_EXIT_CMD";
+
     case PRTE_DAEMON_PROCESS_AND_RELAY_CMD:
-        return strdup("PRTE_DAEMON_PROCESS_AND_RELAY_CMD");
+        return "PRTE_DAEMON_PROCESS_AND_RELAY_CMD";
+
     case PRTE_DAEMON_NULL_CMD:
-        return strdup("NULL");
+        return "NULL";
 
     case PRTE_DAEMON_REPORT_JOB_INFO_CMD:
-        return strdup("PRTE_DAEMON_REPORT_JOB_INFO_CMD");
+        return "PRTE_DAEMON_REPORT_JOB_INFO_CMD";
+
     case PRTE_DAEMON_REPORT_NODE_INFO_CMD:
-        return strdup("PRTE_DAEMON_REPORT_NODE_INFO_CMD");
+        return "PRTE_DAEMON_REPORT_NODE_INFO_CMD";
+
     case PRTE_DAEMON_REPORT_PROC_INFO_CMD:
-        return strdup("PRTE_DAEMON_REPORT_PROC_INFO_CMD");
+        return "PRTE_DAEMON_REPORT_PROC_INFO_CMD";
+
     case PRTE_DAEMON_SPAWN_JOB_CMD:
-        return strdup("PRTE_DAEMON_SPAWN_JOB_CMD");
+        return "PRTE_DAEMON_SPAWN_JOB_CMD";
+
     case PRTE_DAEMON_TERMINATE_JOB_CMD:
-        return strdup("PRTE_DAEMON_TERMINATE_JOB_CMD");
+        return "PRTE_DAEMON_TERMINATE_JOB_CMD";
+
     case PRTE_DAEMON_HALT_VM_CMD:
-        return strdup("PRTE_DAEMON_HALT_VM_CMD");
+        return "PRTE_DAEMON_HALT_VM_CMD";
+
     case PRTE_DAEMON_HALT_DVM_CMD:
-        return strdup("PRTE_DAEMON_HALT_DVM_CMD");
+        return "PRTE_DAEMON_HALT_DVM_CMD";
+
     case PRTE_DAEMON_REPORT_JOB_COMPLETE:
-        return strdup("PRTE_DAEMON_REPORT_JOB_COMPLETE");
+        return "PRTE_DAEMON_REPORT_JOB_COMPLETE";
+
     case PRTE_DAEMON_DEFINE_PSET:
-        return strdup("PRTE_DAEMON_DEFINE_PSET");
+        return "PRTE_DAEMON_DEFINE_PSET";
 
     case PRTE_DAEMON_TOP_CMD:
-        return strdup("PRTE_DAEMON_TOP_CMD");
+        return "PRTE_DAEMON_TOP_CMD";
 
     case PRTE_DAEMON_NAME_REQ_CMD:
-        return strdup("PRTE_DAEMON_NAME_REQ_CMD");
+        return "PRTE_DAEMON_NAME_REQ_CMD";
+
     case PRTE_DAEMON_CHECKIN_CMD:
-        return strdup("PRTE_DAEMON_CHECKIN_CMD");
+        return "PRTE_DAEMON_CHECKIN_CMD";
+
     case PRTE_TOOL_CHECKIN_CMD:
-        return strdup("PRTE_TOOL_CHECKIN_CMD");
+        return "PRTE_TOOL_CHECKIN_CMD";
 
     case PRTE_DAEMON_PROCESS_CMD:
-        return strdup("PRTE_DAEMON_PROCESS_CMD");
+        return "PRTE_DAEMON_PROCESS_CMD";
 
     case PRTE_DAEMON_ABORT_PROCS_CALLED:
-        return strdup("PRTE_DAEMON_ABORT_PROCS_CALLED");
+        return "PRTE_DAEMON_ABORT_PROCS_CALLED";
 
     case PRTE_DAEMON_DVM_ADD_PROCS:
-        return strdup("PRTE_DAEMON_DVM_ADD_PROCS");
+        return "PRTE_DAEMON_DVM_ADD_PROCS";
 
     case PRTE_DAEMON_GET_STACK_TRACES:
-        return strdup("PRTE_DAEMON_GET_STACK_TRACES");
+        return "PRTE_DAEMON_GET_STACK_TRACES";
 
     case PRTE_DAEMON_GET_MEMPROFILE:
-        return strdup("PRTE_DAEMON_GET_MEMPROFILE");
-
-    case PRTE_DAEMON_REPORT_TOPOLOGY_CMD:
-        return strdup("PRTE_DAEMON_REPORT_TOPOLOGY_CMD");
+        return "PRTE_DAEMON_GET_MEMPROFILE";
 
     case PRTE_DAEMON_DVM_CLEANUP_JOB_CMD:
-        return strdup("PRTE_DAEMON_DVM_CLEANUP_JOB_CMD");
+        return "PRTE_DAEMON_DVM_CLEANUP_JOB_CMD";
+
+    case PRTE_DAEMON_SHRINK_CMD:
+        return "PRTE_DAEMON_SHRINK_CMD";
 
     default:
-        return strdup("Unknown Command!");
+        return "Unknown Command!";
     }
 }

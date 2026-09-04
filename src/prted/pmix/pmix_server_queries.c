@@ -19,9 +19,11 @@
  * Copyright (c) 2014-2019 Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2020      IBM Corporation.  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * Copyright (c) 2024      Triad National Security, LLC. All rights
  *                         reserved.
+ * Copyright (c) 2026      Barcelona Supercomputing Center (BSC-CNS).
+ *                         All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -32,31 +34,38 @@
 
 #include "prte_config.h"
 
-#ifdef HAVE_UNISTD_H
-#    include <unistd.h>
-#endif
+#include <stdlib.h>
+#include <string.h>
 
 #include "src/hwloc/hwloc-internal.h"
 #include "src/pmix/pmix-internal.h"
-#include "src/util/pmix_argv.h"
 #include "src/util/pmix_os_path.h"
-#include "src/util/pmix_path.h"
 #include "src/util/pmix_output.h"
+#include "src/util/pmix_path.h"
 
 #include "src/mca/errmgr/errmgr.h"
-#include "src/mca/iof/iof.h"
-#include "src/mca/plm/base/plm_private.h"
-#include "src/mca/plm/plm.h"
 #include "src/mca/rmaps/rmaps_types.h"
 #include "src/rml/rml.h"
-#include "src/mca/schizo/schizo.h"
-#include "src/mca/state/state.h"
 #include "src/runtime/prte_globals.h"
-#include "src/threads/pmix_threads.h"
 #include "src/util/name_fns.h"
-#include "src/util/pmix_show_help.h"
 
 #include "src/prted/pmix/pmix_server_internal.h"
+
+/* A query's qualifiers are the requesting client's own: PMIx forwards the
+ * array to the host without inspecting what any entry holds, so reading a
+ * fixed member of the value union is reading whatever eight bytes the caller
+ * chose to put there.  Every qualifier this function acts on other than the
+ * two numeric ones is a string that it then hands to strlen(), strcmp() or
+ * PMIx_Check_nspace(), so a mistyped one is a fault - which any process or
+ * tool attached to a daemon could produce with a single PMIx_Query_info. */
+static bool qual_string(const pmix_info_t *qual, char **str)
+{
+    if (PMIX_STRING != qual->value.type) {
+        return false;
+    }
+    *str = qual->value.data.string;
+    return true;
+}
 
 static void qrel(void *cbdata)
 {
@@ -67,28 +76,204 @@ static void qrel(void *cbdata)
     PMIX_RELEASE(cd);
 }
 
+/* ==================================================================== *
+ * Queries a daemon cannot answer
+ *
+ * A prted holds the identity half of the DVM's node table and nothing
+ * else - the nidmap ships node names, aliases, daemon vpids and pool
+ * slots, never slot counts or node state - and holds no session but the
+ * default one.  A key whose answer comes out of either therefore has to
+ * be asked of the DVM master.
+ *
+ * Which keys those are is deliberately not written down anywhere.  Such
+ * a list is a point-in-time snapshot that goes stale the first time
+ * someone adds a key, and a stale entry does not fail loudly: it returns
+ * a default-constructed zero that reads exactly like a real answer.  So
+ * the decision is made by the *read* instead.  A branch reaches
+ * allocation state only through prte_get_allocated_nodes() and its two
+ * companions, which succeed on the master and return
+ * PRTE_ERR_NOT_AUTHORITATIVE anywhere else; a branch that gets that back
+ * jumps to the "defer" label and its key is forwarded.  A key added
+ * tomorrow that reads capacity is relayed with no edit here, and one
+ * that reads only what the nidmap and the launch message already deliver
+ * stays local with no edit either.
+ *
+ * Deferral is per key, not per query and not per request, because the
+ * three things a daemon must answer for *itself* can arrive in the same
+ * PMIx_Query_info as a key only the master can answer: PMIX_HWLOC_XML_*
+ * exports this node's topology, an unqualified PMIX_SERVER_URI is this
+ * daemon's own URI, and PMIX_QUERY_LOCAL_PROC_TABLE means the procs this
+ * daemon is hosting.  Relaying a whole query would answer those about
+ * the master.
+ * ==================================================================== */
+
+/* Finish a query: convert what was gathered, decide the status, and hand
+ * it to the client.  Reached either directly, when every key was answered
+ * here, or from the master's reply once its results have been merged in. */
+static void query_complete(prte_pmix_server_op_caddy_t *cd, void *results,
+                           size_t nkeys, pmix_status_t ret)
+{
+    prte_pmix_server_op_caddy_t *rcd;
+    pmix_status_t rc;
+    /* PMIx initializes this before anything in PMIx_Info_list_convert() can
+     * fail, but every path here depends on that and the early ones arrive
+     * having never touched it - so initialize it here rather than rely on
+     * the callee to initialize its caller's stack */
+    pmix_data_array_t dry = PMIX_DATA_ARRAY_STATIC_INIT;
+
+    rcd = PMIX_NEW(prte_pmix_server_op_caddy_t);
+    PMIX_INFO_LIST_CONVERT(rc, results, &dry);
+    if (PMIX_SUCCESS != rc && PMIX_ERR_EMPTY != rc) {
+        PMIX_ERROR_LOG(rc);
+        ret = rc;
+    }
+    PMIX_INFO_LIST_RELEASE(results);
+    /* only decide the status here if no arm has already decided it.  An error
+     * an arm set is what actually happened - a malformed qualifier, a job we
+     * do not know - and reporting "not found" in its place tells the caller
+     * the DVM looked.  PMIX_ERR_NOT_SUPPORTED used to be the one error
+     * protected from this, which is how the shape of it is visible: every
+     * other error an arm could set was being thrown away with an empty
+     * result list, which is exactly what an arm that failed leaves behind */
+    if (PMIX_SUCCESS == ret) {
+        if (PMIX_ERR_EMPTY == rc || 0 == dry.size) {
+            ret = PMIX_ERR_NOT_FOUND;
+        } else if (dry.size < nkeys) {
+            /* against cd->ninfo, which a query caddy never sets, this compared
+             * with zero and PMIX_QUERY_PARTIAL_SUCCESS could not be reached.
+             * The count that means something here is the number of keys that
+             * were asked for: fewer results than that is what partial success
+             * is for, and a caller has no other way to learn that one of its
+             * keys went unanswered */
+            ret = PMIX_QUERY_PARTIAL_SUCCESS;
+        }
+    }
+    rcd->ninfo = dry.size;
+    rcd->info = (pmix_info_t *) dry.array;
+    // memory allocated in the data array will be free'd when rcd is released
+    cd->infocbfunc(ret, rcd->info, rcd->ninfo, cd->cbdata, qrel, rcd);
+    PMIX_RELEASE(cd);
+}
+
+/* Record one key for the master, carrying the qualifiers of the query it
+ * came from - they are what select the job, node or allocation it is
+ * asking about, so the key is meaningless without them. */
+static void defer_key(pmix_query_t *dq, size_t *ndq, pmix_query_t *q, char *key)
+{
+    pmix_query_t *d = &dq[*ndq];
+    size_t i;
+
+    PMIx_Argv_append_nosize(&d->keys, key);
+    if (NULL != q->qualifiers && 0 < q->nqual) {
+        PMIX_INFO_CREATE(d->qualifiers, q->nqual);
+        for (i = 0; i < q->nqual; i++) {
+            PMIX_INFO_XFER(&d->qualifiers[i], &q->qualifiers[i]);
+        }
+        d->nqual = q->nqual;
+    }
+    ++(*ndq);
+}
+
+/* Send the deferred keys to the master.  The results gathered locally ride
+ * on the tracker and are merged with the master's reply, so the client sees
+ * one answer covering every key it asked for. */
+static pmix_status_t relay_query(prte_pmix_server_op_caddy_t *cd, void *results,
+                                 size_t nkeys, pmix_query_t *dq, size_t ndq)
+{
+    prte_pmix_server_req_t *req;
+    pmix_data_buffer_t *buf;
+    pmix_status_t rc;
+    int ret;
+
+    req = PMIX_NEW(prte_pmix_server_req_t);
+    pmix_asprintf(&req->operation, "QUERY");
+    req->qcaddy = cd;
+    req->qresults = results;
+    req->nkeys = nkeys;
+    req->local_index = pmix_pointer_array_add(&prte_pmix_server_globals.local_reqs, req);
+
+    PMIX_DATA_BUFFER_CREATE(buf);
+    /* our tracking room number, which the master echoes back */
+    rc = PMIx_Data_pack(NULL, buf, &req->local_index, 1, PMIX_INT);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        goto error;
+    }
+    /* the client that asked - the master defaults a query to the requestor's
+     * own job, so answering as ourselves would answer about the wrong one */
+    rc = PMIx_Data_pack(NULL, buf, &cd->proct, 1, PMIX_PROC);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        goto error;
+    }
+    rc = PMIx_Data_pack(NULL, buf, &ndq, 1, PMIX_SIZE);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        goto error;
+    }
+    rc = PMIx_Data_pack(NULL, buf, dq, ndq, PMIX_QUERY);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        goto error;
+    }
+
+    PRTE_RML_RELIABLE_SEND(ret, PRTE_PROC_MY_HNP->rank, buf, PRTE_RML_TAG_QUERY);
+    if (PRTE_SUCCESS != ret) {
+        PRTE_ERROR_LOG(ret);
+        PMIX_DATA_BUFFER_RELEASE(buf);
+        rc = prte_pmix_convert_rc(ret);
+        goto error_sent;
+    }
+    return PMIX_SUCCESS;
+
+error:
+    PMIX_DATA_BUFFER_RELEASE(buf);
+error_sent:
+    /* nothing will answer this tracker, and the caller is about to complete
+     * the query itself - so let go of the caddy and the results it holds */
+    req->qcaddy = NULL;
+    req->qresults = NULL;
+    pmix_pointer_array_set_item(&prte_pmix_server_globals.local_reqs,
+                                req->local_index, NULL);
+    PMIX_RELEASE(req);
+    return rc;
+}
+
 static void _query(int sd, short args, void *cbdata)
 {
     prte_pmix_server_op_caddy_t *cd = (prte_pmix_server_op_caddy_t *) cbdata;
-    prte_pmix_server_op_caddy_t *rcd;
     pmix_query_t *q;
     pmix_status_t ret = PMIX_SUCCESS;
     void *results, *plist, *stack, *cache;
-    prte_info_item_t *kv;
+    pmix_pointer_array_t *alloc_nodes, *dvm_nodes, *alloc_sessions;
     pmix_nspace_t jobid;
     prte_job_t *jdata;
     prte_node_t *node, *ndptr;
-    int j, k, rc;
+    int j, k, rc, prc;
     size_t m, n, p;
-    uint32_t key, nodeid, sessionid = UINT32_MAX;
+    /* keys this daemon cannot answer, bound for the master.  Sized to the
+     * total number of keys asked for, so a deferral never has to grow it. */
+    pmix_query_t *dq = NULL;
+    size_t ndq = 0, nq_alloc = 0;
+    uint32_t key, nodeid, sessionid = UINT32_MAX, nslots;
     char **nspaces, *hostname, *uri;
     char *cmdline;
+    const char *allocid;
+#ifdef PMIX_ALLOC_PROPERTY
+        const char *allocprop;
+#endif
     char **ans, *tmp;
+    size_t nkeys = 0;
     char *psetname;
     prte_app_context_t *app;
+    prte_session_t *session;
     int matched;
     pmix_proc_info_t *procinfo;
-    pmix_data_array_t dry;
+    /* PMIx initializes this before anything in PMIx_Info_list_convert() can
+     * fail, but every path to the done: label depends on that and the early
+     * ones reach it having never touched this - so initialize it here rather
+     * than rely on the callee to initialize its caller's stack */
+    pmix_data_array_t dry = PMIX_DATA_ARRAY_STATIC_INIT;
     prte_proc_t *proct;
     pmix_proc_t *proc;
     size_t sz;
@@ -100,6 +285,24 @@ static void _query(int sd, short args, void *cbdata)
                         "%s processing query",
                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME));
 
+    /* On the master nothing ever defers, so do not pay for the array there.
+     * Elsewhere, count the keys first: a deferral must not fail, and a
+     * fixed-size array bounded by the key count cannot. */
+    if (!PRTE_PROC_IS_MASTER) {
+        for (m = 0; m < cd->nqueries; m++) {
+            q = &cd->queries[m];
+            if (NULL == q->keys) {
+                continue;
+            }
+            for (n = 0; NULL != q->keys[n]; n++) {
+                ++nq_alloc;
+            }
+        }
+        if (0 < nq_alloc) {
+            PMIX_QUERY_CREATE(dq, nq_alloc);
+        }
+    }
+
     PMIX_INFO_LIST_START(results);
 
     /* see what they wanted */
@@ -108,6 +311,10 @@ static void _query(int sd, short args, void *cbdata)
         hostname = NULL;
         nodeid = UINT32_MAX;
         psetname = NULL;
+        allocid = NULL;
+#ifdef PMIX_ALLOC_PROPERTY
+        allocprop = NULL;
+#endif
         /* default to the requestor's jobid */
         PMIX_LOAD_NSPACE(jobid, cd->proct.nspace);
         /* see if they provided any qualifiers */
@@ -121,10 +328,14 @@ static void _query(int sd, short args, void *cbdata)
                                          : "(not a string)"));
 
                 if (PMIX_CHECK_KEY(&q->qualifiers[n], PMIX_NSPACE)) {
+                    char *nsq;
+                    if (!qual_string(&q->qualifiers[n], &nsq)) {
+                        ret = PMIX_ERR_BAD_PARAM;
+                        goto done;
+                    }
                     // the nspace could be NULL, indicating that this is a
                     // wildcard request - if so, then ignore it here
-                    if (NULL == q->qualifiers[n].value.data.string ||
-                        0 == strlen(q->qualifiers[n].value.data.string)) {
+                    if (NULL == nsq || 0 == strlen(nsq)) {
                         PMIX_LOAD_NSPACE(jobid, NULL);
                         continue;
                     }
@@ -137,7 +348,7 @@ static void _query(int sd, short args, void *cbdata)
                     for (k = 0; k < prte_job_data->size; k++) {
                         jdata = (prte_job_t *) pmix_pointer_array_get_item(prte_job_data, k);
                         if (NULL != jdata) {
-                            if (PMIX_CHECK_NSPACE(q->qualifiers[n].value.data.string, jdata->nspace)) {
+                            if (PMIX_CHECK_NSPACE(nsq, jdata->nspace)) {
                                 matched = 1;
                                 break;
                             }
@@ -147,7 +358,7 @@ static void _query(int sd, short args, void *cbdata)
                         pmix_output_verbose(2, prte_pmix_server_globals.output,
                                             "%s qualifier key \"%s\" : value \"%s\" is an unknown namespace",
                                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), q->qualifiers[n].key,
-                                            q->qualifiers[n].value.data.string);
+                                            nsq);
                         ret = PMIX_ERR_BAD_PARAM;
                         goto done;
                     }
@@ -159,16 +370,21 @@ static void _query(int sd, short args, void *cbdata)
                     }
 
                 } else if (PMIX_CHECK_KEY(&q->qualifiers[n], PMIX_GROUP_ID)) {
+                    char *grpq;
+                    prte_pmix_server_pset_t *ps;
                     /* Never trust the group string that is provided.
                      * First check to see if we know about this group. If
                      * not then return an error. If so then continue on.
                      */
+                    if (!qual_string(&q->qualifiers[n], &grpq) || NULL == grpq) {
+                        ret = PMIX_ERR_BAD_PARAM;
+                        goto done;
+                    }
                     /* Make sure the qualifier group exists */
                     matched = 0;
-                    prte_pmix_server_pset_t *ps;
                     PMIX_LIST_FOREACH(ps, &prte_pmix_server_globals.groups, prte_pmix_server_pset_t)
                     {
-                        if (PMIX_CHECK_NSPACE(q->qualifiers[n].value.data.string, ps->name)) {
+                        if (NULL != ps->name && PMIX_CHECK_NSPACE(grpq, ps->name)) {
                             matched = 1;
                             break;
                         }
@@ -177,33 +393,61 @@ static void _query(int sd, short args, void *cbdata)
                         pmix_output_verbose(2, prte_pmix_server_globals.output,
                                             "%s qualifier key \"%s\" : value \"%s\" is an unknown group",
                                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), q->qualifiers[n].key,
-                                            q->qualifiers[n].value.data.string);
+                                            grpq);
                         ret = PMIX_ERR_BAD_PARAM;
                         goto done;
                     }
-                    PMIX_LOAD_NSPACE(jobid, q->qualifiers[n].value.data.string);
+                    PMIX_LOAD_NSPACE(jobid, grpq);
                     if (PMIX_NSPACE_INVALID(jobid)) {
                         ret = PMIX_ERR_BAD_PARAM;
                         goto done;
                     }
 
                 } else if (PMIX_CHECK_KEY(&q->qualifiers[n], PMIX_HOSTNAME)) {
-                    hostname = q->qualifiers[n].value.data.string;
+                    if (!qual_string(&q->qualifiers[n], &hostname)) {
+                        ret = PMIX_ERR_BAD_PARAM;
+                        goto done;
+                    }
 
                 } else if (PMIX_CHECK_KEY(&q->qualifiers[n], PMIX_NODEID)) {
-                    PMIX_VALUE_GET_NUMBER(rc, &q->qualifiers[n].value, nodeid, uint32_t);
+                    rc = PMIx_Value_get_number(&q->qualifiers[n].value, &nodeid, PMIX_UINT32);
+                    if (PMIX_SUCCESS != rc) {
+                        ret = PMIX_ERR_BAD_PARAM;
+                        goto done;
+                    }
 
                 } else if (PMIX_CHECK_KEY(&q->qualifiers[n], PMIX_PSET_NAME)) {
-                    psetname = q->qualifiers[n].value.data.string;
+                    if (!qual_string(&q->qualifiers[n], &psetname)) {
+                        ret = PMIX_ERR_BAD_PARAM;
+                        goto done;
+                    }
 
                 } else if (PMIX_CHECK_KEY(&q->qualifiers[n], PMIX_SESSION_ID)) {
-                    PMIX_VALUE_GET_NUMBER(rc, &q->qualifiers[n].value, sessionid, uint32_t);
+                    rc = PMIx_Value_get_number(&q->qualifiers[n].value, &sessionid, PMIX_UINT32);
+                    if (PMIX_SUCCESS != rc) {
+                        ret = PMIX_ERR_BAD_PARAM;
+                        goto done;
+                    }
 
+                } else if (PMIX_CHECK_KEY(&q->qualifiers[n], PMIX_ALLOC_ID)) {
+                    if (!qual_string(&q->qualifiers[n], (char **) &allocid)) {
+                        ret = PMIX_ERR_BAD_PARAM;
+                        goto done;
+                    }
+
+#ifdef PMIX_ALLOC_PROPERTY
+                } else if (PMIX_CHECK_KEY(&q->qualifiers[n], PMIX_ALLOC_PROPERTY)) {
+                    if (!qual_string(&q->qualifiers[n], (char **) &allocprop)) {
+                        ret = PMIX_ERR_BAD_PARAM;
+                        goto done;
+                    }
+#endif
                 }
 
             }
         }
         for (n = 0; NULL != q->keys[n]; n++) {
+            ++nkeys;
             pmix_output_verbose(2, prte_pmix_server_globals.output,
                                 "%s processing key %s",
                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), q->keys[n]);
@@ -218,12 +462,12 @@ static void _query(int sd, short args, void *cbdata)
                     }
                     /* don't show the requestor's job */
                     if (!PMIX_CHECK_NSPACE(PRTE_PROC_MY_NAME->nspace, jdata->nspace)) {
-                        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&nspaces, jdata->nspace);
+                        PMIx_Argv_append_nosize(&nspaces, jdata->nspace);
                     }
                 }
                 /* join the results into a single comma-delimited string */
-                tmp = PMIX_ARGV_JOIN_COMPAT(nspaces, ',');
-                PMIX_ARGV_FREE_COMPAT(nspaces);
+                tmp = PMIx_Argv_join(nspaces, ',');
+                PMIx_Argv_free(nspaces);
                 PMIX_INFO_LIST_ADD(rc, results, PMIX_QUERY_NAMESPACES, tmp, PMIX_STRING);
                 free(tmp);
                 if (PMIX_SUCCESS != rc) {
@@ -239,8 +483,12 @@ static void _query(int sd, short args, void *cbdata)
                     if (NULL == jdata) {
                         continue;
                     }
-                    // if the session ID was given, then ignore jobs not from that session
-                    if (UINT32_MAX != sessionid && jdata->session->session_id != sessionid) {
+                    // if the session ID was given, then ignore jobs not from that session.
+                    // A job's session pointer is optional - the launch path falls back to
+                    // prte_default_session where it finds none - so a job that has none
+                    // belongs to no session the caller can have named
+                    if (UINT32_MAX != sessionid &&
+                        (NULL == jdata->session || jdata->session->session_id != sessionid)) {
                         continue;
                     }
                     PMIX_INFO_LIST_START(stack);
@@ -249,15 +497,18 @@ static void _query(int sd, short args, void *cbdata)
                     if (PMIX_SUCCESS != rc) {
                         PMIX_ERROR_LOG(rc);
                         PMIX_INFO_LIST_RELEASE(stack);
+                        PMIX_INFO_LIST_RELEASE(cache);
                         goto done;
                     }
                     /* add the cmd line */
                     app = (prte_app_context_t *) pmix_pointer_array_get_item(jdata->apps, 0);
                     if (NULL == app) {
                         ret = PMIX_ERR_NOT_FOUND;
+                        PMIX_INFO_LIST_RELEASE(stack);
+                        PMIX_INFO_LIST_RELEASE(cache);
                         goto done;
                     }
-                    cmdline = PMIX_ARGV_JOIN_COMPAT(app->argv, ' ');
+                    cmdline = PMIx_Argv_join(app->argv, ' ');
                     PMIX_INFO_LIST_ADD(rc, stack, PMIX_CMD_LINE, cmdline, PMIX_STRING);
                     free(cmdline);
                     /* add the job size */
@@ -265,6 +516,7 @@ static void _query(int sd, short args, void *cbdata)
                     if (PMIX_SUCCESS != rc) {
                         PMIX_ERROR_LOG(rc);
                         PMIX_INFO_LIST_RELEASE(stack);
+                        PMIX_INFO_LIST_RELEASE(cache);
                         goto done;
                     }
                     /* construct info on each process in the job */
@@ -280,15 +532,23 @@ static void _query(int sd, short args, void *cbdata)
                             PMIX_ERROR_LOG(rc);
                             PMIX_INFO_LIST_RELEASE(stack);
                             PMIX_INFO_LIST_RELEASE(plist);
+                            PMIX_INFO_LIST_RELEASE(cache);
                             goto done;
                         }
-                        /* add the proc's hostname */
-                        PMIX_INFO_LIST_ADD(rc, plist, PMIX_HOSTNAME, proct->node->name, PMIX_STRING);
-                        if (PMIX_SUCCESS != rc) {
-                            PMIX_ERROR_LOG(rc);
-                            PMIX_INFO_LIST_RELEASE(stack);
-                            PMIX_INFO_LIST_RELEASE(plist);
-                            goto done;
+                        /* add the proc's hostname.  A proc has no node until the
+                         * mapper places it, and this loop walks every job in the
+                         * array including one still being mapped - the proc table
+                         * below makes the same check and this did not */
+                        if (NULL != proct->node && NULL != proct->node->name) {
+                            PMIX_INFO_LIST_ADD(rc, plist, PMIX_HOSTNAME, proct->node->name,
+                                               PMIX_STRING);
+                            if (PMIX_SUCCESS != rc) {
+                                PMIX_ERROR_LOG(rc);
+                                PMIX_INFO_LIST_RELEASE(stack);
+                                PMIX_INFO_LIST_RELEASE(plist);
+                                PMIX_INFO_LIST_RELEASE(cache);
+                                goto done;
+                            }
                         }
                         /* add the proc's local rank */
                         PMIX_INFO_LIST_ADD(rc, plist, PMIX_LOCAL_RANK, &proct->local_rank, PMIX_UINT16);
@@ -296,6 +556,7 @@ static void _query(int sd, short args, void *cbdata)
                             PMIX_ERROR_LOG(rc);
                             PMIX_INFO_LIST_RELEASE(stack);
                             PMIX_INFO_LIST_RELEASE(plist);
+                            PMIX_INFO_LIST_RELEASE(cache);
                             goto done;
                         }
                         /* add to the stack */
@@ -304,6 +565,7 @@ static void _query(int sd, short args, void *cbdata)
                             PMIX_ERROR_LOG(rc);
                             PMIX_INFO_LIST_RELEASE(stack);
                             PMIX_INFO_LIST_RELEASE(plist);
+                            PMIX_INFO_LIST_RELEASE(cache);
                             goto done;
                         }
                         PMIX_INFO_LIST_RELEASE(plist);
@@ -315,6 +577,7 @@ static void _query(int sd, short args, void *cbdata)
                     if (PMIX_SUCCESS != rc) {
                         PMIX_ERROR_LOG(rc);
                         PMIX_INFO_LIST_RELEASE(stack);
+                        PMIX_INFO_LIST_RELEASE(cache);
                         goto done;
                     }
                     PMIX_INFO_LIST_RELEASE(stack);
@@ -337,21 +600,30 @@ static void _query(int sd, short args, void *cbdata)
 
             } else if (PMIx_Check_key(q->keys[n], PMIX_QUERY_SPAWN_SUPPORT)) {
                 ans = NULL;
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&ans, PMIX_HOST);
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&ans, PMIX_HOSTFILE);
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&ans, PMIX_ADD_HOST);
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&ans, PMIX_ADD_HOSTFILE);
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&ans, PMIX_PREFIX);
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&ans, PMIX_WDIR);
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&ans, PMIX_MAPPER);
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&ans, PMIX_PPR);
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&ans, PMIX_MAPBY);
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&ans, PMIX_RANKBY);
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&ans, PMIX_BINDTO);
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&ans, PMIX_COSPAWN_APP);
+                PMIx_Argv_append_nosize(&ans, PMIX_HOST);
+                PMIx_Argv_append_nosize(&ans, PMIX_HOSTFILE);
+                PMIx_Argv_append_nosize(&ans, PMIX_ADD_HOST);
+                PMIx_Argv_append_nosize(&ans, PMIX_ADD_HOSTFILE);
+                /* not a PMIx attribute: PMIx has no standard way to say
+                 * "start a daemon on a node I already hold". It is still a
+                 * spawn directive this DVM honors, and a tool that wants to
+                 * know whether it can use it has nowhere else to ask. */
+                PMIx_Argv_append_nosize(&ans, PRTE_ACTIVATE_HOSTS);
+                PMIx_Argv_append_nosize(&ans, PMIX_PREFIX);
+                PMIx_Argv_append_nosize(&ans, PMIX_WDIR);
+                /* deliberately not PMIX_MAPPER: naming a mapping component
+                 * is not a directive PRRTE can act on - the mapping policy
+                 * IS the choice of mapper - and a spawn carrying it is
+                 * refused, so advertising it here would be a promise we
+                 * break at the next call */
+                PMIx_Argv_append_nosize(&ans, PMIX_PPR);
+                PMIx_Argv_append_nosize(&ans, PMIX_MAPBY);
+                PMIx_Argv_append_nosize(&ans, PMIX_RANKBY);
+                PMIx_Argv_append_nosize(&ans, PMIX_BINDTO);
+                PMIx_Argv_append_nosize(&ans, PMIX_COSPAWN_APP);
                 /* create the return kv */
-                tmp = PMIX_ARGV_JOIN_COMPAT(ans, ',');
-                PMIX_ARGV_FREE_COMPAT(ans);
+                tmp = PMIx_Argv_join(ans, ',');
+                PMIx_Argv_free(ans);
                 PMIX_INFO_LIST_ADD(rc, results, PMIX_QUERY_SPAWN_SUPPORT, tmp, PMIX_STRING);
                 free(tmp);
                 if (PMIX_SUCCESS != rc) {
@@ -361,15 +633,15 @@ static void _query(int sd, short args, void *cbdata)
 
             } else if (PMIx_Check_key(q->keys[n], PMIX_QUERY_DEBUG_SUPPORT)) {
                 ans = NULL;
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&ans, PMIX_DEBUG_STOP_IN_INIT);
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&ans, PMIX_DEBUG_STOP_IN_APP);
+                PMIx_Argv_append_nosize(&ans, PMIX_DEBUG_STOP_IN_INIT);
+                PMIx_Argv_append_nosize(&ans, PMIX_DEBUG_STOP_IN_APP);
 #if PRTE_HAVE_STOP_ON_EXEC
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&ans, PMIX_DEBUG_STOP_ON_EXEC);
+                PMIx_Argv_append_nosize(&ans, PMIX_DEBUG_STOP_ON_EXEC);
 #endif
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&ans, PMIX_DEBUG_TARGET);
+                PMIx_Argv_append_nosize(&ans, PMIX_DEBUG_TARGET);
                 /* create the return kv */
-                tmp = PMIX_ARGV_JOIN_COMPAT(ans, ',');
-                PMIX_ARGV_FREE_COMPAT(ans);
+                tmp = PMIx_Argv_join(ans, ',');
+                PMIx_Argv_free(ans);
                 PMIX_INFO_LIST_ADD(rc, results, PMIX_QUERY_DEBUG_SUPPORT, tmp, PMIX_STRING);
                 free(tmp);
                 if (PMIX_SUCCESS != rc) {
@@ -381,11 +653,9 @@ static void _query(int sd, short args, void *cbdata)
                 if (NULL != prte_hwloc_topology) {
                     char *xmlbuffer = NULL;
                     int len;
-                    kv = PMIX_NEW(prte_info_item_t);
                     /* get it from the v2 API */
                     if (0 != hwloc_topology_export_xmlbuffer(prte_hwloc_topology, &xmlbuffer, &len,
                                                              HWLOC_TOPOLOGY_EXPORT_XML_FLAG_V1)) {
-                        PMIX_RELEASE(kv);
                         continue;
                     }
                     PMIX_INFO_LIST_ADD(rc, results, PMIX_HWLOC_XML_V1, xmlbuffer, PMIX_STRING);
@@ -400,9 +670,7 @@ static void _query(int sd, short args, void *cbdata)
                 if (NULL != prte_hwloc_topology) {
                     char *xmlbuffer = NULL;
                     int len;
-                    kv = PMIX_NEW(prte_info_item_t);
                     if (0 != hwloc_topology_export_xmlbuffer(prte_hwloc_topology, &xmlbuffer, &len, 0)) {
-                        PMIX_RELEASE(kv);
                         continue;
                     }
                     PMIX_INFO_LIST_ADD(rc, results, PMIX_HWLOC_XML_V2, xmlbuffer, PMIX_STRING);
@@ -466,13 +734,21 @@ static void _query(int sd, short args, void *cbdata)
                 } else {
                     /* send them ours */
                     proct = prte_get_proc_object(PRTE_PROC_MY_NAME);
+                    if (NULL == proct) {
+                        ret = PMIX_ERR_NOT_FOUND;
+                        goto done;
+                    }
                 }
                 /* get the server uri value - we can block here as we are in
                  * an PRTE progress thread */
                 PRTE_MODEX_RECV_VALUE_OPTIONAL(rc, PMIX_SERVER_URI, &proct->name,
                                                (char **) &uri, PMIX_STRING);
-                if (PRTE_SUCCESS != rc) {
-                    ret = prte_pmix_convert_rc(rc);
+                if (PMIX_SUCCESS != rc) {
+                    /* the macro yields a PMIx status - it is already in the
+                     * space this function returns. Running it through
+                     * prte_pmix_convert_rc() converts the wrong direction
+                     * and turned every failure here into PMIX_ERROR. */
+                    ret = rc;
                     goto done;
                 }
                 PMIX_INFO_LIST_ADD(rc, results, PMIX_SERVER_URI, uri, PMIX_STRING);
@@ -591,13 +867,13 @@ static void _query(int sd, short args, void *cbdata)
                 ans = NULL;
                 PMIX_LIST_FOREACH(ps, &prte_pmix_server_globals.psets, prte_pmix_server_pset_t)
                 {
-                    PMIX_ARGV_APPEND_NOSIZE_COMPAT(&ans, ps->name);
+                    PMIx_Argv_append_nosize(&ans, ps->name);
                 }
                 if (NULL == ans) {
                     tmp = NULL;;
                 } else {
-                    tmp = PMIX_ARGV_JOIN_COMPAT(ans, ',');
-                    PMIX_ARGV_FREE_COMPAT(ans);
+                    tmp = PMIx_Argv_join(ans, ',');
+                    PMIx_Argv_free(ans);
                     ans = NULL;
                 }
                 PMIX_INFO_LIST_ADD(rc, results, PMIX_QUERY_PSET_NAMES, tmp, PMIX_STRING);
@@ -669,10 +945,10 @@ static void _query(int sd, short args, void *cbdata)
                 ans = NULL;
                 PMIX_LIST_FOREACH(ps, &prte_pmix_server_globals.groups, prte_pmix_server_pset_t)
                 {
-                    PMIX_ARGV_APPEND_NOSIZE_COMPAT(&ans, ps->name);
+                    PMIx_Argv_append_nosize(&ans, ps->name);
                 }
-                tmp = PMIX_ARGV_JOIN_COMPAT(ans, ',');
-                PMIX_ARGV_FREE_COMPAT(ans);
+                tmp = PMIx_Argv_join(ans, ',');
+                PMIx_Argv_free(ans);
                 PMIX_INFO_LIST_ADD(rc, results, PMIX_QUERY_GROUP_NAMES, tmp, PMIX_STRING);
                 free(tmp);
                 if (PMIX_SUCCESS != rc) {
@@ -711,7 +987,6 @@ static void _query(int sd, short args, void *cbdata)
                     goto done;
                 }
 
-#if PMIX_NUMERIC_VERSION >= 0x00050000
             } else if (PMIx_Check_key(q->keys[n], PMIX_QUERY_ALLOCATION)) {
                 /* collect all the node info */
                 void *nodelist, *nodeinfolist;
@@ -719,10 +994,19 @@ static void _query(int sd, short args, void *cbdata)
                 prte_topology_t *topo;
                 int len;
 
+                /* slot counts and node state live only on the master */
+                prc = prte_get_allocated_nodes(allocid, &alloc_nodes);
+                if (PRTE_ERR_NOT_AUTHORITATIVE == prc) {
+                    goto defer;
+                }
+                if (PRTE_SUCCESS != prc) {
+                    ret = prte_pmix_convert_rc(prc);
+                    goto done;
+                }
                 PMIX_INFO_LIST_START(nodelist);
                 p = 0;
-                for (k=0; k < prte_node_pool->size; k++) {
-                    node = (prte_node_t*)pmix_pointer_array_get_item(prte_node_pool, k);
+                for (k=0; k < alloc_nodes->size; k++) {
+                    node = (prte_node_t*)pmix_pointer_array_get_item(alloc_nodes, k);
                     if (NULL == node) {
                         continue;
                     }
@@ -731,12 +1015,18 @@ static void _query(int sd, short args, void *cbdata)
                     PMIX_INFO_LIST_ADD(rc, nodeinfolist, PMIX_HOSTNAME, node->name, PMIX_STRING);
                     /* add any aliases */
                     if (NULL != node->aliases) {
-                        str = PMIX_ARGV_JOIN_COMPAT(node->aliases, ',');
+                        str = PMIx_Argv_join(node->aliases, ',');
                         PMIX_INFO_LIST_ADD(rc, nodeinfolist, PMIX_HOSTNAME_ALIASES, str, PMIX_STRING);
                         free(str);
                     }
+                    /* add the number of slots allocated on this node */
+                    nslots = (uint32_t) node->slots;
+                    PMIX_INFO_LIST_ADD(rc, nodeinfolist, PMIX_NUM_SLOTS, &nslots, PMIX_UINT32);
                     /* add topology index */
-                    PMIX_INFO_LIST_ADD(rc, nodeinfolist, PMIX_TOPOLOGY_INDEX, &node->topology->index, PMIX_INT);
+                    if (NULL != node->topology) {
+                        PMIX_INFO_LIST_ADD(rc, nodeinfolist, PMIX_TOPOLOGY_INDEX,
+                                           &node->topology->index, PMIX_INT);
+                    }
                     /* convert to array */
                     PMIX_INFO_LIST_CONVERT(rc, nodeinfolist, &dry);
                     PMIX_INFO_LIST_RELEASE(nodeinfolist);
@@ -762,7 +1052,51 @@ static void _query(int sd, short args, void *cbdata)
                 PMIX_INFO_LIST_CONVERT(rc, nodelist, &dry);
                 PMIX_INFO_LIST_RELEASE(nodelist);
                 /* add to results */
-                PMIX_INFO_LIST_ADD(rc, nodelist, PMIX_QUERY_ALLOCATION, &dry, PMIX_DATA_ARRAY);
+                PMIX_INFO_LIST_ADD(rc, results, PMIX_QUERY_ALLOCATION, &dry, PMIX_DATA_ARRAY);
+                PMIX_DATA_ARRAY_DESTRUCT(&dry);
+                if (PMIX_SUCCESS != rc) {
+                    PMIX_ERROR_LOG(rc);
+                    goto done;
+                }
+
+#ifdef PMIX_QUERY_ALLOC_IDS
+            } else if (PMIx_Check_key(q->keys[n], PMIX_QUERY_ALLOC_IDS)) {
+                void *alloclist;
+
+                /* the session table is the master's - a daemon holds only
+                 * the default session, so it would answer "none" */
+                prc = prte_get_allocation_sessions(&alloc_sessions);
+                if (PRTE_ERR_NOT_AUTHORITATIVE == prc) {
+                    goto defer;
+                }
+                if (PRTE_SUCCESS != prc) {
+                    ret = prte_pmix_convert_rc(prc);
+                    goto done;
+                }
+                PMIX_INFO_LIST_START(alloclist);
+                if (NULL != alloc_sessions) {
+                    for (k = 0; k < alloc_sessions->size; k++) {
+                        session = (prte_session_t *) pmix_pointer_array_get_item(alloc_sessions, k);
+                        if (NULL == session || NULL == session->alloc_refid) {
+                            continue;
+                        }
+                        PMIX_INFO_LIST_ADD(rc, alloclist, PMIX_ALLOC_ID, session->alloc_refid, PMIX_STRING);
+                        if (PMIX_SUCCESS != rc) {
+                            PMIX_ERROR_LOG(rc);
+                            PMIX_INFO_LIST_RELEASE(alloclist);
+                            goto done;
+                        }
+                    }
+                }
+                PMIX_INFO_LIST_CONVERT(rc, alloclist, &dry);
+                PMIX_INFO_LIST_RELEASE(alloclist);
+                if (PMIX_ERR_EMPTY == rc) {
+                    PMIX_DATA_ARRAY_CONSTRUCT(&dry, 0, PMIX_INFO);
+                } else if (PMIX_SUCCESS != rc) {
+                    PMIX_ERROR_LOG(rc);
+                    goto done;
+                }
+                PMIX_INFO_LIST_ADD(rc, results, PMIX_QUERY_ALLOC_IDS, &dry, PMIX_DATA_ARRAY);
                 PMIX_DATA_ARRAY_DESTRUCT(&dry);
                 if (PMIX_SUCCESS != rc) {
                     PMIX_ERROR_LOG(rc);
@@ -770,16 +1104,126 @@ static void _query(int sd, short args, void *cbdata)
                 }
 #endif
 
-#ifdef PMIX_QUERY_AVAILABLE_SLOTS
+#ifdef PMIX_QUERY_ALLOC_PROPERTIES
+            } else if (PMIx_Check_key(q->keys[n], PMIX_QUERY_ALLOC_PROPERTIES)) {
+                void *proplist;
+                bool releasable;
+
+                prc = prte_get_allocation_session(allocid, &session);
+                if (PRTE_ERR_NOT_AUTHORITATIVE == prc) {
+                    goto defer;
+                }
+                if (PRTE_SUCCESS != prc) {
+                    ret = prte_pmix_convert_rc(prc);
+                    goto done;
+                }
+                PMIX_INFO_LIST_START(proplist);
+                rc = PMIX_SUCCESS;
+                /* a named property selects it; naming none returns all */
+                if (NULL == allocprop || PMIx_Check_key(allocprop, PMIX_ALLOC_RELEASABLE)) {
+                    /* If we added the session dynamically to extend the DVM, we can release it fully */
+                    releasable = PRTE_FLAG_TEST(session, PRTE_SESSION_FLAG_DYNAMIC);
+                    PMIX_INFO_LIST_ADD(rc, proplist, PMIX_ALLOC_RELEASABLE, &releasable, PMIX_BOOL);
+                }
+                if (PMIX_SUCCESS == rc &&
+                    (NULL == allocprop || PMIx_Check_key(allocprop, PMIX_ALLOC_SEQUENCE))) {
+                    PMIX_INFO_LIST_ADD(rc, proplist, PMIX_ALLOC_SEQUENCE,
+                                       &session->acquisition, PMIX_UINT32);
+                }
+                if (PMIX_SUCCESS != rc) {
+                    PMIX_ERROR_LOG(rc);
+                    PMIX_INFO_LIST_RELEASE(proplist);
+                    goto done;
+                }
+                PMIX_INFO_LIST_CONVERT(rc, proplist, &dry);
+                PMIX_INFO_LIST_RELEASE(proplist);
+                if (PMIX_ERR_EMPTY == rc) {
+                    ret = PMIX_ERR_NOT_FOUND;
+                    goto done;
+                }
+                if (PMIX_SUCCESS != rc) {
+                    PMIX_ERROR_LOG(rc);
+                    goto done;
+                }
+                PMIX_INFO_LIST_ADD(rc, results, PMIX_QUERY_ALLOC_PROPERTIES, &dry, PMIX_DATA_ARRAY);
+                PMIX_DATA_ARRAY_DESTRUCT(&dry);
+                if (PMIX_SUCCESS != rc) {
+                    PMIX_ERROR_LOG(rc);
+                    goto done;
+                }
+#endif
+
+            } else if (PMIx_Check_key(q->keys[n], PMIX_NUM_SLOTS)) {
+                /* the slots allocated to a specific node, if one was named,
+                 * otherwise the total across the allocation
+                 */
+                /* every arm below reads node->slots, which the nidmap does
+                 * not ship - so settle authority once, before any of them */
+                prc = prte_get_allocated_nodes(allocid, &alloc_nodes);
+                if (PRTE_ERR_NOT_AUTHORITATIVE == prc) {
+                    goto defer;
+                }
+                if (PRTE_SUCCESS != prc) {
+                    ret = prte_pmix_convert_rc(prc);
+                    goto done;
+                }
+                if (NULL != hostname) {
+                    node = prte_node_match(NULL, hostname);
+                    if (NULL == node) {
+                        ret = PMIX_ERR_NOT_FOUND;
+                        goto done;
+                    }
+                    nslots = (uint32_t) node->slots;
+                } else if (UINT32_MAX != nodeid) {
+                    /* a nodeid is a slot in the DVM-wide pool, not in the
+                     * allocation the qualifier named */
+                    prc = prte_get_allocated_nodes(NULL, &dvm_nodes);
+                    if (PRTE_SUCCESS != prc) {
+                        ret = prte_pmix_convert_rc(prc);
+                        goto done;
+                    }
+                    node = (prte_node_t *) pmix_pointer_array_get_item(dvm_nodes, nodeid);
+                    if (NULL == node) {
+                        ret = PMIX_ERR_NOT_FOUND;
+                        goto done;
+                    }
+                    nslots = (uint32_t) node->slots;
+                } else {
+                    nslots = 0;
+                    for (k = 0; k < alloc_nodes->size; k++) {
+                        node = (prte_node_t *) pmix_pointer_array_get_item(alloc_nodes, k);
+                        if (NULL == node) {
+                            continue;
+                        }
+                        nslots += (uint32_t) node->slots;
+                    }
+                }
+                PMIX_INFO_LIST_ADD(rc, results, PMIX_NUM_SLOTS, &nslots, PMIX_UINT32);
+                if (PMIX_SUCCESS != rc) {
+                    PMIX_ERROR_LOG(rc);
+                    goto done;
+                }
+
             } else if (PMIx_Check_key(q->keys[n], PMIX_QUERY_AVAILABLE_SLOTS)) {
                 /* compute the slots currently available for assignment. Note that
                  * this is purely a point-in-time measurement as jobs may be working
                  * there way thru the state machine for mapping, and more jobs may
                  * be submitted at any moment.
                  */
-                p = 0;
-                for (k=0; k < prte_node_pool->size; k++) {
-                    node = (prte_node_t*)pmix_pointer_array_get_item(prte_node_pool, k);
+                /* slots, slots_inuse, slots_max and node state are all
+                 * master-only - a daemon would report every node as empty
+                 * and every filter as inert */
+                prc = prte_get_allocated_nodes(NULL, &alloc_nodes);
+                if (PRTE_ERR_NOT_AUTHORITATIVE == prc) {
+                    goto defer;
+                }
+                if (PRTE_SUCCESS != prc) {
+                    ret = prte_pmix_convert_rc(prc);
+                    goto done;
+                }
+                nslots = 0;
+                for (k=0; k < alloc_nodes->size; k++) {
+                    node = (prte_node_t*)pmix_pointer_array_get_item(alloc_nodes, k);
                     if (NULL == node) {
                         continue;
                     }
@@ -803,16 +1247,17 @@ static void _query(int sd, short args, void *cbdata)
                     if (node->slots <= node->slots_inuse) {
                         continue;
                     }
-                    p += node->slots - node->slots_inuse;
+                    nslots += (uint32_t)(node->slots - node->slots_inuse);
                 }
-                PMIX_INFO_LIST_ADD(rc, results, PMIX_QUERY_AVAILABLE_SLOTS, &p, PMIX_UINT32);
+                /* the count is handed to PMIx by address, so it has to be the
+                 * width PMIx is told it is - a size_t read as a PMIX_UINT32
+                 * takes the correct four bytes only on a little-endian machine */
+                PMIX_INFO_LIST_ADD(rc, results, PMIX_QUERY_AVAILABLE_SLOTS, &nslots, PMIX_UINT32);
                 if (PMIX_SUCCESS != rc) {
                     PMIX_ERROR_LOG(rc);
                     goto done;
                 }
-#endif
 
-#ifdef PMIX_MEM_ALLOC_KIND
             } else if (PMIx_Check_key(q->keys[n], PMIX_MEM_ALLOC_KIND)) {
                 pmix_proc_t pproc;
                 pmix_info_t info;
@@ -834,9 +1279,7 @@ static void _query(int sd, short args, void *cbdata)
                     PMIX_ERROR_LOG(rc);
                     goto done;
                 }
-#endif
 
-#ifdef PMIX_QUERY_RESOLVE_PEERS
             } else if (PMIx_Check_key(q->keys[n], PMIX_QUERY_RESOLVE_PEERS)) {
                 char *nm;
                 pmix_list_t procs;
@@ -922,9 +1365,7 @@ static void _query(int sd, short args, void *cbdata)
                     free(proc);
                 }
                 PMIX_DESTRUCT(&procs);
-#endif
 
-#ifdef PMIX_QUERY_RESOLVE_NODE
             } else if (PMIx_Check_key(q->keys[n], PMIX_QUERY_RESOLVE_NODE)) {
                 char **nodes = NULL, *nodelist;
                 // could ask for info on all jobs, so have to check for that case
@@ -952,17 +1393,18 @@ static void _query(int sd, short args, void *cbdata)
                 nodelist = PMIx_Argv_join(nodes, ',');
                 PMIx_Argv_free(nodes);
                 PMIX_INFO_LIST_ADD(rc, results, PMIX_QUERY_RESOLVE_NODE, nodelist, PMIX_STRING);
-#endif
+                if (NULL != nodelist) {
+                    free(nodelist);
+                }
+                if (PMIX_SUCCESS != rc) {
+                    PMIX_ERROR_LOG(rc);
+                    goto done;
+                }
 
-#ifdef PMIX_QUERY_PROC_RESOURCE_USAGE
             } else if (PMIx_Check_key(q->keys[n], PMIX_QUERY_PROC_RESOURCE_USAGE)) {
 
-#endif
-
-#ifdef PMIX_QUERY_NODE_RESOURCE_USAGE
             } else if (PMIx_Check_key(q->keys[n], PMIX_QUERY_NODE_RESOURCE_USAGE)) {
 
-#endif
 
             } else {
                 pmix_output_verbose(2, prte_pmix_server_globals.output,
@@ -972,38 +1414,39 @@ static void _query(int sd, short args, void *cbdata)
                 ret = PMIX_ERR_NOT_SUPPORTED;
                 goto done;
             }
+            continue;
+
+        defer:
+            /* this key wants state only the master holds - see the block
+             * comment above query_complete().  The array was sized to hold
+             * every key, so this cannot overrun. */
+            pmix_output_verbose(2, prte_pmix_server_globals.output,
+                                "%s deferring key %s to the DVM master",
+                                PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), q->keys[n]);
+            defer_key(dq, &ndq, q, q->keys[n]);
         } // for
     }     // for
 
 done:
-    rcd = PMIX_NEW(prte_pmix_server_op_caddy_t);
-    PMIX_INFO_LIST_CONVERT(rc, results, &dry);
-    if (PMIX_SUCCESS != rc && PMIX_ERR_EMPTY != rc) {
-        PMIX_ERROR_LOG(rc);
-        ret = rc;
-    }
-    PMIX_INFO_LIST_RELEASE(results);
-    if (PMIX_ERR_NOT_SUPPORTED != ret) {
-        if (PMIX_ERR_EMPTY == rc) {
-            ret = PMIX_ERR_NOT_FOUND;
-        } else if (PMIX_SUCCESS == ret) {
-            if (0 == dry.size) {
-                ret = PMIX_ERR_NOT_FOUND;
-            } else {
-                if (dry.size < cd->ninfo) {
-                    ret = PMIX_QUERY_PARTIAL_SUCCESS;
-                } else {
-                    ret = PMIX_SUCCESS;
-                }
+    if (0 < ndq) {
+        if (PMIX_SUCCESS == ret) {
+            rc = relay_query(cd, results, nkeys, dq, ndq);
+            if (PMIX_SUCCESS == rc) {
+                /* the client is answered when the master replies */
+                PMIX_QUERY_FREE(dq, nq_alloc);
+                return;
             }
+            /* we never reached the master, so say why rather than reporting
+             * the empty result as "not found" */
+            ret = rc;
         }
     }
-    rcd->ninfo = dry.size;
-    rcd->info = (pmix_info_t*)dry.array;
-    // memory allocated in the data array will be free'd when rcd is released
-    cd->infocbfunc(ret, rcd->info, rcd->ninfo, cd->cbdata, qrel, rcd);
-    PMIX_RELEASE(cd);
+    if (NULL != dq) {
+        PMIX_QUERY_FREE(dq, nq_alloc);
+    }
+    query_complete(cd, results, nkeys, ret);
 }
+
 
 pmix_status_t pmix_server_query_fn(pmix_proc_t *proct, pmix_query_t *queries, size_t nqueries,
                                    pmix_info_cbfunc_t cbfunc, void *cbdata)
@@ -1027,4 +1470,274 @@ pmix_status_t pmix_server_query_fn(pmix_proc_t *proct, pmix_query_t *queries, si
     prte_event_active(&(cd->ev), PRTE_EV_WRITE, 1);
 
     return PMIX_SUCCESS;
+}
+
+/* ---- the master's half of a relayed query ---------------------------- */
+
+/* Ship the master's answer back to the daemon that asked.  Runs on the PRRTE
+ * progress thread: query_complete() invokes it from _query, which is itself
+ * an event handler, so there is nothing to thread-shift. */
+static void send_query_resp(pmix_status_t status, pmix_info_t *info, size_t ninfo,
+                            void *cbdata, pmix_release_cbfunc_t release_fn,
+                            void *release_cbdata)
+{
+    prte_pmix_server_req_t *req = (prte_pmix_server_req_t *) cbdata;
+    prte_pmix_server_op_caddy_t *cd = (prte_pmix_server_op_caddy_t *) req->qcaddy;
+    pmix_data_buffer_t *buf;
+    pmix_status_t rc;
+    int ret;
+
+    PMIX_DATA_BUFFER_CREATE(buf);
+    rc = PMIx_Data_pack(NULL, buf, &status, 1, PMIX_STATUS);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        PMIX_DATA_BUFFER_RELEASE(buf);
+        goto cleanup;
+    }
+    /* the asking daemon's room number, not ours */
+    rc = PMIx_Data_pack(NULL, buf, &req->remote_index, 1, PMIX_INT);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        PMIX_DATA_BUFFER_RELEASE(buf);
+        goto cleanup;
+    }
+    rc = PMIx_Data_pack(NULL, buf, &ninfo, 1, PMIX_SIZE);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        PMIX_DATA_BUFFER_RELEASE(buf);
+        goto cleanup;
+    }
+    if (0 < ninfo) {
+        rc = PMIx_Data_pack(NULL, buf, info, ninfo, PMIX_INFO);
+        if (PMIX_SUCCESS != rc) {
+            PMIX_ERROR_LOG(rc);
+            PMIX_DATA_BUFFER_RELEASE(buf);
+            goto cleanup;
+        }
+    }
+
+    pmix_output_verbose(2, prte_pmix_server_globals.output,
+                        "%s sending query response to %s for their req %d",
+                        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                        PRTE_NAME_PRINT(&req->proxy), req->remote_index);
+    PRTE_RML_RELIABLE_SEND(ret, req->proxy.rank, buf, PRTE_RML_TAG_QUERY_RESP);
+    if (PRTE_SUCCESS != ret) {
+        PRTE_ERROR_LOG(ret);
+        PMIX_DATA_BUFFER_RELEASE(buf);
+    }
+
+cleanup:
+    /* every exit comes through here - a pack failure that returned early
+     * would strand the asking daemon's client for the life of the DVM */
+    if (NULL != release_fn) {
+        release_fn(release_cbdata);
+    }
+    /* the queries were unpacked into this caddy and are ours to free; the
+     * caddy itself is released by query_complete() as we return */
+    if (NULL != cd && NULL != cd->queries) {
+        PMIX_QUERY_FREE(cd->queries, cd->nqueries);
+        cd->queries = NULL;
+        cd->nqueries = 0;
+    }
+    req->qcaddy = NULL;
+    pmix_pointer_array_set_item(&prte_pmix_server_globals.local_reqs,
+                                req->local_index, NULL);
+    PMIX_RELEASE(req);
+}
+
+/* A daemon could not answer some keys and has sent them here.  Answer them
+ * with the very same _query() the daemon ran - on the master the accessors
+ * always succeed, so nothing defers and it completes locally. */
+void pmix_server_query_request(int status, pmix_proc_t *sender,
+                               pmix_data_buffer_t *buffer,
+                               prte_rml_tag_t tg, void *cbdata)
+{
+    prte_pmix_server_op_caddy_t *cd;
+    prte_pmix_server_req_t *req;
+    pmix_query_t *queries = NULL;
+    pmix_proc_t source;
+    size_t nqueries = 0;
+    pmix_status_t rc;
+    int32_t cnt;
+    int refid;
+    PRTE_HIDE_UNUSED_PARAMS(status, tg, cbdata);
+
+    /* unpack the asking daemon's room number first - with it we can at least
+     * send back an error it can match to a waiting client */
+    cnt = 1;
+    rc = PMIx_Data_unpack(NULL, buffer, &refid, &cnt, PMIX_INT);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        return;
+    }
+
+    cnt = 1;
+    rc = PMIx_Data_unpack(NULL, buffer, &source, &cnt, PMIX_PROC);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        goto error;
+    }
+
+    cnt = 1;
+    rc = PMIx_Data_unpack(NULL, buffer, &nqueries, &cnt, PMIX_SIZE);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        goto error;
+    }
+    if (0 == nqueries) {
+        rc = PMIX_ERR_BAD_PARAM;
+        goto error;
+    }
+    PMIX_QUERY_CREATE(queries, nqueries);
+    cnt = nqueries;
+    rc = PMIx_Data_unpack(NULL, buffer, queries, &cnt, PMIX_QUERY);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        PMIX_QUERY_FREE(queries, nqueries);
+        queries = NULL;
+        goto error;
+    }
+
+    req = PMIX_NEW(prte_pmix_server_req_t);
+    pmix_asprintf(&req->operation, "QUERY");
+    req->remote_index = refid;
+    PMIX_PROC_LOAD(&req->proxy, sender->nspace, sender->rank);
+    req->local_index = pmix_pointer_array_add(&prte_pmix_server_globals.local_reqs, req);
+
+    cd = PMIX_NEW(prte_pmix_server_op_caddy_t);
+    /* answer about the job of the client that originally asked, not ours */
+    memcpy(&cd->proct, &source, sizeof(pmix_proc_t));
+    cd->queries = queries;
+    cd->nqueries = nqueries;
+    cd->infocbfunc = send_query_resp;
+    cd->cbdata = req;
+    req->qcaddy = cd;
+
+    /* post it rather than calling inline: _query reaches back into the RML
+     * to answer, and we are still inside the RML's dispatch */
+    prte_event_set(prte_event_base, &(cd->ev), -1, PRTE_EV_WRITE, _query, cd);
+    PMIX_POST_OBJECT(cd);
+    prte_event_active(&(cd->ev), PRTE_EV_WRITE, 1);
+    return;
+
+error:
+    /* the daemon is holding a tracker under refid and nothing else will ever
+     * complete it - an error reply is what releases its client */
+    {
+        pmix_data_buffer_t *reply;
+        size_t none = 0;
+        int ret;
+
+        PMIX_DATA_BUFFER_CREATE(reply);
+        /* the empty info count keeps this reply the same shape as a real
+         * one, so the receiver unpacks one format rather than guessing
+         * which it got from the status */
+        if (PMIX_SUCCESS != PMIx_Data_pack(NULL, reply, &rc, 1, PMIX_STATUS) ||
+            PMIX_SUCCESS != PMIx_Data_pack(NULL, reply, &refid, 1, PMIX_INT) ||
+            PMIX_SUCCESS != PMIx_Data_pack(NULL, reply, &none, 1, PMIX_SIZE)) {
+            PMIX_DATA_BUFFER_RELEASE(reply);
+            return;
+        }
+        PRTE_RML_RELIABLE_SEND(ret, sender->rank, reply, PRTE_RML_TAG_QUERY_RESP);
+        if (PRTE_SUCCESS != ret) {
+            PRTE_ERROR_LOG(ret);
+            PMIX_DATA_BUFFER_RELEASE(reply);
+        }
+    }
+}
+
+/* ---- the asking daemon's half ---------------------------------------- */
+
+/* The master has answered the keys we deferred.  Merge its results into the
+ * ones we gathered locally and complete the client's query - it asked once
+ * and gets one answer covering every key. */
+void pmix_server_query_resp(int status, pmix_proc_t *sender,
+                            pmix_data_buffer_t *buffer,
+                            prte_rml_tag_t tg, void *cbdata)
+{
+    prte_pmix_server_req_t *req;
+    prte_pmix_server_op_caddy_t *cd;
+    pmix_info_t *info = NULL;
+    size_t ninfo = 0, n;
+    pmix_status_t ret, rc;
+    int32_t cnt;
+    int req_index;
+    PRTE_HIDE_UNUSED_PARAMS(status, sender, tg, cbdata);
+
+    /* the status is already a PMIx value - it is the one we report */
+    cnt = 1;
+    rc = PMIx_Data_unpack(NULL, buffer, &ret, &cnt, PMIX_STATUS);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        ret = rc;
+    }
+
+    /* fall through on the above in the hope the room number still unpacks,
+     * which is the only thing that lets us answer the waiting client */
+    cnt = 1;
+    rc = PMIx_Data_unpack(NULL, buffer, &req_index, &cnt, PMIX_INT);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        return;
+    }
+
+    req = pmix_pointer_array_get_item(&prte_pmix_server_globals.local_reqs, req_index);
+    if (NULL == req || NULL == req->qcaddy) {
+        /* the index came off the wire, but it is OUR index echoed back, so a
+         * miss means the request was retired early and whoever waits on it
+         * waits forever.  Say so rather than returning in silence. */
+        pmix_output_verbose(2, prte_pmix_server_globals.output,
+                            "%s query response names local req %d, which is gone",
+                            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), req_index);
+        return;
+    }
+    cd = (prte_pmix_server_op_caddy_t *) req->qcaddy;
+
+    cnt = 1;
+    rc = PMIx_Data_unpack(NULL, buffer, &ninfo, &cnt, PMIX_SIZE);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        ret = rc;
+        ninfo = 0;
+        goto complete;
+    }
+    if (0 < ninfo) {
+        PMIX_INFO_CREATE(info, ninfo);
+        cnt = ninfo;
+        rc = PMIx_Data_unpack(NULL, buffer, info, &cnt, PMIX_INFO);
+        if (PMIX_SUCCESS != rc) {
+            PMIX_ERROR_LOG(rc);
+            PMIX_INFO_FREE(info, ninfo);
+            ret = rc;
+            ninfo = 0;
+            goto complete;
+        }
+        for (n = 0; n < ninfo; n++) {
+            PMIX_INFO_LIST_XFER(rc, req->qresults, &info[n]);
+            if (PMIX_SUCCESS != rc) {
+                PMIX_ERROR_LOG(rc);
+                ret = rc;
+                break;
+            }
+        }
+        PMIX_INFO_FREE(info, ninfo);
+    }
+
+complete:
+    /* query_complete() owns the list and the caddy from here.  "Nothing to
+     * report" from the master is not the answer to the client's whole
+     * request - keys this daemon answered are in the list - so hand those
+     * two statuses back to the accounting there, which weighs the merged
+     * result against every key that was asked for and lands on partial
+     * success or, if the list really is empty, not-found.  Any other error
+     * says something specific went wrong and is reported as it stands. */
+    if (PMIX_QUERY_PARTIAL_SUCCESS == ret || PMIX_ERR_NOT_FOUND == ret) {
+        ret = PMIX_SUCCESS;
+    }
+    query_complete(cd, req->qresults, req->nkeys, ret);
+    req->qcaddy = NULL;
+    req->qresults = NULL;
+    pmix_pointer_array_set_item(&prte_pmix_server_globals.local_reqs,
+                                req->local_index, NULL);
+    PMIX_RELEASE(req);
 }

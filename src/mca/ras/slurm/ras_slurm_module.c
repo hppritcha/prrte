@@ -17,7 +17,9 @@
  * Copyright (c) 2015-2019 Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2016      IBM Corporation.  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2026      Barcelona Supercomputing Center (BSC-CNS).
+ *                         All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -55,8 +57,10 @@
 #include "src/runtime/prte_globals.h"
 #include "src/util/name_fns.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 
 #include "ras_slurm.h"
+#include "src/mca/common/slurm/common_slurm.h"
 #include "src/mca/ras/base/base.h"
 
 #define PRTE_SLURM_DYN_MAX_SIZE 256
@@ -66,18 +70,18 @@
  */
 static int init(void);
 static int prte_ras_slurm_allocate(prte_job_t *jdata, pmix_list_t *nodes);
-static void deallocate(prte_job_t *jdata, prte_app_context_t *app);
-static void modify(prte_pmix_server_req_t *req);
+static pmix_status_t modify(prte_pmix_server_req_t *req);
 static int prte_ras_slurm_finalize(void);
 
 /*
  * RAS slurm module
  */
 prte_ras_base_module_t prte_ras_slurm_module = {
+    .scheduler_owned = true,
     .init = init,
     .allocate = prte_ras_slurm_allocate,
-    .deallocate = deallocate,
     .modify = modify,
+    .shrink_complete = prte_ras_slurm_shrink_complete,
     .finalize = prte_ras_slurm_finalize
 };
 
@@ -85,6 +89,19 @@ prte_ras_base_module_t prte_ras_slurm_module = {
 static int prte_ras_slurm_discover(char *regexp, char *tasks_per_node, pmix_list_t *nodelist);
 static int prte_ras_slurm_parse_ranges(char *base, char *ranges, char ***nodelist);
 static int prte_ras_slurm_parse_range(char *base, char *range, char ***nodelist);
+
+pmix_list_t *prte_slurm_session_stack = NULL;
+
+static void session_stack_item_des(prte_session_stack_item_t *p)
+{
+    if (NULL != p->session) {
+        PMIX_RELEASE(p->session);
+    }
+}
+PMIX_CLASS_INSTANCE(prte_session_stack_item_t,
+                    pmix_list_item_t,
+                    NULL,
+                    session_stack_item_des);
 
 static bool check_taint(char *name, char *evar)
 {
@@ -96,7 +113,7 @@ static bool check_taint(char *name, char *evar)
         }
     }
 
-    pmix_show_help("help-ras-slurm.txt", "tainted-envar", true,
+    prte_show_help("help-ras-slurm.txt", "tainted-envar", true,
                    name, prte_mca_ras_slurm_component.max_length);
     return true;
 }
@@ -104,7 +121,44 @@ static bool check_taint(char *name, char *evar)
 /* init the module */
 static int init(void)
 {
-    return PRTE_SUCCESS;
+    int err = PRTE_SUCCESS;
+
+    prte_slurm_session_stack = PMIX_NEW(pmix_list_t);
+
+    if(NULL == prte_slurm_session_stack) {
+        err = PRTE_ERR_OUT_OF_RESOURCE;
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
+
+    err = prte_ras_slurm_modify_release_init();
+    if (PRTE_SUCCESS != err) {
+        goto cleanup;
+    }
+
+    err = prte_ras_slurm_modify_cancel_init();
+    if (PRTE_SUCCESS != err) {
+        goto cleanup;
+    }
+
+    err = prte_ras_slurm_modify_extend_init();
+    if (PRTE_SUCCESS != err) {
+        goto cleanup;
+    }
+
+cleanup:
+
+    if (PRTE_SUCCESS != err) {
+        prte_ras_slurm_modify_release_finalize();
+        prte_ras_slurm_modify_cancel_finalize();
+        prte_ras_slurm_modify_extend_finalize();
+        if (NULL != prte_slurm_session_stack) {
+            PMIX_RELEASE(prte_slurm_session_stack);
+            prte_slurm_session_stack = NULL;
+        }
+    }
+
+    return err;
 }
 
 /**
@@ -119,15 +173,25 @@ static int prte_ras_slurm_allocate(prte_job_t *jdata, pmix_list_t *nodes)
     char *tasks_per_node, *node_tasks;
     char *tmp;
     char *slurm_jobid;
+    prte_session_t *session;
     PRTE_HIDE_UNUSED_PARAMS(jdata);
 
-    if (NULL == (slurm_jobid = getenv("SLURM_JOBID"))) {
+    if (NULL == (slurm_jobid = prte_common_slurm_jobid())) {
         return PRTE_ERR_TAKE_NEXT_OPTION;
+    }
+
+    session = prte_get_session_object_from_id(slurm_jobid);
+
+    /* we have already discovered these resources. Note that
+     * SLURM_NODELIST provides per-job information, so the output
+     * is always the same, even from distinct job steps */
+    if(NULL != session) {
+        return PRTE_EXISTS;
     }
 
     regexp = getenv("SLURM_NODELIST");
     if (NULL == regexp) {
-        pmix_show_help("help-ras-slurm.txt", "slurm-env-var-not-found", 1, "SLURM_NODELIST");
+        prte_show_help("help-ras-slurm.txt", "slurm-env-var-not-found", 1, "SLURM_NODELIST");
         return PRTE_ERR_NOT_FOUND;
     }
     // check for length violation - untaint the envar value
@@ -145,7 +209,7 @@ static int prte_ras_slurm_allocate(prte_job_t *jdata, pmix_list_t *nodes)
         tasks_per_node = getenv("SLURM_JOB_CPUS_PER_NODE");
         if (NULL == tasks_per_node) {
             /* couldn't find any version - abort */
-            pmix_show_help("help-ras-slurm.txt", "slurm-env-var-not-found", 1,
+            prte_show_help("help-ras-slurm.txt", "slurm-env-var-not-found", 1,
                            "SLURM_JOB_CPUS_PER_NODE");
             return PRTE_ERR_NOT_FOUND;
         }
@@ -165,7 +229,7 @@ static int prte_ras_slurm_allocate(prte_job_t *jdata, pmix_list_t *nodes)
         tasks_per_node = getenv("SLURM_TASKS_PER_NODE");
         if (NULL == tasks_per_node) {
             /* couldn't find any version - abort */
-            pmix_show_help("help-ras-slurm.txt", "slurm-env-var-not-found", 1,
+            prte_show_help("help-ras-slurm.txt", "slurm-env-var-not-found", 1,
                            "SLURM_TASKS_PER_NODE");
             return PRTE_ERR_NOT_FOUND;
         }
@@ -209,6 +273,25 @@ static int prte_ras_slurm_allocate(prte_job_t *jdata, pmix_list_t *nodes)
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
         return ret;
     }
+
+    /* tag each node with the job ID so we can fetch it later */
+    ret = prte_ras_slurm_tag_node_allocation(slurm_jobid, nodes);
+
+    if(PRTE_SUCCESS != ret) {
+        return ret;
+    }
+
+    /* assign the nodes to a new session, allowing us to identify
+     * all members of the group later */
+    ret = prte_ras_slurm_assign_new_session(slurm_jobid, NULL, nodes, false);
+    
+    if(PRTE_SUCCESS != ret) {
+        PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
+                             "%s ras:slurm:allocate: failed to assign new session",
+                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+        return ret;
+    }
+
     /* record the number of allocated nodes */
     prte_num_allocated_nodes = pmix_list_get_size(nodes);
 
@@ -219,20 +302,58 @@ static int prte_ras_slurm_allocate(prte_job_t *jdata, pmix_list_t *nodes)
     return PRTE_SUCCESS;
 }
 
-static void deallocate(prte_job_t *jdata, prte_app_context_t *app)
+static pmix_status_t modify(prte_pmix_server_req_t *req)
 {
-    PRTE_HIDE_UNUSED_PARAMS(jdata, app);
-    return;
-}
+    int err = PRTE_SUCCESS;
 
-static void modify(prte_pmix_server_req_t *req)
-{
-    req->status = PMIX_ERR_NOT_SUPPORTED;
-    return;
+    /* PMIX_ALLOC_NEW is a synonym for PMIX_ALLOC_EXTEND here: Slurm cannot
+     * grow an allocation in place, so an extend is always a second, disjoint
+     * job - "new" to the scheduler - that the DVM then spans.
+     *
+     * Both are claimed outright, and a grow this component cannot ask Slurm
+     * for is refused rather than passed on: inside a Slurm allocation there
+     * is no next module that could legitimately serve it. */
+    if(PMIX_ALLOC_EXTEND == req->allocdir || PMIX_ALLOC_NEW == req->allocdir) {
+        err = prte_ras_slurm_serve_extend_req(req);
+        req->pstatus = prte_pmix_convert_rc(err);
+    } else if(PMIX_ALLOC_RELEASE == req->allocdir) {
+        err = prte_ras_slurm_serve_release_req(req);
+        if (PRTE_ERR_OP_IN_PROGRESS == err) {
+            /* We don't want to touch req->pstatus at this stage
+             * as it may be freed by the callback */
+            return PMIX_SUCCESS;
+        }
+        req->pstatus = prte_pmix_convert_rc(err);
+    } else if(PMIX_ALLOC_REQ_CANCEL == req->allocdir) {
+        err = prte_ras_slurm_serve_cancel_req(req);
+        req->pstatus = prte_pmix_convert_rc(err);
+    } else {
+        req->pstatus = PMIX_ERR_NOT_SUPPORTED;
+    }
+
+    /* Success at this stage means the request was served atomically.
+    * Return PMIX_OPERATION_SUCCEEDED so the RAS base completes the
+    * request instead of waiting for an asynchronous callback.
+    */
+    if (PMIX_SUCCESS == req->pstatus) {
+        return PMIX_OPERATION_SUCCEEDED;
+    }
+
+    return req->pstatus;
 }
 
 static int prte_ras_slurm_finalize(void)
 {
+    /* Cancel first: scancel is what gives the resources back, and killing a
+     * salloc child is not */
+    prte_ras_slurm_modify_cancel_finalize();
+    prte_ras_slurm_modify_extend_finalize();
+    prte_ras_slurm_modify_release_finalize();
+    if (NULL != prte_slurm_session_stack) {
+        prte_ras_slurm_drain_session_stack();
+        PMIX_RELEASE(prte_slurm_session_stack);
+        prte_slurm_session_stack = NULL;
+    }
     return PRTE_SUCCESS;
 }
 
@@ -296,7 +417,7 @@ static int prte_ras_slurm_discover(char *regexp, char *tasks_per_node, pmix_list
         }
         if (i == 0) {
             /* we found a special character at the beginning of the string */
-            pmix_show_help("help-ras-slurm.txt", "slurm-env-var-bad-value", 1, regexp,
+            prte_show_help("help-ras-slurm.txt", "slurm-env-var-bad-value", 1, regexp,
                            tasks_per_node, "SLURM_NODELIST");
             PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
             free(orig);
@@ -313,7 +434,7 @@ static int prte_ras_slurm_discover(char *regexp, char *tasks_per_node, pmix_list
             }
             if (j >= len) {
                 /* we didn't find the end of the range */
-                pmix_show_help("help-ras-slurm.txt", "slurm-env-var-bad-value", 1, regexp,
+                prte_show_help("help-ras-slurm.txt", "slurm-env-var-bad-value", 1, regexp,
                                tasks_per_node, "SLURM_NODELIST");
                 PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
                 free(orig);
@@ -322,7 +443,7 @@ static int prte_ras_slurm_discover(char *regexp, char *tasks_per_node, pmix_list
 
             ret = prte_ras_slurm_parse_ranges(base, base + i + 1, &names);
             if (PRTE_SUCCESS != ret) {
-                pmix_show_help("help-ras-slurm.txt", "slurm-env-var-bad-value", 1, regexp,
+                prte_show_help("help-ras-slurm.txt", "slurm-env-var-bad-value", 1, regexp,
                                tasks_per_node, "SLURM_NODELIST");
                 PRTE_ERROR_LOG(ret);
                 free(orig);
@@ -341,7 +462,7 @@ static int prte_ras_slurm_discover(char *regexp, char *tasks_per_node, pmix_list
                                  "%s ras:slurm:allocate:discover: found node %s",
                                  PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), base));
 
-            if (PRTE_SUCCESS != (ret = PMIX_ARGV_APPEND_NOSIZE_COMPAT(&names, base))) {
+            if (PRTE_SUCCESS != (ret = PMIx_Argv_append_nosize(&names, base))) {
                 PRTE_ERROR_LOG(ret);
                 free(orig);
                 return ret;
@@ -353,13 +474,14 @@ static int prte_ras_slurm_discover(char *regexp, char *tasks_per_node, pmix_list
 
     free(orig);
 
-    num_nodes = PMIX_ARGV_COUNT_COMPAT(names);
+    num_nodes = PMIx_Argv_count(names);
 
     /* Find the number of slots per node */
 
     slots = malloc(sizeof(int) * num_nodes);
     if (NULL == slots) {
         PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+        PMIx_Argv_free(names);
         return PRTE_ERR_OUT_OF_RESOURCE;
     }
     memset(slots, 0, sizeof(int) * num_nodes);
@@ -368,6 +490,7 @@ static int prte_ras_slurm_discover(char *regexp, char *tasks_per_node, pmix_list
     if (NULL == begptr) {
         PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
         free(slots);
+        PMIx_Argv_free(names);
         return PRTE_ERR_OUT_OF_RESOURCE;
     }
 
@@ -404,11 +527,12 @@ static int prte_ras_slurm_discover(char *regexp, char *tasks_per_node, pmix_list
         } else if (*endptr == '\0' || j >= num_nodes) {
             break;
         } else {
-            pmix_show_help("help-ras-slurm.txt", "slurm-env-var-bad-value", 1, regexp,
+            prte_show_help("help-ras-slurm.txt", "slurm-env-var-bad-value", 1, regexp,
                            tasks_per_node, "SLURM_TASKS_PER_NODE");
             PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
             free(slots);
             free(orig);
+            PMIx_Argv_free(names);
             return PRTE_ERR_BAD_PARAM;
         }
     }
@@ -429,6 +553,7 @@ static int prte_ras_slurm_discover(char *regexp, char *tasks_per_node, pmix_list
         if (NULL == node) {
             PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
             free(slots);
+            PMIx_Argv_free(names);
             return PRTE_ERR_OUT_OF_RESOURCE;
         }
         node->name = strdup(names[i]);
@@ -436,10 +561,15 @@ static int prte_ras_slurm_discover(char *regexp, char *tasks_per_node, pmix_list
         node->slots_inuse = 0;
         node->slots_max = 0;
         node->slots = slots[i];
+        /* This count came from the scheduler, so it is authoritative: mark it
+         * given or the launch path will discard it and re-derive the node's
+         * size from its core count, silently handing the job more slots than
+         * SLURM allocated and hiding real oversubscription from the mapper. */
+        PRTE_FLAG_SET(node, PRTE_NODE_FLAG_SLOTS_GIVEN);
         pmix_list_append(nodelist, &node->super);
     }
     free(slots);
-    PMIX_ARGV_FREE_COMPAT(names);
+    PMIx_Argv_free(names);
 
     /* All done */
     return ret;
@@ -585,7 +715,7 @@ static int prte_ras_slurm_parse_range(char *base, char *range, char ***names)
             str[j] = '\0';
         }
         strcat(str, temp1);
-        ret = PMIX_ARGV_APPEND_NOSIZE_COMPAT(names, str);
+        ret = PMIx_Argv_append_nosize(names, str);
         if (PRTE_SUCCESS != ret) {
             PRTE_ERROR_LOG(ret);
             free(str);
@@ -596,4 +726,297 @@ static int prte_ras_slurm_parse_range(char *base, char *range, char ***names)
 
     /* All done */
     return PRTE_SUCCESS;
+}
+
+
+/*
+ * Validate that a Slurm job ID is valid according to expected syntax
+ *
+ * A valid Slurm job ID must be non-NULL, non-empty, must not exceed
+ * PRTE_SLURM_JOB_ID_MAX_LEN characters, and must contain only decimal digits.
+ *
+ * @param[in] slurm_jobid  Null-terminated Slurm job ID string to validate.
+ */
+int prte_ras_slurm_validate_jobid(const char *slurm_jobid) {
+
+    if (NULL == slurm_jobid) {
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    size_t id_len = strnlen(slurm_jobid, PRTE_SLURM_JOB_ID_MAX_LEN+1);
+    if (0 == id_len || id_len > PRTE_SLURM_JOB_ID_MAX_LEN) {
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    for (size_t i = 0; i < id_len; ++i) {
+        if (!isdigit((unsigned char)slurm_jobid[i])) {
+            return PRTE_ERR_BAD_PARAM;
+        }
+    }
+
+    return PRTE_SUCCESS;
+}
+
+/*
+ * Validate that a Slurm hostname does not contain unexpected characters.
+ *
+ * A valid Slurm hostname must be non-NULL, non-empty, must not exceed
+ * PRTE_SLURM_HOSTNAME_MAX_LEN characters, and may contain only characters
+ * from a restricted allowlist.
+ *
+ * @param[in] hostname  Null-terminated Slurm hostname string to validate.
+ */
+int prte_ras_slurm_validate_hostname(const char *hostname)
+{
+    if (NULL == hostname) {
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    size_t len = strnlen(hostname, PRTE_SLURM_HOSTNAME_MAX_LEN + 1);
+    if (0 == len || len > PRTE_SLURM_HOSTNAME_MAX_LEN) {
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    for (size_t i = 0; i < len; ++i) {
+        unsigned char c = (unsigned char) hostname[i];
+
+        if (!(isalnum(c) ||
+              c == '-' || c == '_' || c == '.' ||
+              c == '+' || c == ':' || c == '@' ||
+              c == '%' || c == '=')) {
+            return PRTE_ERR_BAD_PARAM;
+        }
+    }
+
+    return PRTE_SUCCESS;
+}
+
+/*
+ * Convert a Slurm job ID string to uint32_t.
+ *
+ * Expects a strictly decimal, non-negative string.
+ *
+ * @param[in]  slurm_jobid           Input string containing digits only.
+ * @param[out] slurm_jobid_numeric   Converted value.
+ */
+int prte_ras_slurm_convert_jobid(const char *slurm_jobid, uint32_t *slurm_jobid_numeric) {
+
+    if (NULL == slurm_jobid || NULL == slurm_jobid_numeric) {
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    if (!isdigit((unsigned char)slurm_jobid[0])) {
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    char *end = NULL;
+
+    unsigned long slurm_id_ulong;
+
+    errno = 0;
+    slurm_id_ulong = strtoul(slurm_jobid, &end, 10);
+
+    if ('\0' != *end || ERANGE == errno || slurm_id_ulong > UINT32_MAX) {
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    *slurm_jobid_numeric = (uint32_t)slurm_id_ulong;
+
+    return PRTE_SUCCESS;
+}
+
+/*
+ * Create and register a PRRTE session from a node list belonging to a Slurm allocation.
+ *
+ * Creates a new prte_session_t using slurm_jobid as the session ID,
+ * associates the nodes in node_list with the session, and adds it to
+ * the global session table and the internal session tracker list.
+ * 
+ * @note Nodes in the list are duplicates of the originals
+ *
+ * @param[in] slurm_jobid  Slurm job ID string (must be convertible to uint32_t)
+ * @param[in] user_refid   Optional user-provided allocation reference ID (may be NULL)
+ * @param[in] node_list    List of prte_node_t to attach to the session
+ * @param[in] dynamic      Whether the session was created by a modify request
+ */
+int prte_ras_slurm_assign_new_session(const char *slurm_jobid, const char *user_refid,
+                                      pmix_list_t *node_list, bool dynamic)
+{
+    if(NULL == slurm_jobid || NULL == node_list) {
+        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    int err = PRTE_SUCCESS;
+
+    err = prte_ras_slurm_validate_jobid(slurm_jobid);
+
+    if(PRTE_SUCCESS != err) {
+        PRTE_ERROR_LOG(err);
+        return err;
+    }
+
+    prte_session_t *session = NULL;
+
+    uint32_t slurm_id_uint;
+
+    err = prte_ras_slurm_convert_jobid(slurm_jobid, &slurm_id_uint);
+
+    if(PRTE_SUCCESS != err) {
+        PRTE_ERROR_LOG(err);
+        return err;
+    }
+
+    char *user_refid_dup = NULL;
+
+    if(NULL != user_refid) {
+        user_refid_dup = strdup(user_refid);
+        if(NULL == user_refid_dup) {
+            err = PRTE_ERR_OUT_OF_RESOURCE;
+            PRTE_ERROR_LOG(err);
+            return err;
+        }
+    }
+
+    char *slurm_jobid_dup = NULL;
+
+    slurm_jobid_dup = strdup(slurm_jobid);
+    if(NULL == slurm_jobid_dup) {
+        err = PRTE_ERR_OUT_OF_RESOURCE;
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
+
+    session = PMIX_NEW(prte_session_t);
+
+    if (NULL == session) {
+        err = PRTE_ERR_OUT_OF_RESOURCE;
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
+
+    session->session_id = slurm_id_uint;
+
+    if(NULL != user_refid_dup) {
+        session->user_refid = user_refid_dup;
+        /* Now owned by the session */
+        user_refid_dup = NULL;
+    }
+
+    session->alloc_refid = slurm_jobid_dup;
+    slurm_jobid_dup = NULL;
+
+    if (dynamic) {
+        PRTE_FLAG_SET(session, PRTE_SESSION_FLAG_DYNAMIC);
+    }
+
+    prte_node_t *node = NULL;
+
+    PMIX_LIST_FOREACH(node, node_list, prte_node_t) {
+
+        /* Hold a retained *reference* to the very node object that will be
+         * inserted into the global pool by prte_ras_base_node_insert after
+         * this module's allocate() returns - never a prte_node_copy()
+         * duplicate, which would be daemon-less and unusable by the mapper and
+         * launch path. This is the hard reference-model invariant of the
+         * node-reservation design (docs/plans/node_reservation).
+         *
+         * These nodes form the DVM's startup (default) session, so
+         * node->session is intentionally left NULL: they remain in the general
+         * pool rather than being withheld from it. The session object here is
+         * a per-Slurm-jobid tracking handle used to identify and release the
+         * group later; it is not a reservation. */
+        PMIX_RETAIN(node);
+        /* NOTE: pmix_pointer_array_add returns the assigned INDEX, not a
+         * status - a negative value just means the array could not grow */
+        if (0 > pmix_pointer_array_add(session->nodes, node)) {
+            err = PRTE_ERR_OUT_OF_RESOURCE;
+            PMIX_RELEASE(node);
+            PRTE_ERROR_LOG(err);
+            goto cleanup;
+        }
+    }
+
+    err = prte_set_session_object(session);
+    if (PRTE_SUCCESS != err) {
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
+
+    prte_session_stack_item_t *item = PMIX_NEW(prte_session_stack_item_t);
+
+    if(NULL == item) {
+        err = PRTE_ERR_OUT_OF_RESOURCE;
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
+
+    PMIX_RETAIN(session);
+    item->session = session;
+    item->nodes_in_session = pmix_list_get_size(node_list);
+
+    pmix_list_append(prte_slurm_session_stack, &item->super);
+
+    cleanup:
+
+    free(user_refid_dup);
+    free(slurm_jobid_dup);
+
+    if(NULL != session && err != PRTE_SUCCESS) {
+        PMIX_RELEASE(session);
+    }
+
+    return err;
+}
+
+/*
+ * Tag each node in the given list with the given Slurm job ID
+ *
+ * Convert the given Slurm job ID to uint32, then set
+ * the PRTE_NODE_ALLOC_ID attribute of each node to
+ * the converted ID. 
+ *
+ * @param[in] slurm_jobid  Slurm job ID string
+ * @param[in] node_list    List of prte_node_t to attach to the session
+ */
+int prte_ras_slurm_tag_node_allocation(const char *slurm_jobid, pmix_list_t *node_list)
+{
+    if(NULL == slurm_jobid || NULL == node_list) {
+        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    int err = PRTE_SUCCESS;
+
+    err = prte_ras_slurm_validate_jobid(slurm_jobid);
+
+    if(PRTE_SUCCESS != err) {
+        PRTE_ERROR_LOG(err);
+        return err;
+    }
+
+    uint32_t slurm_id_uint;
+
+    err = prte_ras_slurm_convert_jobid(slurm_jobid, &slurm_id_uint);
+
+    if(PRTE_SUCCESS != err) {
+        PRTE_ERROR_LOG(err);
+        return err;
+    }
+
+    prte_node_t *node = NULL;
+
+    PMIX_LIST_FOREACH(node, node_list, prte_node_t) {
+
+        /* Tag the nodes with the allocation ID */
+        err = prte_set_attribute(&node->attributes, PRTE_NODE_ALLOC_ID, PRTE_ATTR_LOCAL,
+            &slurm_id_uint, PMIX_UINT32);
+
+        if(PRTE_SUCCESS != err) {
+            PRTE_ERROR_LOG(err);
+            return err;
+        }
+    }
+
+    return err;
 }

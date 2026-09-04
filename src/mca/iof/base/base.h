@@ -17,7 +17,7 @@
  * Copyright (c) 2017      Mellanox Technologies. All rights reserved.
  * Copyright (c) 2018      Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
- * Copyright (c) 2021-2023 Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting.  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -76,7 +76,6 @@ PRTE_EXPORT int prte_iof_base_select(void);
  * Maximum size of single msg
  */
 #define PRTE_IOF_BASE_MSG_MAX        4096
-#define PRTE_IOF_BASE_TAG_MAX        1024
 #define PRTE_IOF_BASE_TAGGED_OUT_MAX 8192
 #define PRTE_IOF_MAX_INPUT_BUFFERS   50
 
@@ -97,8 +96,9 @@ typedef struct {
     pmix_proc_t daemon;
     prte_iof_tag_t tag;
     prte_iof_write_event_t *wev;
-    bool xoff;
-    bool exclusive;
+    /* set by nobody today: the HNP's stdin_write_handler honors it by
+     * releasing the sink once the last queued byte is out, which is the
+     * graceful counterpart to the zero-byte close sentinel */
     bool closed;
 } prte_iof_sink_t;
 PRTE_EXPORT PMIX_CLASS_DECLARATION(prte_iof_sink_t);
@@ -111,10 +111,8 @@ typedef struct {
     struct timeval tv;
     int fd;
     prte_iof_tag_t tag;
-    bool active;
     bool activated;
     bool always_readable;
-    prte_iof_sink_t *sink;
 } prte_iof_read_event_t;
 PRTE_EXPORT PMIX_CLASS_DECLARATION(prte_iof_read_event_t);
 
@@ -203,7 +201,6 @@ static inline bool prte_iof_base_fd_always_ready(int fd)
 
 #define PRTE_IOF_READ_ACTIVATE(rev) \
     do {                            \
-        rev->active = true;         \
         PMIX_POST_OBJECT(rev);      \
         PRTE_IOF_READ_ADDEV(rev);   \
     } while (0);
@@ -238,16 +235,37 @@ static inline bool prte_iof_base_fd_always_ready(int fd)
         }                                                                                     \
     } while (0);
 
-PRTE_EXPORT int prte_iof_base_flush(void);
-
 PRTE_EXPORT extern int prte_iof_base_output_limit;
 
 /* base functions */
+
+/* Queue "numbytes" of "data" for writing to the given channel, breaking
+ * it across as many chunks as required, and arm the write event if it is
+ * not already pending. Passing zero bytes queues the sentinel that flushes
+ * any preceding data and then closes the channel. Returns the resulting
+ * number of queued chunks (zero if "channel" is NULL) so the caller can
+ * detect back-pressure.
+ */
 PRTE_EXPORT int prte_iof_base_write_output(const pmix_proc_t *name, prte_iof_tag_t stream,
                                            const unsigned char *data, int numbytes,
                                            prte_iof_write_event_t *channel);
 PRTE_EXPORT void prte_iof_base_write_handler(int fd, short event, void *cbdata);
 
+/* Re-base a queued chunk after a short write: discard the "num_written"
+ * bytes that made it out and slide the remainder to the front of the
+ * chunk so the next write resumes where this one stopped. Every write
+ * handler that re-queues a partially written chunk must call this - both
+ * halves matter, and adjusting the data without the count re-sends the
+ * tail of the chunk on every retry (see the comment in the function).
+ */
+PRTE_EXPORT void prte_iof_base_adjust_short_write(prte_iof_write_output_t *output,
+                                                  int num_written);
+
+/* Emit "string" as though it were output from "source" on the given channel.
+ * NOTE: this takes ownership of "string" - it must be a heap allocation, and
+ * it is free'd once the output has been delivered. Callers must not free it
+ * themselves. A NULL string (a formatter that failed) is a no-op.
+ */
 PRTE_EXPORT void prte_iof_base_output(const pmix_proc_t *source,
                                       pmix_iof_channel_t channel,
                                       char *string);

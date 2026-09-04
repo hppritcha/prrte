@@ -14,7 +14,7 @@
  *                         All rights reserved.
  * Copyright (c) 2014-2020 Intel, Inc.  All rights reserved.
  * Copyright (c) 2016      IBM Corporation.  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -45,6 +45,7 @@
 #include "src/util/pmix_if.h"
 #include "src/util/pmix_net.h"
 #include "src/util/pmix_output.h"
+#include "src/util/pmix_string_copy.h"
 #include "src/util/proc_info.h"
 
 #include "src/util/proc_info.h"
@@ -93,8 +94,14 @@ void prte_setup_hostname(void)
                                       PMIX_MCA_BASE_VAR_TYPE_BOOL,
                                       &prte_keep_fqdn_hostnames);
 
-    /* get the nodename */
-    gethostname(hostname, sizeof(hostname));
+    /* get the nodename. POSIX does not require gethostname() to terminate
+     * the buffer when the name does not fit, so leave room and terminate it
+     * ourselves - and fall back to something usable if the call fails, since
+     * every session directory and node name downstream is built from this */
+    memset(hostname, 0, sizeof(hostname));
+    if (0 != gethostname(hostname, sizeof(hostname) - 1)) {
+        pmix_string_copy(hostname, "localhost", sizeof(hostname));
+    }
 
     prte_strip_prefix = NULL;
     (void) pmix_mca_base_var_register(
@@ -107,7 +114,7 @@ void prte_setup_hostname(void)
      * the names exchanged in the modex match the names found locally
      */
     if (NULL != prte_strip_prefix && !pmix_net_isaddr(hostname)) {
-        prefixes = PMIX_ARGV_SPLIT_COMPAT(prte_strip_prefix, ',');
+        prefixes = PMIx_Argv_split(prte_strip_prefix, ',');
         match = false;
         for (i = 0; NULL != prefixes[i]; i++) {
             if (0 == strncmp(hostname, prefixes[i], strlen(prefixes[i]))) {
@@ -124,7 +131,7 @@ void prte_setup_hostname(void)
                     prte_process_info.nodename = strdup(&hostname[idx]);
                 }
                 /* add this to our list of aliases */
-                PMIX_ARGV_APPEND_UNIQUE_COMPAT(&prte_process_info.aliases, prte_process_info.nodename);
+                PMIx_Argv_append_unique_nosize(&prte_process_info.aliases, prte_process_info.nodename);
                 match = true;
                 break;
             }
@@ -133,7 +140,7 @@ void prte_setup_hostname(void)
         if (!match) {
             prte_process_info.nodename = strdup(hostname);
         }
-        PMIX_ARGV_FREE_COMPAT(prefixes);
+        PMIx_Argv_free(prefixes);
     } else {
         prte_process_info.nodename = strdup(hostname);
     }
@@ -143,26 +150,31 @@ void prte_setup_hostname(void)
         ptr = strchr(prte_process_info.nodename, '.');
         if (NULL != ptr) {
             /* add the fqdn name as an alias */
-            PMIX_ARGV_APPEND_UNIQUE_COMPAT(&prte_process_info.aliases, prte_process_info.nodename);
+            PMIx_Argv_append_unique_nosize(&prte_process_info.aliases, prte_process_info.nodename);
             /* retain the non-fqdn name as the node's name */
             *ptr = '\0';
         }
     }
 
     // add the localhost names
-    PMIX_ARGV_APPEND_UNIQUE_COMPAT(&prte_process_info.aliases, "localhost");
-    PMIX_ARGV_APPEND_UNIQUE_COMPAT(&prte_process_info.aliases, "127.0.0.1");
+    PMIx_Argv_append_unique_nosize(&prte_process_info.aliases, "localhost");
+    PMIx_Argv_append_unique_nosize(&prte_process_info.aliases, "127.0.0.1");
 }
 
 bool prte_check_host_is_local(const char *name)
 {
     int i;
 
+    /* the hostfile and dash-host parsers call this on every name they see,
+     * and both can run before prte_setup_hostname() has filled these in */
+    if (NULL == name || NULL == prte_process_info.nodename) {
+        return false;
+    }
     if (0 == strcmp(name, prte_process_info.nodename)) {
         return true;
     }
 
-    for (i = 0; NULL != prte_process_info.aliases[i]; i++) {
+    for (i = 0; NULL != prte_process_info.aliases && NULL != prte_process_info.aliases[i]; i++) {
         if (0 == strcmp(name, prte_process_info.aliases[i])) {
             return true;
         }
@@ -172,7 +184,7 @@ bool prte_check_host_is_local(const char *name)
     if (!prte_do_not_resolve) {
         if (pmix_ifislocal(name)) {
             /* add to our aliases */
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&prte_process_info.aliases, name);
+            PMIx_Argv_append_nosize(&prte_process_info.aliases, name);
             return true;
         }
     }
@@ -266,7 +278,7 @@ int prte_proc_info_finalize(void)
 
     prte_process_info.proc_type = PRTE_PROC_TYPE_NONE;
 
-    PMIX_ARGV_FREE_COMPAT(prte_process_info.aliases);
+    PMIx_Argv_free(prte_process_info.aliases);
 
     init = false;
     return PRTE_SUCCESS;

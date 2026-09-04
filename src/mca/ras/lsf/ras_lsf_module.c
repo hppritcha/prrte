@@ -12,7 +12,7 @@
  * Copyright (c) 2007-2020 Cisco Systems, Inc.  All rights reserved
  * Copyright (c) 2014-2019 Intel, Inc.  All rights reserved.
  * Copyright (c) 2016-2022 IBM Corporation.  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -44,6 +44,7 @@
 #include "src/mca/rmaps/rmaps_types.h"
 #include "src/runtime/prte_globals.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 
 #include "ras_lsf.h"
 #include "src/mca/ras/base/base.h"
@@ -58,6 +59,7 @@ static int finalize(void);
  * Global variable
  */
 prte_ras_base_module_t prte_ras_lsf_module = {
+    .scheduler_owned = true,
     .init = NULL,
     .allocate = allocate,
     .finalize = finalize
@@ -72,7 +74,7 @@ static int allocate(prte_job_t *jdata, pmix_list_t *nodes)
 
     /* get the list of allocated nodes */
     if ((num_nodes = lsb_getalloc(&nodelist)) < 0) {
-        pmix_show_help("help-ras-lsf.txt", "nodelist-failed", true);
+        prte_show_help("help-ras-lsf.txt", "nodelist-failed", true);
         return PRTE_ERR_NOT_AVAILABLE;
     }
     node = NULL;
@@ -96,6 +98,9 @@ static int allocate(prte_job_t *jdata, pmix_list_t *nodes)
         node->slots_inuse = 0;
         node->slots_max = 0;
         node->slots = 1;
+        /* lsb_getalloc returns one entry per allocated slot, so the count
+         * this loop arrives at is what LSF gave us - authoritative */
+        PRTE_FLAG_SET(node, PRTE_NODE_FLAG_SLOTS_GIVEN);
         node->state = PRTE_NODE_STATE_UP;
         pmix_list_append(nodes, &node->super);
 
@@ -105,7 +110,7 @@ static int allocate(prte_job_t *jdata, pmix_list_t *nodes)
     }
 
     /* release the nodelist from lsf */
-    PMIX_ARGV_FREE_COMPAT(nodelist);
+    PMIx_Argv_free(nodelist);
 
     return PRTE_SUCCESS;
 }

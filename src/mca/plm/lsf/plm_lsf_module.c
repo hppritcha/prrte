@@ -18,7 +18,7 @@
  * Copyright (c) 2017      IBM Corporation.  All rights reserved.
  * Copyright (c) 2019      Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -81,6 +81,7 @@ int lsberrno;
 #include "src/runtime/prte_wait.h"
 #include "src/threads/pmix_threads.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 
 #include "plm_lsf.h"
 #include "src/mca/plm/base/base.h"
@@ -188,6 +189,8 @@ static void launch_daemons(int fd, short args, void *cbdata)
     char *newenv;
     PRTE_HIDE_UNUSED_PARAMS(fd, args);
 
+    nodelist_argv = NULL;
+
     PMIX_ACQUIRE_OBJECT(state);
     jdata = state->jdata;
 
@@ -258,6 +261,14 @@ static void launch_daemons(int fd, short args, void *cbdata)
          */
         pmix_argv_append(&nodelist_argc, &nodelist_argv, node->name);
     }
+    if (0 == PMIx_Argv_count(nodelist_argv)) {
+        /* every node in the map already has a daemon - there is nothing
+         * for lsb_launch to do, and handing it an empty host list is not
+         * something we should ask of it */
+        prte_show_help("help-plm-lsf.txt", "no-hosts-in-list", true);
+        rc = PRTE_ERR_FAILED_TO_START;
+        goto cleanup;
+    }
 
     /*
      * start building argv array
@@ -299,7 +310,7 @@ static void launch_daemons(int fd, short args, void *cbdata)
     prte_plm_base_wrap_args(argv);
 
     if (0 < pmix_output_get_verbosity(prte_plm_base_framework.framework_output)) {
-        param = PMIX_ARGV_JOIN_COMPAT(argv, ' ');
+        param = PMIx_Argv_join(argv, ' ');
         if (NULL != param) {
             pmix_output(0, "plm:lsf: final top-level argv:");
             pmix_output(0, "plm:lsf:     %s", param);
@@ -309,7 +320,7 @@ static void launch_daemons(int fd, short args, void *cbdata)
 
     /* setup environment - this is the pristine version that PRRTE
      * has already stripped of all PRTE_ and PMIX_ prefixed values */
-    env = PMIX_ARGV_COPY_COMPAT(prte_launch_environ);
+    env = PMIx_Argv_copy(prte_launch_environ);
 
     /*
      * Any prefix was installed in the DAEMON job object, so
@@ -331,7 +342,7 @@ static void launch_daemons(int fd, short args, void *cbdata)
         PMIX_OUTPUT_VERBOSE((1, prte_plm_base_framework.framework_output,
                              "%s plm:lsf: resetting PATH: %s",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), newenv));
-        PMIX_SETENV_COMPAT("PATH", newenv, true, &env);
+        PMIx_Setenv("PATH", newenv, true, &env);
         free(newenv);
         // set the library path
         param = getenv("LD_LIBRARY_PATH");
@@ -343,10 +354,10 @@ static void launch_daemons(int fd, short args, void *cbdata)
         PMIX_OUTPUT_VERBOSE((1, prte_plm_base_framework.framework_output,
                              "%s plm:lsf: resetting LD_LIBRARY_PATH: %s",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), newenv));
-        PMIX_SETENV_COMPAT("LD_LIBRARY_PATH", newenv, true, &env);
+        PMIx_Setenv("LD_LIBRARY_PATH", newenv, true, &env);
         free(newenv);
         // add the prefix itself to the environment
-        PMIX_SETENV_COMPAT("PRTE_PREFIX", cur_prefix, true, &env);
+        PMIx_Setenv("PRTE_PREFIX", cur_prefix, true, &env);
         free(cur_prefix);
         free(bin_base);
         free(lib_base);
@@ -365,10 +376,10 @@ static void launch_daemons(int fd, short args, void *cbdata)
         PMIX_OUTPUT_VERBOSE((1, prte_plm_base_framework.framework_output,
                              "%s plm:lsf: resetting LD_LIBRARY_PATH: %s",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), newenv));
-        PMIX_SETENV_COMPAT("LD_LIBRARY_PATH", newenv, true, &env);
+        PMIx_Setenv("LD_LIBRARY_PATH", newenv, true, &env);
         free(newenv);
         // add the prefix itself to the environment
-        PMIX_SETENV_COMPAT("PMIX_PREFIX", pmix_prefix, true, &env);
+        PMIx_Setenv("PMIX_PREFIX", pmix_prefix, true, &env);
         free(pmix_prefix);
         free(lib_base);
     }
@@ -389,9 +400,9 @@ static void launch_daemons(int fd, short args, void *cbdata)
     if ((rc = lsb_launch(nodelist_argv, argv, LSF_DJOB_REPLACE_ENV | LSF_DJOB_NOWAIT, env)) < 0) {
         PRTE_ERROR_LOG(PRTE_ERR_FAILED_TO_START);
         char *flattened_nodelist = NULL;
-        flattened_nodelist = PMIX_ARGV_JOIN_COMPAT(nodelist_argv, '\n');
-        pmix_show_help("help-plm-lsf.txt", "lsb_launch-failed", true, rc, lsberrno, lsb_sysmsg(),
-                       PMIX_ARGV_COUNT_COMPAT(nodelist_argv), flattened_nodelist);
+        flattened_nodelist = PMIx_Argv_join(nodelist_argv, '\n');
+        prte_show_help("help-plm-lsf.txt", "lsb_launch-failed", true, rc, lsberrno, lsb_sysmsg(),
+                       PMIx_Argv_count(nodelist_argv), flattened_nodelist);
         free(flattened_nodelist);
         rc = PRTE_ERR_FAILED_TO_START;
         prte_wait_enable(); /* re-enable our SIGCHLD handler */
@@ -408,10 +419,13 @@ static void launch_daemons(int fd, short args, void *cbdata)
 
 cleanup:
     if (NULL != argv) {
-        PMIX_ARGV_FREE_COMPAT(argv);
+        PMIx_Argv_free(argv);
     }
     if (NULL != env) {
-        PMIX_ARGV_FREE_COMPAT(env);
+        PMIx_Argv_free(env);
+    }
+    if (NULL != nodelist_argv) {
+        PMIx_Argv_free(nodelist_argv);
     }
 
     /* check for failed launch - if so, force terminate */

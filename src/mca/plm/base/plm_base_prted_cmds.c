@@ -35,7 +35,7 @@
 #include "src/event/event-internal.h"
 #include "src/mca/errmgr/errmgr.h"
 #include "src/mca/ess/ess.h"
-#include "src/mca/grpcomm/base/base.h"
+#include "src/grpcomm/grpcomm.h"
 #include "src/mca/odls/odls_types.h"
 #include "src/rml/rml.h"
 #include "src/rml/rml_types.h"
@@ -49,6 +49,11 @@
 
 #include "src/mca/plm/base/base.h"
 #include "src/mca/plm/base/plm_private.h"
+
+/* The command the DVM was ordered down with, remembered so that a daemon
+ * which was still coming up when the order went out can be given the same
+ * one when it finally reports in.  See prte_plm_base_prted_exit_late(). */
+static prte_daemon_cmd_flag_t term_command = PRTE_DAEMON_EXIT_CMD;
 
 int prte_plm_base_prted_exit(prte_daemon_cmd_flag_t command)
 {
@@ -77,6 +82,7 @@ int prte_plm_base_prted_exit(prte_daemon_cmd_flag_t command)
     if (prte_abnormal_term_ordered || prte_never_launched || !prte_routing_is_enabled) {
         cmmnd = PRTE_DAEMON_HALT_VM_CMD;
     }
+    term_command = cmmnd;
 
     /* send it express delivery! */
     PMIX_DATA_BUFFER_CONSTRUCT(&cmd);
@@ -89,11 +95,39 @@ int prte_plm_base_prted_exit(prte_daemon_cmd_flag_t command)
         return rc;
     }
     /* goes to all daemons */
-    if (PRTE_SUCCESS != (rc = prte_grpcomm.xcast(PRTE_RML_TAG_DAEMON, &cmd))) {
+    if (PRTE_SUCCESS != (rc = prte_grpcomm_xcast(PRTE_RML_TAG_DAEMON, &cmd))) {
         PRTE_ERROR_LOG(rc);
     }
     PMIX_DATA_BUFFER_DESTRUCT(&cmd);
 
+    return rc;
+}
+
+int prte_plm_base_prted_exit_late(const pmix_proc_t *daemon)
+{
+    int rc;
+    pmix_data_buffer_t *cmd;
+
+    PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
+                         "%s plm:base:prted_cmd re-issuing prted_exit to %s",
+                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                         PRTE_NAME_PRINT(daemon)));
+
+    PMIX_DATA_BUFFER_CREATE(cmd);
+    rc = PMIx_Data_pack(NULL, cmd, &term_command, 1, PMIX_UINT8);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        PMIX_DATA_BUFFER_RELEASE(cmd);
+        return prte_pmix_convert_status(rc);
+    }
+
+    /* point-to-point, not an xcast: the broadcast has already been through
+     * the tree and every daemon that was listening for it has acted on it */
+    PRTE_RML_SEND(rc, daemon->rank, cmd, PRTE_RML_TAG_DAEMON);
+    if (PRTE_SUCCESS != rc) {
+        PRTE_ERROR_LOG(rc);
+        PMIX_DATA_BUFFER_RELEASE(cmd);
+    }
     return rc;
 }
 
@@ -156,7 +190,7 @@ int prte_plm_base_prted_kill_local_procs(pmix_pointer_array_t *procs)
         }
     }
     /* goes to all daemons */
-    if (PRTE_SUCCESS != (rc = prte_grpcomm.xcast(PRTE_RML_TAG_DAEMON, &cmd))) {
+    if (PRTE_SUCCESS != (rc = prte_grpcomm_xcast(PRTE_RML_TAG_DAEMON, &cmd))) {
         PRTE_ERROR_LOG(rc);
     }
     PMIX_DATA_BUFFER_DESTRUCT(&cmd);
@@ -170,10 +204,19 @@ int prte_plm_base_prted_signal_local_procs(pmix_nspace_t job, int32_t signal)
     int rc;
     pmix_data_buffer_t cmd;
     prte_daemon_cmd_flag_t command = PRTE_DAEMON_SIGNAL_LOCAL_PROCS;
+    /* A pmix_nspace_t is an array type, so as a PARAMETER it has decayed to a
+     * char* - and &job is therefore the address of that pointer variable, not
+     * of the name. Packing PMIX_PROC_NSPACE reads PMIX_MAX_NSLEN+1 bytes from
+     * whatever it is handed, so passing &job packed a stack fragment and the
+     * receiving daemon matched no job at all: every signal delivered through
+     * this entry point was silently dropped. Copy into real storage first. */
+    pmix_nspace_t jobid;
 
     PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
                          "%s plm:base:prted_cmd sending signal_local_procs cmds",
                          PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+
+    PMIX_LOAD_NSPACE(jobid, job);
 
     PMIX_DATA_BUFFER_CONSTRUCT(&cmd);
 
@@ -186,7 +229,7 @@ int prte_plm_base_prted_signal_local_procs(pmix_nspace_t job, int32_t signal)
     }
 
     /* pack the jobid */
-    rc = PMIx_Data_pack(NULL, &cmd, &job, 1, PMIX_PROC_NSPACE);
+    rc = PMIx_Data_pack(NULL, &cmd, &jobid, 1, PMIX_PROC_NSPACE);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
         PMIX_DATA_BUFFER_DESTRUCT(&cmd);
@@ -202,7 +245,7 @@ int prte_plm_base_prted_signal_local_procs(pmix_nspace_t job, int32_t signal)
     }
 
     /* goes to all daemons */
-    if (PRTE_SUCCESS != (rc = prte_grpcomm.xcast(PRTE_RML_TAG_DAEMON, &cmd))) {
+    if (PRTE_SUCCESS != (rc = prte_grpcomm_xcast(PRTE_RML_TAG_DAEMON, &cmd))) {
         PRTE_ERROR_LOG(rc);
     }
     PMIX_DATA_BUFFER_DESTRUCT(&cmd);

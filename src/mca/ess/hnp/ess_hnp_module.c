@@ -17,7 +17,7 @@
  * Copyright (c) 2013-2020 Intel, Inc.  All rights reserved.
  * Copyright (c) 2017-2018 Research Organization for Information Science
  *                         and Technology (RIST). All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -41,22 +41,19 @@
 #include "src/class/pmix_hash_table.h"
 #include "src/class/pmix_list.h"
 #include "src/event/event-internal.h"
-#include "src/include/hash_string.h"
-
 #include "src/hwloc/hwloc-internal.h"
 #include "src/pmix/pmix-internal.h"
 #include "src/util/pmix_argv.h"
 #include "src/util/pmix_basename.h"
 #include "src/util/pmix_fd.h"
 #include "src/util/pmix_if.h"
-#include "src/util/malloc.h"
 #include "src/util/pmix_os_path.h"
 #include "src/util/pmix_output.h"
 #include "src/util/pmix_environ.h"
 
 #include "src/mca/errmgr/base/base.h"
 #include "src/mca/filem/base/base.h"
-#include "src/mca/grpcomm/base/base.h"
+#include "src/grpcomm/grpcomm.h"
 #include "src/mca/iof/base/base.h"
 #include "src/mca/odls/base/base.h"
 #include "src/mca/plm/base/base.h"
@@ -75,6 +72,7 @@
 #include "src/util/proc_info.h"
 #include "src/util/session_dir.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 
 #include "src/runtime/prte_globals.h"
 #include "src/runtime/prte_locks.h"
@@ -169,18 +167,23 @@ static int rte_init(int argc, char **argv)
     jdata = PMIX_NEW(prte_job_t);
     PMIX_LOAD_NSPACE(jdata->nspace, PRTE_PROC_MY_NAME->nspace);
     ret = prte_set_job_data_object(jdata);
+    if (PRTE_SUCCESS != ret) {
+        PRTE_ERROR_LOG(ret);
+        error = "prte_set_job_data_object";
+        goto error;
+    }
 
     /* set the schizo personality to "prte" by default */
     jdata->schizo = (struct prte_schizo_base_module_t*)prte_schizo_base_detect_proxy("prte");
     if (NULL == jdata->schizo) {
-        pmix_show_help("help-schizo-base.txt", "no-proxy", true, prte_tool_basename, "prte");
+        prte_show_help("help-schizo-base.txt", "no-proxy", true, prte_tool_basename, "prte");
         error = "select personality";
         ret = PRTE_ERR_SILENT;
         goto error;
     }
 
     /* Set the session of the daemon job to the default session */
-    jdata->session = prte_default_session;
+    prte_set_job_session(jdata, prte_default_session);
 
     /* mark that the daemons have reported as we are the
      * only ones in the system right now, and we definitely
@@ -191,7 +194,7 @@ static int rte_init(int argc, char **argv)
     /* every job requires at least one app */
     app = PMIX_NEW(prte_app_context_t);
     app->app = strdup(argv[0]);
-    app->argv = PMIX_ARGV_COPY_COMPAT(argv);
+    app->argv = PMIx_Argv_copy(argv);
     app->job = (struct prte_job_t*)jdata;
     pmix_pointer_array_set_item(jdata->apps, 0, app);
     jdata->num_apps++;
@@ -207,7 +210,7 @@ static int rte_init(int argc, char **argv)
     PMIX_LOAD_PROCID(&proc->name, PRTE_PROC_MY_NAME->nspace, PRTE_PROC_MY_NAME->rank);
     proc->pid = prte_process_info.pid;
     proc->state = PRTE_PROC_STATE_RUNNING;
-    PMIX_RETAIN(node); /* keep accounting straight */
+    /* the node backpointer is borrowed, not retained */
     proc->node = node;
     pmix_pointer_array_set_item(jdata->procs, PRTE_PROC_MY_NAME->rank, proc);
 
@@ -255,7 +258,7 @@ static int rte_init(int argc, char **argv)
     pmix_ifgetaliases(&prte_process_info.aliases);
 
     /* get our aliases - will include all the interface aliases captured in prte_init */
-    node->aliases = PMIX_ARGV_COPY_COMPAT(prte_process_info.aliases);
+    node->aliases = PMIx_Argv_copy(prte_process_info.aliases);
 
     /* if we are using xml for output, put a start tag */
     if (prte_xml_output) {
@@ -288,16 +291,9 @@ static int rte_init(int argc, char **argv)
     /*
      * Group communications
      */
-    if (PRTE_SUCCESS
-        != (ret = pmix_mca_base_framework_open(&prte_grpcomm_base_framework,
-                                               PMIX_MCA_BASE_OPEN_DEFAULT))) {
+    if (PRTE_SUCCESS != (ret = prte_grpcomm_init())) {
         PRTE_ERROR_LOG(ret);
-        error = "prte_grpcomm_base_open";
-        goto error;
-    }
-    if (PRTE_SUCCESS != (ret = prte_grpcomm_base_select())) {
-        PRTE_ERROR_LOG(ret);
-        error = "prte_grpcomm_base_select";
+        error = "prte_grpcomm_init";
         goto error;
     }
 
@@ -360,18 +356,18 @@ static int rte_init(int argc, char **argv)
     /* add the topology to the array of known topologies */
     t = PMIX_NEW(prte_topology_t);
     t->topo = prte_hwloc_topology;
-    /* generate the signature */
-    prte_topo_signature = prte_hwloc_base_get_topo_signature(prte_hwloc_topology);
-    t->sig = strdup(prte_topo_signature);
     t->index = pmix_pointer_array_add(prte_node_topologies, t);
+    /* the node holds a counted reference to the topology */
+    PMIX_RETAIN(t);
     node->topology = t;
     node->available = prte_hwloc_base_filter_cpus(prte_hwloc_topology);
     if (15 < pmix_output_get_verbosity(prte_ess_base_framework.framework_output)) {
         char *output = NULL;
         pmix_output(0, "%s Topology Info:", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME));
-        prte_hwloc_print(&output, "\t", prte_hwloc_topology);
-        pmix_output(0, "%s", output);
-        free(output);
+        if (PRTE_SUCCESS == prte_hwloc_print(&output, "\t", prte_hwloc_topology)) {
+            pmix_output(0, "%s", output);
+            free(output);
+        }
     }
 
     /* Open/select the odls */
@@ -426,7 +422,7 @@ static int rte_init(int argc, char **argv)
 
 error:
     if (PRTE_ERR_SILENT != ret && !prte_report_silent_errors) {
-        pmix_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true, error,
+        prte_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true, error,
                        PRTE_ERROR_NAME(ret), ret);
     }
     if (NULL != jdata) {
@@ -440,12 +436,21 @@ static int rte_finalize(void)
 {
     /* first stage shutdown of the errmgr, deregister the handler but keep
      * the required facilities until the rml is offline */
-    prte_errmgr.finalize();
+    if (NULL != prte_errmgr.finalize) {
+        prte_errmgr.finalize();
+    }
 
     /* close frameworks */
     (void) pmix_mca_base_framework_close(&prte_filem_base_framework);
-    (void) pmix_mca_base_framework_close(&prte_grpcomm_base_framework);
+    prte_grpcomm_finalize();
     (void) pmix_mca_base_framework_close(&prte_iof_base_framework);
+    /* mapping is over, so rmaps can go here - the close frees the base's
+     * hwloc bitmaps and runs each mapper's finalize. The ras framework we
+     * also opened is NOT closed here: a session destructor asks it to
+     * release the underlying allocation, and the sessions are torn down
+     * after this function returns, so prte_finalize closes it once that
+     * teardown is done. */
+    (void) pmix_mca_base_framework_close(&prte_rmaps_base_framework);
     (void) pmix_mca_base_framework_close(&prte_plm_base_framework);
     if (!prte_abnormal_term_ordered) {
         /* make sure our local procs are dead */
@@ -456,8 +461,6 @@ static int rte_finalize(void)
     (void) pmix_mca_base_framework_close(&prte_prtereachable_base_framework);
     (void) pmix_mca_base_framework_close(&prte_errmgr_base_framework);
     (void) pmix_mca_base_framework_close(&prte_state_base_framework);
-
-    free(prte_topo_signature);
 
     if (prte_xml_output) {
         fprintf(stdout, "</%s>\n", prte_tool_basename);

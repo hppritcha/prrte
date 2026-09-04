@@ -37,9 +37,10 @@ static int filem_raw_close(void);
 static int filem_raw_query(pmix_mca_base_module_t **module, int *priority);
 
 bool prte_filem_raw_flatten_trees = false;
+int prte_filem_raw_chunk_window = 64;
 
 prte_filem_base_component_t prte_mca_filem_raw_component = {
-    PRTE_FILEM_BASE_VERSION_2_0_0,
+    PRTE_MCA_BASE_VERSION(filem),
     /* Component name and version */
     .pmix_mca_component_name = "raw",
     PMIX_MCA_BASE_MAKE_VERSION(component,
@@ -65,6 +66,23 @@ static int filem_raw_register(void)
                                                 "creating their respective directory trees",
                                                 PMIX_MCA_BASE_VAR_TYPE_BOOL,
                                                 &prte_filem_raw_flatten_trees);
+
+    prte_filem_raw_chunk_window = 64;
+    (void) pmix_mca_base_component_var_register(c, "chunk_window",
+                                                "Maximum number of 16KByte chunks of one "
+                                                "file that may be broadcast before the "
+                                                "reader waits for the oldest of them to "
+                                                "reach the whole DVM. "
+                                                "This is the only thing bounding how much of "
+                                                "a staged file the daemons hold in memory at "
+                                                "once; raise it on a fabric whose round trip "
+                                                "the default cannot fill, and never set it "
+                                                "below 1.",
+                                                PMIX_MCA_BASE_VAR_TYPE_INT,
+                                                &prte_filem_raw_chunk_window);
+    if (1 > prte_filem_raw_chunk_window) {
+        prte_filem_raw_chunk_window = 1;
+    }
 
     return PRTE_SUCCESS;
 }

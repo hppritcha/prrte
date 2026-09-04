@@ -6,7 +6,7 @@
  * Copyright (c) 2019      Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -25,7 +25,6 @@
 
 #include "src/class/pmix_list.h"
 #include "src/event/event-internal.h"
-#include "src/include/hash_string.h"
 #include "src/mca/mca.h"
 #include "src/threads/pmix_threads.h"
 #include "src/util/error.h"
@@ -48,6 +47,25 @@ typedef struct {
     pmix_list_item_t super;
     pmix_app_t app;
     void *info;
+    /* The mapping/ranking/binding directives this app segment carried, held
+     * aside until the whole cmd line has been parsed. Only then is it known
+     * whether they are per-app at all: a directive written on the first app
+     * and nowhere else speaks for the whole job, however many apps there
+     * are, so it belongs in the job's spec rather than any app's. Written on
+     * a later app it is that app's alone. prte_parse_locals() decides and
+     * distributes them. */
+    char *mapby;
+    char *rankby;
+    char *bindto;
+    /* The job-level directives this app segment carried. Unlike the three
+     * above these are never per-app - there is no such thing as one app
+     * being displayed, or one app not launching - but the global parse of
+     * the command line stops at the first executable and so cannot see one
+     * written in a later segment. prte_parse_locals() collects them and
+     * hands them back to the tool's parse result. */
+    char *output;
+    char *display;
+    char *rtos;
 } prte_pmix_app_t;
 PMIX_CLASS_DECLARATION(prte_pmix_app_t);
 
@@ -79,22 +97,6 @@ typedef struct {
 } prte_value_t;
 PMIX_CLASS_DECLARATION(prte_value_t);
 
-#if !defined(WORDS_BIGENDIAN)
-#    define PMIX_PROC_NTOH(guid) pmix_proc_ntoh_intr(&(guid))
-static inline __prte_attribute_always_inline__ void pmix_proc_ntoh_intr(pmix_proc_t *name)
-{
-    name->rank = ntohl(name->rank);
-}
-#    define PMIX_PROC_HTON(guid) pmix_proc_hton_intr(&(guid))
-static inline __prte_attribute_always_inline__ void pmix_proc_hton_intr(pmix_proc_t *name)
-{
-    name->rank = htonl(name->rank);
-}
-#else
-#    define PMIX_PROC_NTOH(guid)
-#    define PMIX_PROC_HTON(guid)
-#endif
-
 #define prte_pmix_condition_wait(a, b) pthread_cond_wait(a, &(b)->m_lock_pthread)
 
 #define PRTE_PMIX_CONSTRUCT_LOCK(l)                \
@@ -116,92 +118,68 @@ static inline __prte_attribute_always_inline__ void pmix_proc_hton_intr(pmix_pro
         pthread_cond_destroy(&(l)->cond); \
         if (NULL != (l)->msg) {           \
             free((l)->msg);               \
+            (l)->msg = NULL;              \
         }                                 \
     } while (0)
 
-#if PRTE_ENABLE_DEBUG
-#    define PRTE_PMIX_ACQUIRE_THREAD(lck)                                       \
-        do {                                                                    \
-            pmix_mutex_lock(&(lck)->mutex);                                     \
-            while ((lck)->active) {                                             \
-                prte_pmix_condition_wait(&(lck)->cond, &(lck)->mutex);          \
-            }                                                                   \
-            (lck)->active = true;                                               \
-        } while (0)
-#else
-#    define PRTE_PMIX_ACQUIRE_THREAD(lck)                              \
-        do {                                                           \
-            pmix_mutex_lock(&(lck)->mutex);                            \
-            while ((lck)->active) {                                    \
-                prte_pmix_condition_wait(&(lck)->cond, &(lck)->mutex); \
-            }                                                          \
-            (lck)->active = true;                                      \
-        } while (0)
-#endif
-
-#if PRTE_ENABLE_DEBUG
-#    define PRTE_PMIX_WAIT_THREAD(lck)                                          \
-        do {                                                                    \
-            pmix_mutex_lock(&(lck)->mutex);                                     \
-            while ((lck)->active) {                                             \
-                prte_pmix_condition_wait(&(lck)->cond, &(lck)->mutex);          \
-            }                                                                   \
-            PMIX_ACQUIRE_OBJECT(&lck);                                          \
-            pmix_mutex_unlock(&(lck)->mutex);                                   \
-        } while (0)
-#else
-#    define PRTE_PMIX_WAIT_THREAD(lck)                                 \
-        do {                                                           \
-            pmix_mutex_lock(&(lck)->mutex);                            \
-            while ((lck)->active) {                                    \
-                prte_pmix_condition_wait(&(lck)->cond, &(lck)->mutex); \
-            }                                                          \
-            PMIX_ACQUIRE_OBJECT(lck);                                  \
-            pmix_mutex_unlock(&(lck)->mutex);                          \
-        } while (0)
-#endif
-
-#if PRTE_ENABLE_DEBUG
-#    define PRTE_PMIX_RELEASE_THREAD(lck)                                     \
-        do {                                                                  \
-            (lck)->active = false;                                            \
-            pthread_cond_signal(&(lck)->cond);                             \
-            pmix_mutex_unlock(&(lck)->mutex);                                 \
-        } while (0)
-#else
-#    define PRTE_PMIX_RELEASE_THREAD(lck)                   \
-        do {                                                \
-            assert(0 != pmix_mutex_trylock(&(lck)->mutex)); \
-            (lck)->active = false;                          \
-            pthread_cond_signal(&(lck)->cond);           \
-            pmix_mutex_unlock(&(lck)->mutex);               \
-        } while (0)
-#endif
-
-#define PRTE_PMIX_WAKEUP_THREAD(lck)          \
-    do {                                      \
-        pmix_mutex_lock(&(lck)->mutex);       \
-        (lck)->active = false;                \
-        PMIX_POST_OBJECT(lck);                \
-        pthread_cond_signal(&(lck)->cond); \
-        pmix_mutex_unlock(&(lck)->mutex);     \
+/* Block the calling thread until someone wakes the lock. Never use this
+ * on the thread that drives prte_event_base - see the discussion of
+ * prte_pmix_shifted_wakeup() below and in the top-level AGENTS.md. */
+#define PRTE_PMIX_WAIT_THREAD(lck)                                 \
+    do {                                                           \
+        pmix_mutex_lock(&(lck)->mutex);                            \
+        while ((lck)->active) {                                    \
+            prte_pmix_condition_wait(&(lck)->cond, &(lck)->mutex); \
+        }                                                          \
+        PMIX_ACQUIRE_OBJECT(lck);                                  \
+        pmix_mutex_unlock(&(lck)->mutex);                          \
     } while (0)
 
-/*
- * Count the hash for the the external RM
- */
-#define PRTE_HASH_JOBID(str, hash) \
-    {                              \
-        PRTE_HASH_STR(str, hash);  \
-        hash &= ~(0x8000);         \
-    }
+#define PRTE_PMIX_WAKEUP_THREAD(lck)       \
+    do {                                   \
+        pmix_mutex_lock(&(lck)->mutex);    \
+        (lck)->active = false;             \
+        PMIX_POST_OBJECT(lck);             \
+        pthread_cond_signal(&(lck)->cond); \
+        pmix_mutex_unlock(&(lck)->mutex);  \
+    } while (0)
+
+/* Caddy for shifting a lock wakeup from the PMIx progress thread
+ * onto the PRRTE progress thread. A prte_pmix_lock_t is a PRRTE
+ * object, so a callback executing on the PMIx progress thread must
+ * not wake it directly - a waiter that drives prte_event_base while
+ * polling the lock's active flag would never observe a wakeup
+ * signaled while the event loop is parked in the backend. Posting
+ * the wakeup as an event both wakes the loop and serializes the
+ * flag update. */
+typedef struct {
+    pmix_object_t super;
+    pmix_event_t ev;
+    prte_pmix_lock_t *lock;
+    pmix_status_t status;
+    char *msg;
+} prte_pmix_wakeup_caddy_t;
+PMIX_CLASS_DECLARATION(prte_pmix_wakeup_caddy_t);
+
+/* Post a wakeup of the given lock to prte_event_base. The handler
+ * running on the PRRTE progress thread stores status in
+ * lock->status, transfers ownership of msg (which must be NULL or
+ * heap-allocated) to lock->msg, and then wakes the waiter. Call
+ * this - never PRTE_PMIX_WAKEUP_THREAD - from any callback that
+ * PMIx invokes in a process hosting a PRRTE event base. */
+PRTE_EXPORT void prte_pmix_shifted_wakeup(prte_pmix_lock_t *lock,
+                                          pmix_status_t status,
+                                          char *msg);
 
 /**
  * Provide a simplified macro for retrieving modex data
  * from another process when we don't want the PMIx module
  * to request it from the server if not found:
  *
- * r - the integer return status from the modex op (int)
+ * r - lvalue receiving the PMIx status of the modex op
+ *     (pmix_status_t) - NOT a PRTE error code. Feed it to
+ *     prte_pmix_convert_status() before comparing it against
+ *     anything but PMIX_SUCCESS.
  * s - string key (char*)
  * p - pointer to the pmix_proc_t of the proc that posted
  *     the data (pmix_proc_t*)
@@ -220,23 +198,23 @@ static inline __prte_attribute_always_inline__ void pmix_proc_hton_intr(pmix_pro
                              PRTE_NAME_PRINT((p)), (s)));                              \
         PMIX_INFO_LOAD(&_info, PMIX_OPTIONAL, NULL, PMIX_BOOL);                        \
         (r) = PMIx_Get((p), (s), &(_info), 1, &(_kv));                                 \
-        if (NULL == _kv) {                                                             \
+        PMIX_INFO_DESTRUCT(&_info);                                                    \
+        if (PMIX_SUCCESS != (r)) {                                                     \
+            /* leave the library's status alone - it says why */                       \
+        } else if (NULL == _kv) {                                                      \
             (r) = PMIX_ERR_NOT_FOUND;                                                  \
         } else if (_kv->type != (t)) {                                                 \
             (r) = PMIX_ERR_TYPE_MISMATCH;                                              \
-        } else if (PMIX_SUCCESS == (r)) {                                              \
+        } else {                                                                       \
             PMIX_VALUE_UNLOAD((r), _kv, (void **) (d), &_sz);                          \
         }                                                                              \
         if (NULL != _kv) {                                                             \
             PMIX_VALUE_RELEASE(_kv);                                                   \
         }                                                                              \
-    } while (0);
-
-#define PRTE_PMIX_SHOW_HELP "prte.show.help"
+    } while (0)
 
 /* PRTE attribute */
 typedef uint16_t prte_attribute_key_t;
-#define PRTE_ATTR_KEY_T PRTE_UINT16
 typedef struct {
     pmix_list_item_t super;   /* required for this to be on lists */
     prte_attribute_key_t key; /* key identifier */
@@ -245,7 +223,11 @@ typedef struct {
 } prte_attribute_t;
 PRTE_EXPORT PMIX_CLASS_DECLARATION(prte_attribute_t);
 
-/* some helper functions */
+/* Translators between PRRTE's and PMIx's code spaces. Every one of
+ * these is total: an input the switch does not name still yields a
+ * legal code in the target space, never a raw pass-through of the
+ * input. See src/pmix/AGENTS.md for why that matters - the two spaces
+ * overlap numerically. */
 PRTE_EXPORT pmix_proc_state_t prte_pmix_convert_state(int state);
 PRTE_EXPORT int prte_pmix_convert_pstate(pmix_proc_state_t);
 PRTE_EXPORT pmix_status_t prte_pmix_convert_rc(int rc);
@@ -253,102 +235,75 @@ PRTE_EXPORT int prte_pmix_convert_status(pmix_status_t status);
 PRTE_EXPORT pmix_status_t prte_pmix_convert_job_state_to_error(int state);
 PRTE_EXPORT pmix_status_t prte_pmix_convert_proc_state_to_error(int state);
 
-PRTE_EXPORT int prte_pmix_register_cleanup(char *path, bool directory, bool ignore, bool jobscope);
+/* Reach the interface version a framework's own header states.
+ *
+ * The PRRTE counterpart of PMIX_MCA_FW_VER() in PMIx's mca.h, and the
+ * reason PRRTE needs one of its own: that macro pastes a PMIX_ prefix,
+ * and these are PRRTE's frameworks, so the numbers belong in PRRTE's
+ * namespace. A framework states its version once, as three macros in its
+ * <framework>.h - for example, in plm.h:
+ *
+ *   #define PRTE_MCA_plm_MAJOR_VERSION   2
+ *   #define PRTE_MCA_plm_MINOR_VERSION   0
+ *   #define PRTE_MCA_plm_RELEASE_VERSION 0
+ *
+ * Both sides of the load-time version check reach those same three
+ * integers by pasting the framework's name: the component stamp below,
+ * and the framework's declaration. Nothing restates them, so the version
+ * a component carries and the version it is checked against cannot drift
+ * apart, and bumping an interface is one edit in one header.
+ *
+ * The name carries the framework's directory name verbatim, lower case
+ * and all: the preprocessor pastes tokens, it does not upper-case them. */
+#define PRTE_MCA_FW_VER_(name, level) PRTE_MCA_##name##_##level##_VERSION
+#define PRTE_MCA_FW_VER(name, level)  PRTE_MCA_FW_VER_(name, level)
 
-#ifndef PMIX_DATA_BUFFER_STATIC_INIT
-    #define PMIX_DATA_BUFFER_STATIC_INIT    \
-    {                                       \
-        .base_ptr = NULL,                   \
-        .pack_ptr = NULL,                   \
-        .unpack_ptr = NULL,                 \
-        .bytes_allocated = 0,               \
-        .bytes_used = 0                     \
-    }
-#endif
+/* Open a component struct.
+ *
+ * Every PRRTE component begins its base struct with this, naming its
+ * framework as a bare token - the framework's directory name, so that the
+ * same token both stringifies into the struct and pastes into the version
+ * macros above:
+ *
+ *   prte_plm_base_component_t prte_mca_plm_ssh_component = {
+ *       .base_version = {
+ *           PRTE_MCA_BASE_VERSION(plm),
+ *           .pmix_mca_component_name = "ssh",
+ *           ...
+ *
+ * PMIx's PMIX_MCA_BASE_VERSION() cannot serve here: it stamps the project
+ * as "pmix" with PMIx's own version numbers. This one says "prte" and
+ * PRRTE's, which is the whole reason PRRTE keeps a macro of its own at
+ * this level. */
+#define PRTE_MCA_BASE_VERSION(type)                                                \
+    PMIX_MCA_BASE_VERSION_2_1_0("prte", PRTE_MAJOR_VERSION, PRTE_MINOR_VERSION,    \
+                                PRTE_RELEASE_VERSION, #type,                       \
+                                PRTE_MCA_FW_VER(type, MAJOR),                      \
+                                PRTE_MCA_FW_VER(type, MINOR),                      \
+                                PRTE_MCA_FW_VER(type, RELEASE))
 
-#define PRTE_MCA_BASE_VERSION_3_0_0(type, type_major, type_minor, type_release) \
-    PMIX_MCA_BASE_VERSION_2_1_0("prte", PRTE_MAJOR_VERSION, PRTE_MINOR_VERSION, \
-                                PRTE_RELEASE_VERSION, type, type_major, type_minor, type_release)
+/* Declare a PRRTE framework, stating its interface version.
+ *
+ * The PRRTE counterpart of PMIX_MCA_BASE_VERSIONED_FRAMEWORK_DECLARE,
+ * built on the same underlying declaration so that the framework reports
+ * the version its header states and pmix_mca_base_components_open() can
+ * refuse a component built against a different one. It takes no version
+ * arguments and no project argument: every framework here is "prte", and
+ * the numbers come from the header.
+ *
+ * A framework that uses this without defining the three macros above does
+ * not compile, which is the point. Using PMIX_MCA_BASE_FRAMEWORK_DECLARE
+ * instead still works and is what PRRTE did until August 2026 - it simply
+ * reports version 0.0, which the loader reads as "no version stated" and
+ * skips the check for, so the framework's components are never screened. */
+#define PRTE_MCA_BASE_FRAMEWORK_DECLARE(name, description, registerfn, openfn,     \
+                                        closefn, static_components, flags)         \
+    PMIX_MCA_BASE_FRAMEWORK_DECLARE_FULL(prte, name,                               \
+                                         PRTE_MCA_FW_VER(name, MAJOR),             \
+                                         PRTE_MCA_FW_VER(name, MINOR),             \
+                                         description, registerfn, openfn, closefn, \
+                                         static_components, flags)
 
-#if PMIX_NUMERIC_VERSION < 0x00040203
-#define PMIX_ARGV_JOIN_COMPAT(a, b) \
-        pmix_argv_join(a, b)
-#else
-#define PMIX_ARGV_JOIN_COMPAT(a, b) \
-        PMIx_Argv_join(a, b)
-#endif
-
-#if PMIX_NUMERIC_VERSION < 0x00040203
-#define PMIX_ARGV_SPLIT_COMPAT(a, b) \
-        pmix_argv_split(a, b)
-#else
-#define PMIX_ARGV_SPLIT_COMPAT(a, b) \
-        PMIx_Argv_split(a, b)
-#endif
-
-#if PMIX_NUMERIC_VERSION < 0x00040203
-#define PMIX_ARGV_SPLIT_WITH_EMPTY_COMPAT(a, b) \
-        pmix_argv_split_with_empty(a, b)
-#else
-#define PMIX_ARGV_SPLIT_WITH_EMPTY_COMPAT(a, b) \
-        PMIx_Argv_split_with_empty(a, b)
-#endif
-
-#if PMIX_NUMERIC_VERSION < 0x00040203
-#define PMIX_ARGV_COUNT_COMPAT(a) \
-        pmix_argv_count(a)
-#else
-#define PMIX_ARGV_COUNT_COMPAT(a) \
-        PMIx_Argv_count(a)
-#endif
-
-#if PMIX_NUMERIC_VERSION < 0x00040203
-#define PMIX_ARGV_FREE_COMPAT(a) \
-        pmix_argv_free(a)
-#else
-#define PMIX_ARGV_FREE_COMPAT(a) \
-        PMIx_Argv_free(a)
-#endif
-
-#if PMIX_NUMERIC_VERSION < 0x00040203
-#define PMIX_ARGV_APPEND_UNIQUE_COMPAT(a, b) \
-        pmix_argv_append_unique_nosize(a, b)
-#else
-#define PMIX_ARGV_APPEND_UNIQUE_COMPAT(a, b) \
-        PMIx_Argv_append_unique_nosize(a, b)
-#endif
-
-#if PMIX_NUMERIC_VERSION < 0x00040203
-#define PMIX_ARGV_APPEND_NOSIZE_COMPAT(a, b) \
-        pmix_argv_append_nosize(a, b)
-#else
-#define PMIX_ARGV_APPEND_NOSIZE_COMPAT(a, b) \
-        PMIx_Argv_append_nosize(a, b)
-#endif
-
-#if PMIX_NUMERIC_VERSION < 0x00040203
-#define PMIX_ARGV_COPY_COMPAT(a) \
-        pmix_argv_copy(a)
-#else
-#define PMIX_ARGV_COPY_COMPAT(a) \
-        PMIx_Argv_copy(a)
-#endif
-
-#if PMIX_NUMERIC_VERSION < 0x00040203
-#define PMIX_SETENV_COMPAT(a, b, c, d) \
-        pmix_setenv(a, b, c, d)
-#else
-#define PMIX_SETENV_COMPAT(a, b, c, d) \
-        PMIx_Setenv(a, b, c, d)
-#endif
-
-#ifndef PMIX_GROUP_NONE
-#define PMIX_GROUP_NONE 2
-#endif
-
-#ifndef PMIX_MCA_BASE_COMPONENT_INIT
-#define PMIX_MCA_BASE_COMPONENT_INIT(prte, a, b)
-#endif
 
 END_C_DECLS
 

@@ -40,6 +40,7 @@
 #include "src/util/pmix_net.h"
 #include "src/util/pmix_output.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 
 /*
  * Local functions
@@ -54,6 +55,7 @@ static int get_slot_count(char* node_name, int* slot_cnt);
  * Global variable
  */
 prte_ras_base_module_t prte_ras_gridengine_module = {
+    .scheduler_owned = true,
     .allocate = prte_ras_gridengine_allocate,
     .finalize = prte_ras_gridengine_finalize
 };
@@ -90,11 +92,13 @@ static int prte_ras_gridengine_allocate(prte_job_t *jdata, pmix_list_t *nodelist
     /* check the PE_HOSTFILE before continuing on */
     fp = fopen(pe_hostfile, "r");
     if (NULL == fp) {
-        pmix_show_help("help-ras-gridengine.txt", "cannot-read-pe-hostfile", true, pe_hostfile,
+        prte_show_help("help-ras-gridengine.txt", "cannot-read-pe-hostfile", true, pe_hostfile,
                        strerror(errno));
         rc = PRTE_ERROR;
         PRTE_ERROR_LOG(rc);
-        goto cleanup;
+        /* return the open failure: falling through to the shared cleanup
+         * would report "no nodes found" and hide why */
+        return rc;
     }
 
     /* parse the pe_hostfile for hostname, slots, etc, then compare the
@@ -109,6 +113,13 @@ static int prte_ras_gridengine_allocate(prte_job_t *jdata, pmix_list_t *nodelist
         num = strtok_r(NULL, " \n", &tok);
         queue = strtok_r(NULL, " \n", &tok);
         arch = strtok_r(NULL, " \n", &tok);
+
+        /* a blank line yields no hostname, and a line missing the slot
+         * count yields no num - either way there is nothing to add, and
+         * dereferencing them would take down the HNP */
+        if (NULL == ptr || NULL == num) {
+            continue;
+        }
 
         /* see if we already have this node */
         found = false;
@@ -132,6 +143,8 @@ static int prte_ras_gridengine_allocate(prte_job_t *jdata, pmix_list_t *nodelist
             node->slots_inuse = 0;
             node->slots_max = 0;
             node->slots = (int) strtol(num, (char **) NULL, 10);
+            /* the count came from PE_HOSTFILE - authoritative */
+            PRTE_FLAG_SET(node, PRTE_NODE_FLAG_SLOTS_GIVEN);
             pmix_output(prte_mca_ras_gridengine_component.verbose,
                         "ras:gridengine: %s: PE_HOSTFILE shows slots=%d queue=%s arch=%s",
                         node->name, node->slots, queue, arch);
@@ -139,10 +152,7 @@ static int prte_ras_gridengine_allocate(prte_job_t *jdata, pmix_list_t *nodelist
         }
     } /* finished reading the $PE_HOSTFILE */
 
-cleanup:
-    if (NULL != fp) {
-        fclose(fp);
-    }
+    fclose(fp);
 
     /* in gridengine, if we didn't find anything, then something
      * is wrong. The user may not have indicated this was a parallel
@@ -150,7 +160,7 @@ cleanup:
      * is considered an unrecoverable error and we need to report it
      */
     if (pmix_list_is_empty(nodelist)) {
-        pmix_show_help("help-ras-gridengine.txt", "no-nodes-found", true);
+        prte_show_help("help-ras-gridengine.txt", "no-nodes-found", true);
         return PRTE_ERR_NOT_FOUND;
     }
 

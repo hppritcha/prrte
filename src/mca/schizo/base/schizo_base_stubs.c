@@ -3,7 +3,7 @@
  * Copyright (c) 2015-2020 Intel, Inc.  All rights reserved.
  * Copyright (c) 2020      IBM Corporation.  All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -30,13 +30,23 @@
 #include "src/util/pmix_basename.h"
 #include "src/util/pmix_environ.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
+#include "src/util/prte_cmd_line.h"
 
 prte_schizo_base_module_t *prte_schizo_base_detect_proxy(char *cmdpath)
 {
     prte_schizo_base_active_module_t *mod;
     prte_schizo_base_module_t *md = NULL;
-    int pri = -1, p;
+    int pri = 0, p;
 
+    /* A confidence of zero means "this is not me" - every component returns
+     * it for a personality list that does not name it.  So the bar for being
+     * selected is a STRICTLY POSITIVE bid, not merely the highest one.  Seeded
+     * at -1, the first component queried won a field of all-zero bids, which
+     * made a personality nobody claims select whichever component happens to
+     * carry the highest static priority - so a typo in "--personality" ran the
+     * command line in the ompi dialect, complete with its own option table and
+     * MCA translation, rather than the native one. */
     PMIX_LIST_FOREACH(mod, &prte_schizo_base.active_modules, prte_schizo_base_active_module_t)
     {
         if (NULL != mod->module->detect_proxy) {
@@ -47,7 +57,83 @@ prte_schizo_base_module_t *prte_schizo_base_detect_proxy(char *cmdpath)
             }
         }
     }
+
+    /* Nobody claimed it.  Fall back to the DEFAULT personality - which is
+     * what a component tells us it would be when asked with no hint at all -
+     * rather than refusing outright.  A name we do not recognize is not
+     * necessarily a mistake: Open MPI starts a singleton's DVM with
+     * "--prtemca schizo prte", so only the native component is even loaded,
+     * and then spawns with PMIX_PERSONALITY="ompi5".  Refusing that fails
+     * every MPI_Comm_spawn from a singleton.  The catch-all is the right
+     * answer there, and remains the right answer for a typo - what was wrong
+     * before was landing on some *other* personality's dialect, not the
+     * falling back itself. */
+    if (NULL == md && NULL != cmdpath) {
+        md = prte_schizo_base_detect_proxy(NULL);
+    }
     return md;
+}
+
+/* the deprecated hyphenated spelling of each option whose canonical key is
+ * un-hyphenated, paired with the key the option tables actually carry */
+static struct {
+    const char *deprecated;
+    const char *canonical;
+} normalized_opts[] = {
+    {.deprecated = "--map-by",          .canonical = "--mapby"},
+    {.deprecated = "--rank-by",         .canonical = "--rankby"},
+    {.deprecated = "--bind-to",         .canonical = "--bindto"},
+    {.deprecated = "--runtime-options", .canonical = "--rtos"},
+    {.deprecated = NULL,                .canonical = NULL}
+};
+
+char *prte_schizo_base_normalize_argv(char **argv)
+{
+    char *personality = NULL, *value, *tmp;
+    size_t len;
+    int i, n;
+
+    /* Normalize the deprecated hyphenated option spellings to their canonical
+     * forms and capture any personality specification.  --rank-by and --bind-to
+     * may legitimately appear more than once in a command line - once per app
+     * context in an MPMD invocation - so, exactly like --map-by, they are
+     * renamed unconditionally on every occurrence.  Detecting an erroneous
+     * duplicate (e.g. two job-level --rank-by with no intervening MPMD
+     * separator) is the schizo MPMD parser's responsibility, since it has the
+     * app-context boundaries that this flat argv scan lacks.
+     *
+     * Both spellings getopt_long accepts have to be handled here - "--opt value"
+     * AND "--opt=value".  Only recognizing the space-separated form leaves the
+     * "=" form to be rejected later as an unrecognized option (for the renamed
+     * options) or, worse, silently ignored (for --personality, which would then
+     * drop the invocation onto the default personality). */
+    for (i = 0; NULL != argv[i]; i++) {
+        if (0 == strcmp(argv[i], "--personality")) {
+            personality = argv[i + 1];
+            continue;
+        }
+        if (0 == strncmp(argv[i], "--personality=", strlen("--personality="))) {
+            value = argv[i] + strlen("--personality=");
+            personality = ('\0' == value[0]) ? NULL : value;
+            continue;
+        }
+        for (n = 0; NULL != normalized_opts[n].deprecated; n++) {
+            len = strlen(normalized_opts[n].deprecated);
+            if (0 == strcmp(argv[i], normalized_opts[n].deprecated)) {
+                free(argv[i]);
+                argv[i] = strdup(normalized_opts[n].canonical);
+                break;
+            }
+            if (0 == strncmp(argv[i], normalized_opts[n].deprecated, len) &&
+                '=' == argv[i][len]) {
+                pmix_asprintf(&tmp, "%s%s", normalized_opts[n].canonical, &argv[i][len]);
+                free(argv[i]);
+                argv[i] = tmp;
+                break;
+            }
+        }
+    }
+    return personality;
 }
 
 PRTE_EXPORT void prte_schizo_base_root_error_msg(void)
@@ -70,10 +156,10 @@ PRTE_EXPORT void prte_schizo_base_root_error_msg(void)
 static bool check_multi(const char *target)
 {
     char *multi_dirs[] = {
-        "display",
-        "output",
-        "tune",
-        "runtime-options",
+        PRTE_CLI_DISPLAY,
+        PRTE_CLI_OUTPUT,
+        PRTE_CLI_TUNE,
+        PRTE_CLI_RTOS,
         NULL
     };
     int n;
@@ -100,12 +186,13 @@ int prte_schizo_base_add_directive(pmix_cli_result_t *results,
         // does it already have a value?
         if (NULL == opt->values) {
             // technically this should never happen, but...
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&opt->values, directive);
-        } else if (1 < PMIX_ARGV_COUNT_COMPAT(opt->values)) {
+            PMIx_Argv_append_nosize(&opt->values, directive);
+        } else if (1 < PMIx_Argv_count(opt->values)) {
             // cannot use this function
             ptr = pmix_show_help_string("help-schizo-base.txt", "too-many-values",
                                         true, target);
             fprintf(stderr, "%s\n", ptr);
+            free(ptr);
             return PRTE_ERR_SILENT;
         } else {
             // does this contain only a qualifier?
@@ -118,11 +205,12 @@ int prte_schizo_base_add_directive(pmix_cli_result_t *results,
                 // do we allow multiple directives?
                 if (!check_multi(target)) {
                     // report the error
-                    tmp = PMIX_ARGV_JOIN_COMPAT(opt->values, ',');
+                    tmp = PMIx_Argv_join(opt->values, ',');
                     ptr = pmix_show_help_string("help-schizo-base.txt", "too-many-directives",
                                                 true, target, tmp, deprecated, directive);
                     free(tmp);
                     fprintf(stderr, "%s\n", ptr);
+                    free(ptr);
                     return PRTE_ERR_SILENT;
                 }
                 // does the value contain a qualifier?
@@ -146,7 +234,7 @@ int prte_schizo_base_add_directive(pmix_cli_result_t *results,
         // add the new option
         opt = PMIX_NEW(pmix_cli_item_t);
         opt->key = strdup(target);
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&opt->values, directive);
+        PMIx_Argv_append_nosize(&opt->values, directive);
         pmix_list_append(&results->instances, &opt->super);
     }
 
@@ -177,13 +265,14 @@ int prte_schizo_base_add_qualifier(pmix_cli_result_t *results,
         if (NULL == opt->values) {
             // technically this should never happen, but...
             pmix_asprintf(&tmp, ":%s", qualifier);
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&opt->values, tmp);
+            PMIx_Argv_append_nosize(&opt->values, tmp);
             free(tmp);
-        } else if (1 < PMIX_ARGV_COUNT_COMPAT(opt->values)) {
+        } else if (1 < PMIx_Argv_count(opt->values)) {
             // cannot use this function
             ptr = pmix_show_help_string("help-schizo-base.txt", "too-many-values",
                                         true, target);
             fprintf(stderr, "%s\n", ptr);
+            free(ptr);
             return PRTE_ERR_SILENT;
         } else {
             // append with a colon delimiter
@@ -196,7 +285,7 @@ int prte_schizo_base_add_qualifier(pmix_cli_result_t *results,
         opt = PMIX_NEW(pmix_cli_item_t);
         opt->key = strdup(target);
         pmix_asprintf(&tmp, ":%s", qualifier);
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&opt->values, tmp);
+        PMIx_Argv_append_nosize(&opt->values, tmp);
         free(tmp);
         pmix_list_append(&results->instances, &opt->super);
     }
@@ -216,12 +305,21 @@ int prte_schizo_base_add_qualifier(pmix_cli_result_t *results,
 char *prte_schizo_base_getline(FILE *fp)
 {
     char *ret, *buff;
+    size_t len;
     char input[2048];
 
     memset(input, 0, 2048);
     ret = fgets(input, 2048, fp);
     if (NULL != ret) {
-        input[strlen(input) - 1] = '\0'; /* remove newline */
+        /* strip the newline - but only if there IS one.  The last line of a
+         * file that does not end in a newline has none, and blindly chopping
+         * its final character silently corrupts that line (an MCA param file
+         * saved without a trailing newline would lose a character off its
+         * last parameter) */
+        len = strlen(input);
+        if (0 < len && '\n' == input[len - 1]) {
+            input[len - 1] = '\0';
+        }
         buff = strdup(input);
         return buff;
     }
@@ -232,6 +330,7 @@ char *prte_schizo_base_getline(FILE *fp)
 char *prte_schizo_base_strip_quotes(char *p)
 {
     char *pout;
+    size_t len;
 
     /* strip any quotes around the args */
     if ('\"' == p[0]) {
@@ -239,8 +338,11 @@ char *prte_schizo_base_strip_quotes(char *p)
     } else {
         pout = strdup(p);
     }
-    if ('\"' == pout[strlen(pout) - 1]) {
-        pout[strlen(pout) - 1] = '\0';
+    /* an empty string has no trailing character to inspect - reading (and
+     * writing) pout[-1] here walks off the front of the allocation */
+    len = strlen(pout);
+    if (0 < len && '\"' == pout[len - 1]) {
+        pout[len - 1] = '\0';
     }
     return pout;
 }
@@ -259,7 +361,7 @@ int prte_schizo_base_parse_prte(int argc, int start, char **argv, char ***target
         if (0 == strcmp("--prtemca", argv[i])) {
             if (NULL == argv[i + 1] || NULL == argv[i + 2]) {
                 /* this is an error */
-                pmix_show_help("help-schizo-base.txt", "missing-values", true,
+                prte_show_help("help-schizo-base.txt", "missing-values", true,
                                "--prtemca");
                 return PRTE_ERR_SILENT;
             }
@@ -274,9 +376,9 @@ int prte_schizo_base_parse_prte(int argc, int start, char **argv, char ***target
                 setenv(param, p2, true);
                 free(param);
             } else {
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(target, "--prtemca");
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(target, p1);
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(target, p2);
+                PMIx_Argv_append_nosize(target, "--prtemca");
+                PMIx_Argv_append_nosize(target, p1);
+                PMIx_Argv_append_nosize(target, p2);
             }
             free(p1);
             free(p2);
@@ -286,7 +388,7 @@ int prte_schizo_base_parse_prte(int argc, int start, char **argv, char ***target
         if (0 == strcmp("--mca", argv[i])) {
             if (NULL == argv[i + 1] || NULL == argv[i + 2]) {
                 /* this is an error */
-                pmix_show_help("help-schizo-base.txt", "missing-values", true,
+                prte_show_help("help-schizo-base.txt", "missing-values", true,
                                "--mca");
                 return PRTE_ERR_SILENT;
             }
@@ -310,10 +412,6 @@ int prte_schizo_base_parse_prte(int argc, int start, char **argv, char ***target
                     pmix_asprintf(&param, "prtereachable_%s", &p1[strlen("reachable_")]);
                     free(p1);
                     p1 = param;
-                } else if (0 == strncasecmp(p1, "dl", strlen("dl"))) {
-                    pmix_asprintf(&param, "prtedl_%s", &p1[strlen("dl_")]);
-                    free(p1);
-                    p1 = param;
                 } else if (0 == strncasecmp(p1, "plm_rsh", strlen("plm_rsh"))) {
                     pmix_asprintf(&param, "plm_ssh_%s", &p1[strlen("plm_rsh_")]);
                     free(p1);
@@ -331,9 +429,9 @@ int prte_schizo_base_parse_prte(int argc, int start, char **argv, char ***target
                     pmix_output_verbose(1, prte_schizo_base_framework.framework_output,
                                         "%s schizo:prte:parse_cli adding %s to target",
                                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), p1);
-                    PMIX_ARGV_APPEND_NOSIZE_COMPAT(target, "--prtemca");
-                    PMIX_ARGV_APPEND_NOSIZE_COMPAT(target, p1);
-                    PMIX_ARGV_APPEND_NOSIZE_COMPAT(target, p2);
+                    PMIx_Argv_append_nosize(target, "--prtemca");
+                    PMIx_Argv_append_nosize(target, p1);
+                    PMIx_Argv_append_nosize(target, p2);
                 }
                 i += 2;
             }
@@ -358,7 +456,7 @@ int prte_schizo_base_parse_pmix(int argc, int start, char **argv, char ***target
         if (0 == strcmp("--pmixmca", argv[i]) || 0 == strcmp("--gpmixmca", argv[i])) {
             if (NULL == argv[i + 1] || NULL == argv[i + 2]) {
                 /* this is an error */
-                pmix_show_help("help-schizo-base.txt", "missing-values", true,
+                prte_show_help("help-schizo-base.txt", "missing-values", true,
                                "--pmixmca");
                 return PRTE_ERR_SILENT;
             }
@@ -374,9 +472,9 @@ int prte_schizo_base_parse_pmix(int argc, int start, char **argv, char ***target
                 setenv(param, p2, true);
                 free(param);
             } else {
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(target, argv[i]);
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(target, p1);
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(target, p2);
+                PMIx_Argv_append_nosize(target, argv[i]);
+                PMIx_Argv_append_nosize(target, p1);
+                PMIx_Argv_append_nosize(target, p2);
             }
             free(p1);
             free(p2);
@@ -410,12 +508,12 @@ int prte_schizo_base_parse_pmix(int argc, int start, char **argv, char ***target
                     setenv(param, p2, true);
                     free(param);
                 } else {
-                    PMIX_ARGV_APPEND_NOSIZE_COMPAT(target, "--pmixmca");
-                    PMIX_ARGV_APPEND_NOSIZE_COMPAT(target, p1);
-                    PMIX_ARGV_APPEND_NOSIZE_COMPAT(target, p2);
-                    PMIX_ARGV_APPEND_NOSIZE_COMPAT(target, "--omca");
-                    PMIX_ARGV_APPEND_NOSIZE_COMPAT(target, p1);
-                    PMIX_ARGV_APPEND_NOSIZE_COMPAT(target, p2);
+                    PMIx_Argv_append_nosize(target, "--pmixmca");
+                    PMIx_Argv_append_nosize(target, p1);
+                    PMIx_Argv_append_nosize(target, p2);
+                    PMIx_Argv_append_nosize(target, "--omca");
+                    PMIx_Argv_append_nosize(target, p1);
+                    PMIx_Argv_append_nosize(target, p2);
                 }
                 free(p1);
                 free(p2);
@@ -454,9 +552,9 @@ int prte_schizo_base_parse_pmix(int argc, int start, char **argv, char ***target
                     setenv(param, p2, true);
                     free(param);
                 } else {
-                    PMIX_ARGV_APPEND_NOSIZE_COMPAT(target, "--pmixmca");
-                    PMIX_ARGV_APPEND_NOSIZE_COMPAT(target, p1);
-                    PMIX_ARGV_APPEND_NOSIZE_COMPAT(target, p2);
+                    PMIx_Argv_append_nosize(target, "--pmixmca");
+                    PMIx_Argv_append_nosize(target, p1);
+                    PMIx_Argv_append_nosize(target, p2);
                 }
             }
             free(p1);
@@ -472,87 +570,39 @@ int prte_schizo_base_setup_fork(prte_job_t *jdata, prte_app_context_t *app)
 {
     prte_attribute_t *attr;
     bool exists, prefix_defined = false;
-    char *param, *p2, *saveptr, *p, *defprefix;
+    char *param, *p2, *saveptr, *p, *defprefix, *bkpt;
     int i;
     prte_job_t *daemons;
 
     /* flag that we started this job */
-    PMIX_SETENV_COMPAT("PRTE_LAUNCHED", "1", true, &app->env);
+    PMIx_Setenv("PRTE_LAUNCHED", "1", true, &app->env);
 
-    /* now process any envar attributes - we begin with the job-level
-     * ones as the app-specific ones can override them. We have to
-     * process them in the order they were given to ensure we wind
-     * up in the desired final state */
-    PMIX_LIST_FOREACH(attr, &jdata->attributes, prte_attribute_t)
-    {
-        if (PRTE_JOB_SET_ENVAR == attr->key) {
-            PMIX_SETENV_COMPAT(attr->data.data.envar.envar,
-                               attr->data.data.envar.value,
-                               true, &app->env);
-        } else if (PRTE_JOB_ADD_ENVAR == attr->key) {
-            PMIX_SETENV_COMPAT(attr->data.data.envar.envar,
-                               attr->data.data.envar.value,
-                               false, &app->env);
-        } else if (PRTE_JOB_UNSET_ENVAR == attr->key) {
-            pmix_unsetenv(attr->data.data.string, &app->env);
-        } else if (PRTE_JOB_PREPEND_ENVAR == attr->key) {
-            /* see if the envar already exists */
-            exists = false;
-            for (i = 0; NULL != app->env[i]; i++) {
-                saveptr = strchr(app->env[i], '='); // cannot be NULL
-                *saveptr = '\0';
-                if (0 == strcmp(app->env[i], attr->data.data.envar.envar)) {
-                    /* we have the var - prepend it */
-                    param = saveptr;
-                    ++param; // move past where the '=' sign was
-                    pmix_asprintf(&p2, "%s%c%s", attr->data.data.envar.value,
-                                  attr->data.data.envar.separator, param);
-                    *saveptr = '='; // restore the current envar setting
-                    PMIX_SETENV_COMPAT(attr->data.data.envar.envar, p2, true, &app->env);
-                    free(p2);
-                    exists = true;
-                    break;
-                } else {
-                    *saveptr = '='; // restore the current envar setting
-                }
-            }
-            if (!exists) {
-                /* just insert it */
-                PMIX_SETENV_COMPAT(attr->data.data.envar.envar,
-                                   attr->data.data.envar.value,
-                                   true, &app->env);
-            }
-        } else if (PRTE_JOB_APPEND_ENVAR == attr->key) {
-            /* see if the envar already exists */
-            exists = false;
-            for (i = 0; NULL != app->env[i]; i++) {
-                saveptr = strchr(app->env[i], '='); // cannot be NULL
-                *saveptr = '\0';
-                if (0 == strcmp(app->env[i], attr->data.data.envar.envar)) {
-                    /* we have the var - prepend it */
-                    param = saveptr;
-                    ++param; // move past where the '=' sign was
-                    pmix_asprintf(&p2, "%s%c%s", param, attr->data.data.envar.separator,
-                                  attr->data.data.envar.value);
-                    *saveptr = '='; // restore the current envar setting
-                    PMIX_SETENV_COMPAT(attr->data.data.envar.envar, p2, true, &app->env);
-                    free(p2);
-                    exists = true;
-                    break;
-                } else {
-                    *saveptr = '='; // restore the current envar setting
-                }
-            }
-            if (!exists) {
-                /* just insert it */
-                PMIX_SETENV_COMPAT(attr->data.data.envar.envar,
-                                   attr->data.data.envar.value,
-                                   true, &app->env);
-            }
-        }
+    /* if the user named the place they want the application to stop at,
+     * hand that name down to the application.  The runtime cannot know
+     * where any given breakpoint lives - only the application can - so all
+     * we can do is tell it which one was asked for and then wait for the
+     * "ready for debug" event it fires when it gets there.  An application
+     * that stops at a breakpoint of its own choosing (STOP-IN-APP with no
+     * name) sees no envar and stops at the first one it comes to. */
+    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_BREAKPOINT,
+                           (void **) &bkpt, PMIX_STRING)) {
+        PMIx_Setenv("PMIX_BREAKPOINT", bkpt, true, &app->env);
+        free(bkpt);
     }
 
-    /* now do the same thing for any app-level attributes */
+    /* NOTE: the generic envar directives (SET/ADD/UNSET/PREPEND/APPEND, at
+     * both job and app level) are NOT applied here.  odls' process_envars()
+     * applies all of them to app->env immediately before calling this hook,
+     * and applying them a second time is not a no-op: PREPEND and APPEND
+     * edit the existing value, so doing it twice yields "head:head:middle"
+     * and duplicates every entry a user prepends onto PATH or
+     * LD_LIBRARY_PATH.  process_envars() is also the more complete of the
+     * two (it supports the '*' wildcard on UNSET) and it runs for every
+     * personality, whatever that personality's setup_fork does - which is
+     * why it, and not this hook, owns those directives.
+     *
+     * What remains here is what only this hook does: the PMIx prefix. */
+
     PMIX_LIST_FOREACH(attr, &app->attributes, prte_attribute_t)
     {
         if (PRTE_APP_PMIX_PREFIX == attr->key) {
@@ -563,7 +613,7 @@ int prte_schizo_base_setup_fork(prte_job_t *jdata, prte_app_context_t *app)
                 continue;
             }
             // need to set the prefix into the environment
-            PMIX_SETENV_COMPAT("PMIX_PREFIX",
+            PMIx_Setenv("PMIX_PREFIX",
                                attr->data.data.string,
                                true, &app->env);
             // and need to set LD_LIBRARY_PATH
@@ -578,7 +628,7 @@ int prte_schizo_base_setup_fork(prte_job_t *jdata, prte_app_context_t *app)
                     p = pmix_basename(pmix_pinstall_dirs.libdir);
                     pmix_asprintf(&p2, "%s/%s:%s", attr->data.data.string, p, param);
                     *saveptr = '='; // restore the current envar setting
-                    PMIX_SETENV_COMPAT("LD_LIBRARY_PATH", p2, true, &app->env);
+                    PMIx_Setenv("LD_LIBRARY_PATH", p2, true, &app->env);
                     free(p2);
                     free(p);
                     exists = true;
@@ -591,80 +641,11 @@ int prte_schizo_base_setup_fork(prte_job_t *jdata, prte_app_context_t *app)
                 /* just insert it */
                 param = pmix_basename(pmix_pinstall_dirs.libdir);
                 pmix_asprintf(&p2, "%s/%s", attr->data.data.string, param);
-                PMIX_SETENV_COMPAT("LD_LIBRARY_PATH",
+                PMIx_Setenv("LD_LIBRARY_PATH",
                                    p2,
                                    true, &app->env);
                 free(p2);
                 free(param);
-            }
-
-        } else if (PRTE_APP_SET_ENVAR == attr->key) {
-            PMIX_SETENV_COMPAT(attr->data.data.envar.envar,
-                               attr->data.data.envar.value,
-                               true, &app->env);
-
-        } else if (PRTE_APP_ADD_ENVAR == attr->key) {
-            PMIX_SETENV_COMPAT(attr->data.data.envar.envar,
-                               attr->data.data.envar.value,
-                               false, &app->env);
-
-        } else if (PRTE_APP_UNSET_ENVAR == attr->key) {
-            pmix_unsetenv(attr->data.data.string, &app->env);
-
-        } else if (PRTE_APP_PREPEND_ENVAR == attr->key) {
-            /* see if the envar already exists */
-            exists = false;
-            for (i = 0; NULL != app->env[i]; i++) {
-                saveptr = strchr(app->env[i], '='); // cannot be NULL
-                *saveptr = '\0';
-                if (0 == strcmp(app->env[i], attr->data.data.envar.envar)) {
-                    /* we have the var - prepend it */
-                    param = saveptr;
-                    ++param; // move past where the '=' sign was
-                    pmix_asprintf(&p2, "%s%c%s", attr->data.data.envar.value,
-                                  attr->data.data.envar.separator, param);
-                    *saveptr = '='; // restore the current envar setting
-                    PMIX_SETENV_COMPAT(attr->data.data.envar.envar, p2, true, &app->env);
-                    free(p2);
-                    exists = true;
-                    break;
-                } else {
-                    *saveptr = '='; // restore the current envar setting
-                }
-            }
-            if (!exists) {
-                /* just insert it */
-                PMIX_SETENV_COMPAT(attr->data.data.envar.envar,
-                                   attr->data.data.envar.value,
-                                   true, &app->env);
-            }
-
-        } else if (PRTE_APP_APPEND_ENVAR == attr->key) {
-            /* see if the envar already exists */
-            exists = false;
-            for (i = 0; NULL != app->env[i]; i++) {
-                saveptr = strchr(app->env[i], '='); // cannot be NULL
-                *saveptr = '\0';
-                if (0 == strcmp(app->env[i], attr->data.data.envar.envar)) {
-                    /* we have the var - prepend it */
-                    param = saveptr;
-                    ++param; // move past where the '=' sign was
-                    pmix_asprintf(&p2, "%s%c%s", param, attr->data.data.envar.separator,
-                                  attr->data.data.envar.value);
-                    *saveptr = '='; // restore the current envar setting
-                    PMIX_SETENV_COMPAT(attr->data.data.envar.envar, p2, true, &app->env);
-                    free(p2);
-                    exists = true;
-                    break;
-                } else {
-                    *saveptr = '='; // restore the current envar setting
-                }
-            }
-            if (!exists) {
-                /* just insert it */
-                PMIX_SETENV_COMPAT(attr->data.data.envar.envar,
-                                   attr->data.data.envar.value,
-                                   true, &app->env);
             }
         }
     }
@@ -673,8 +654,9 @@ int prte_schizo_base_setup_fork(prte_job_t *jdata, prte_app_context_t *app)
      * of a default one */
     if (!prefix_defined) {
         daemons = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
-        if (prte_get_attribute(&daemons->attributes, PRTE_JOB_PMIX_PREFIX, (void **)&defprefix, PMIX_STRING)) {
-            PMIX_SETENV_COMPAT("PMIX_PREFIX",
+        if (NULL != daemons &&
+            prte_get_attribute(&daemons->attributes, PRTE_JOB_PMIX_PREFIX, (void **)&defprefix, PMIX_STRING)) {
+            PMIx_Setenv("PMIX_PREFIX",
                                defprefix,
                                true, &app->env);
             // and need to set LD_LIBRARY_PATH
@@ -689,7 +671,7 @@ int prte_schizo_base_setup_fork(prte_job_t *jdata, prte_app_context_t *app)
                     p = pmix_basename(pmix_pinstall_dirs.libdir);
                     pmix_asprintf(&p2, "%s/%s:%s", defprefix, p, param);
                     *saveptr = '='; // restore the current envar setting
-                    PMIX_SETENV_COMPAT("LD_LIBRARY_PATH", p2, true, &app->env);
+                    PMIx_Setenv("LD_LIBRARY_PATH", p2, true, &app->env);
                     free(p2);
                     free(p);
                     exists = true;
@@ -702,7 +684,7 @@ int prte_schizo_base_setup_fork(prte_job_t *jdata, prte_app_context_t *app)
                 /* just insert it */
                 param = pmix_basename(pmix_pinstall_dirs.libdir);
                 pmix_asprintf(&p2, "%s/%s", defprefix, param);
-                PMIX_SETENV_COMPAT("LD_LIBRARY_PATH",
+                PMIx_Setenv("LD_LIBRARY_PATH",
                                    p2,
                                    true, &app->env);
                 free(p2);

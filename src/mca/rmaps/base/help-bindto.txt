@@ -1,0 +1,139 @@
+# -*- text -*-
+#
+# Copyright (c) 2004-2005 The Trustees of Indiana University and Indiana
+#                         University Research and Technology
+#                         Corporation.  All rights reserved.
+# Copyright (c) 2004-2005 The University of Tennessee and The University
+#                         of Tennessee Research Foundation.  All rights
+#                         reserved.
+# Copyright (c) 2004-2005 High Performance Computing Center Stuttgart,
+#                         University of Stuttgart.  All rights reserved.
+# Copyright (c) 2004-2005 The Regents of the University of California.
+#                         All rights reserved.
+# Copyright (c) 2011-2020 Cisco Systems, Inc.  All rights reserved
+# Copyright (c) 2011      Los Alamos National Security, LLC.
+#                         All rights reserved.
+# Copyright (c) 2014-2020 Intel, Inc.  All rights reserved.
+# Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
+# $COPYRIGHT$
+#
+# Additional copyrights may follow
+#
+# $HEADER$
+#
+# This is the US/English general help file for PRRTE's prun.
+#
+[bind-to]
+
+NOTE: PRRTE accepts both the new "--bindto" and the older
+deprecated "--bind-to" cmd line options. For simplicity, the
+following description will refer to the new "--bindto" form.
+
+By default, processes are bound to individual CPUs (either COREs or
+HWTHREADs, as defined by default or by user specification for the
+job). On nodes that are OVERSUBSCRIBEd (i.e., where the number of
+procs exceeds the number of assigned slots), the default is to not
+bind the processes.
+
+Note:
+
+  Processes from prior jobs that are already executing on a node are
+  not "unbound" when a new job mapping results in the node becoming
+  oversubscribed.
+
+Binding is performed to the first available specified object type
+within the object where the process was mapped. In other words,
+binding can only be done to the mapped object or to a resource located
+beneath that object.
+
+An object is considered completely consumed when the number of
+processes bound to it equals the number of CPUs within it. Unbound
+processes are not considered in this computation. Additional processes
+cannot be mapped to consumed objects unless the "OVERLOAD" qualifier
+is provided via the "--bindto" command line option.
+
+Note that directives and qualifiers are case-insensitive and can be
+shortened to the minimum number of characters to uniquely identify
+them. Thus, "L1CACHE" can be given as "l1cache" or simply as "L1".
+
+Supported binding directives include:
+
+* "NONE" does not bind the processes
+
+* "HWTHREAD" binds each process to a single hardware thread/ This
+  requires that hwthreads be treated as independent CPUs (i.e., that
+  either the "HWTCPUS" qualifier be provided to the "map-by" option or
+  that "hwthreads" be designated as CPUs by default).
+
+* "CORE" binds each process to a single core. This can be done whether
+  "hwthreads" or "cores" are being treated as independent CPUs
+  provided that mapping is performed at the core or higher level.
+
+* "L1CACHE" binds each process to all the CPUs in an "L1" cache.
+
+* "L2CACHE" binds each process to all the CPUs in an "L2" cache
+
+* "L3CACHE" binds each process to all the CPUs in an "L3" cache
+
+* "NUMA" binds each process to all the CPUs in a "NUMA" region
+
+* "PACKAGE" binds each process to all the CPUs in a "PACKAGE"
+
+Any directive can include qualifiers by adding a colon (:) and any
+combination of one or more of the following to the "--bindto" option:
+
+* "OVERLOAD" indicates that objects can have more processes bound to
+  them than CPUs within them
+
+* "NO-OVERLOAD" indicates that they cannot. This is the default, so
+  the qualifier is only useful for overriding an "OVERLOAD" that a
+  DVM-wide default (the "bindto" MCA parameter) has already applied.
+
+* "IF-SUPPORTED" indicates that the job should continue to be launched
+  and executed even if binding cannot be performed as requested.
+
+* "LIMIT=n" limits the number of processes bound to each eligible
+  representative of the specified type to the given number. For
+  example, specifying "--bindto l3:limit=2" would direct PRRTE
+  to bind ranks to the L3caches, limiting the number of processes
+  bound to each l3cache to two - i.e., bind 2 processes to a
+  given l3cache, and then move on to the next.
+
+* "REPORT" reports each process' binding as it is applied, which is
+  the same thing "--report-bindings" does. It describes the job as a
+  whole: unlike the other qualifiers here it cannot be given per
+  application context, and it cannot be given as a DVM-wide default
+  through the "bindto" MCA parameter.
+
+Note:
+
+  Directives and qualifiers are case-insensitive. "OVERLOAD" is the
+  same as "overload".
+
+
+Per-App-Context Binding (MPMD Jobs)
+-------------------------------------
+
+In a multi-program multiple-data (MPMD) job, each application context
+may carry its own "--bindto" directive that overrides the job-level
+binding policy for that app only. Apps that carry no per-app directive
+inherit the job-level binding policy unchanged.
+
+Example:
+
+  prun -n 4 app1 --bindto core : -n 2 app2 --bindto none
+
+Here "app1" processes are bound to individual cores while "app2"
+processes are left unbound, all within the same job.
+
+Per-app binding is derived from the mapping options resolved for each
+app context. It therefore follows the same constraints as job-level
+binding: binding can only be done to the mapped object or to a
+resource located beneath it.
+
+A more detailed description of the mapping, ranking, and binding
+procedure can be obtained via the "--help placement" option.
+#
+[bindto]
+
+#include#help-bindto.txt#bind-to

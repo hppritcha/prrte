@@ -12,7 +12,7 @@
 #                         All rights reserved.
 # Copyright (c) 2019      Intel, Inc.  All rights reserved.
 # Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
-# Copyright (c) 2023-2025 Nanook Consulting  All rights reserved.
+# Copyright (c) 2023-2026 Nanook Consulting  All rights reserved.
 # $COPYRIGHT$
 #
 # Additional copyrights may follow
@@ -43,17 +43,141 @@ file could not be opened for reading:
 
 Please check the filename and try again.
 #
-[ras-base:nonuniform-slots]
-A request was made to add hosts from a hostfile while operating
-in a managed allocation. In this case, either the slots must be
-specified in the given hostfile, or the number of slots assigned
-by the resource manager on the existing nodes must be uniform.
+[negative-slots]
+A host was provided in an add-hostfile that is unknown
+to the DVM but was given a negative number of slots:
 
-The current allocation does not conform to that requirement:
+  Host:  %s
+  Slots: %d
 
-   Base number of slots: %d
-   Node: %s
-   Number of slots: %d
+We cannot subtract slots from an unknown host. Please
+correct the file or ensure that we are allocated the
+host in advance.
 
-Please assign a number of slots for each node to be added to the
-allocation.
+[ras-base:bad-slots]
+A host in an add-hostfile was given a slot count that is not a number:
+
+  Host:  %s
+  File:  %s
+  Given: slots=%s
+
+The value must be a whole number - "slots=4" to state a count, or
+"slots=+2"/"slots=-2" to adjust the count of a host the DVM already holds.
+
+A value that is not a number used to be read as zero, which is a meaningful
+count here: the host would have joined the DVM able to run nothing, and
+marked as having been given that count so its real size was never worked out
+from its topology.
+
+[ras-base:add-host-managed]
+An add-host or add-hostfile directive was given, but this DVM's allocation
+is owned by a resource manager.
+
+Only the scheduler can decide which nodes this DVM holds. PRRTE cannot add
+one on its own authority - a daemon launched on a node the scheduler has not
+granted fails to start, and that failure takes the whole DVM down rather than
+just the job that asked for it.
+
+To obtain additional nodes, ask the scheduler for them: outside PRRTE before
+starting the DVM, or through a PMIx allocation request that the resource
+manager's component can serve.
+
+If the node you named is one the scheduler already granted, and you only want
+a daemon started on it, use "--activate" instead - it can name nothing the
+allocation does not already contain, so it needs no authority PRRTE lacks.
+
+[ras-base:add-host-unsupported]
+An add-host or add-hostfile directive was given, but no active component can
+serve it.
+
+The nodes this DVM holds were established by an allocator that does not
+support adding to them after the fact - a bootstrapped DVM, for instance,
+takes its membership from the configuration file every daemon reads.
+
+[ras-base:activate-unknown]
+An activation request named a host that is not part of this DVM's
+allocation:
+
+  Host: %s
+
+Activation can only start a daemon on a node the allocation already
+contains; it cannot add one. Check the name, or use "--add-host" if PRRTE
+owns this allocation and you mean to enlarge it.
+
+The request came either from the "--activate" command line option or from a
+PMIX_ALLOC_ACTIVATE allocation request; both name their hosts the same way
+and both are held to this rule.
+
+[ras-base:activate-unavailable]
+An activation request named a host that is not available for use:
+
+  Host:     %s
+  State:    %s
+  Given as: %s
+
+A node in this state has either been taken back by the scheduler, or has
+been marked unusable. Starting a daemon on it would fail, and a daemon that
+fails to start takes the whole DVM down with it.
+
+[ras-base:activate-empty]
+An activation request used the "empty node" syntax:
+
+  Given as: %s
+
+"+e" asks for nodes that have no application process running on them, which
+says nothing about whether a node is in the DVM - most of the nodes it picks
+are already in it. Honoring it here would start no daemon and report success.
+
+If you meant "every node not currently in the DVM", that is "+all". You can
+also name the nodes you want, use "+n<K>" to name one by its position in the
+allocation, or use "file=<hostfile>" to read them from a file.
+
+[ras-base:activate-nofile]
+An activation request gave "file=" with no filename after it.
+
+The form is "--activate file=<hostfile>", naming a file in the same format
+"--hostfile" reads. A PMIX_ALLOC_ACTIVATE request may instead give the file
+as its own PMIX_HOSTFILE attribute.
+
+[ras-base:spawn-alloc-nodirective]
+A spawn carried an allocation request (PMIX_SPAWN_ALLOC) that does not say
+what it is asking for.
+
+The value is an array of pmix_info_t describing an allocation request, and
+its first element must carry the request's directive as
+PMIX_ALLOC_REQ_DIRECTIVE - PMIX_ALLOC_NEW, PMIX_ALLOC_EXTEND, and so on.
+The allocation API takes that directive as a parameter; carried as data, it
+has to be stated. There is no default: a request whose directive had to be
+guessed would ask for something nobody asked for.
+
+The spawn was refused. Nothing was allocated and no processes were started.
+
+[ras-base:activate-nothing-named]
+A PMIX_ALLOC_ACTIVATE allocation request named nothing to activate.
+
+The request must carry PMIX_HOST, PMIX_HOSTFILE, or both, saying which of
+the nodes this DVM already holds are to have a daemon started on them.
+There is no default: activating everything the allocation holds is asked for
+explicitly, with a host specification of "+all".
+
+[ras-base:activate-unknown-in-file]
+A hostfile given to an activation request names a host that is not part of
+this DVM's allocation:
+
+  Host: %s
+  File: %s
+
+Activation can only start a daemon on a node the allocation already
+contains; it cannot add one. Check the file, or use "--add-hostfile" if PRRTE
+owns this allocation and you mean to enlarge it.
+
+[ras-base:activate-slots]
+An activation request carried a slot count:
+
+  Given as: %s
+
+Activation cannot change what the allocation grants - it only starts a
+daemon on a node the allocation already contains - so a slot count here
+could not be honored and is refused rather than silently ignored. Drop the
+":N" extension, or use "--add-host" where PRRTE owns the allocation and the
+slot count really is PRRTE's to set.

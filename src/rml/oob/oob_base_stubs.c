@@ -4,7 +4,8 @@
  *                         reserved.
  * Copyright (c) 2013-2020 Intel, Inc.  All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2026      Sandia National Laboratories  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -21,6 +22,7 @@
 #include "src/util/pmix_output.h"
 #include "src/util/pmix_printf.h"
 #include "src/mca/errmgr/errmgr.h"
+#include "src/mca/ess/base/base.h"
 #include "src/rml/rml.h"
 #include "src/mca/state/state.h"
 #include "src/threads/pmix_threads.h"
@@ -31,6 +33,47 @@
 #include "src/rml/oob/oob_tcp_peer.h"
 
 static prte_oob_tcp_peer_t* process_uri(char *uri);
+
+/* Run a send's completion callback on the main progress thread.
+ *
+ * Reached only when a peer's socket is being serviced by one of the OOB
+ * worker progress threads (see PRTE_OOB_COMPLETE_SEND): the callback belongs
+ * to whoever originated the message and touches PRRTE state that only
+ * prte_event_base may touch.  Posting them all through this one handler also
+ * keeps a peer's completions in the order its socket produced them, since
+ * libevent runs a base's active events first-in first-out.
+ */
+void prte_oob_base_complete_send(int fd, short args, void *cbdata)
+{
+    prte_oob_send_t *cd = (prte_oob_send_t *) cbdata;
+    prte_rml_send_t *msg;
+    PRTE_HIDE_UNUSED_PARAMS(fd, args);
+
+    PMIX_ACQUIRE_OBJECT(cd);
+    msg = cd->msg;
+    PMIX_RELEASE(cd);
+
+    PRTE_RML_SEND_COMPLETE(msg);
+}
+
+/* Has this target been launched but not yet said anything?
+ *
+ * rml_uri is written only by prte_plm_base_daemon_callback, i.e. only by the
+ * daemon itself reporting in, which is what makes it the exact test.  Neither
+ * PRTE_PROC_FLAG_ALIVE nor a RUNNING state can serve: plm/ssh sets both when
+ * it *records* the launch, long before the daemon says anything.  errmgr/dvm
+ * decides whether to act on the failure on this same test.
+ */
+static bool daemon_not_yet_reported(const pmix_proc_t *hop)
+{
+    prte_proc_t *dmn;
+
+    if (!PMIX_CHECK_NSPACE(hop->nspace, PRTE_PROC_MY_NAME->nspace)) {
+        return false;
+    }
+    dmn = prte_get_proc_object(hop);
+    return (NULL != dmn && NULL == dmn->rml_uri);
+}
 
 void prte_oob_base_send_nb(int fd, short args, void *cbdata)
 {
@@ -53,6 +96,16 @@ void prte_oob_base_send_nb(int fd, short args, void *cbdata)
                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(&msg->dst),
                         msg->retries);
 
+    if (!prte_rml_is_node_up(msg->dst.rank)) {
+        pmix_output_verbose(4, prte_oob_base.output,
+                            "%s oob:base:send adressee died %s",
+                            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                            PRTE_NAME_PRINT(&msg->dst));
+        msg->status = PRTE_ERR_NODE_DOWN;
+        PRTE_RML_SEND_COMPLETE(msg);
+        return;
+    }
+
     /* don't try forever - if we have exceeded the number of retries,
      * then report this message as undeliverable even if someone continues
      * to think they could reach it */
@@ -64,7 +117,32 @@ void prte_oob_base_send_nb(int fd, short args, void *cbdata)
 
     /* do we have a route to this peer (could be direct)? */
     PMIX_LOAD_NSPACE(hop.nspace, PRTE_PROC_MY_NAME->nspace);
-    hop.rank = prte_rml_get_route(msg->dst.rank);
+    if (msg->direct) {
+        /* The caller asked for the target itself rather than the next hop the
+         * tree would choose.  Everything below is unchanged: the peer lookup
+         * finds or builds a connection from the target's PMIX_PROC_URI exactly
+         * as it does for a tree neighbour, so a direct send costs nothing
+         * beyond the connection itself. */
+        hop.rank = msg->dst.rank;
+    } else {
+        hop.rank = prte_rml_get_route(msg->dst.rank);
+    }
+resolve_hop:
+    if (PMIX_RANK_INVALID == hop.rank && PRTE_PROC_MY_HNP->rank != msg->dst.rank) {
+        /* The routing tree has no next hop toward this target - it sits behind
+         * a hole we cannot get any closer to.  Report that to the sender rather
+         * than dragging an invalid rank through the lookup below.  A message
+         * for the HNP is the exception: it is allowed to fall through to the
+         * direct-to-HNP attempt just below, which is the last resort when our
+         * whole ancestor chain has died. */
+        pmix_output_verbose(4, prte_oob_base.output,
+                            "%s oob:base:send no route to %s",
+                            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                            PRTE_NAME_PRINT(&msg->dst));
+        msg->status = PRTE_ERR_NO_PATH_TO_TARGET;
+        PRTE_RML_SEND_COMPLETE(msg);
+        return;
+    }
     /* do we know this hop? */
     if (NULL == (peer = prte_oob_tcp_peer_lookup(&hop))) {
         /* if this message is going to the HNP, send it direct */
@@ -76,9 +154,14 @@ void prte_oob_base_send_nb(int fd, short args, void *cbdata)
             }
         }
         // see if we know the contact info for it
+        /* the macro reports a PMIx status, not a PRRTE error code */
         PRTE_MODEX_RECV_VALUE_OPTIONAL(rc, PMIX_PROC_URI, &hop, (char **) &uri, PMIX_STRING);
-        if (PRTE_SUCCESS == rc && NULL != uri) {
+        if (PMIX_SUCCESS == rc && NULL != uri) {
             peer = process_uri(uri);
+            /* process_uri only reads (and temporarily splits) the string - the
+             * copy the modex handed us is ours to release */
+            free(uri);
+            uri = NULL;
             if (NULL == peer) {
                 /* that is just plain wrong */
                 pmix_output_verbose(5, prte_oob_base.output,
@@ -86,24 +169,71 @@ void prte_oob_base_send_nb(int fd, short args, void *cbdata)
                                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                                     PRTE_NAME_PRINT(&msg->dst));
 
-                if (prte_prteds_term_ordered || prte_finalizing || prte_abnormal_term_ordered) {
-                    /* just ignore the problem */
-                    PMIX_RELEASE(msg);
-                    return;
+                /* Complete the send, do not merely release it: the callback is
+                 * how the originator learns the message died. Releasing frees
+                 * the buffer and tells nobody - invisible for the default
+                 * callback, a silently lost message for anything that tracks
+                 * completion (all of RELM). */
+                if (!prte_prteds_term_ordered && !prte_finalizing
+                    && !prte_abnormal_term_ordered) {
+                    PRTE_ACTIVATE_PROC_STATE(&hop, PRTE_PROC_STATE_UNABLE_TO_SEND_MSG);
+                }
+                msg->status = PRTE_ERR_ADDRESSEE_UNKNOWN;
+                PRTE_RML_SEND_COMPLETE(msg);
+                return;
+            }
+        } else if (prte_bootstrap_setup) {
+            /* In a bootstrapped DVM no nidmap has distributed peer URIs during
+             * formation, and after a lifeline heals our new parent (a former
+             * grandparent) was never pre-synthesized.  Derive the next hop's
+             * contact URI from the configuration - the same synthesis prted
+             * used for our original parent - and connect to it. */
+            char *synth = NULL;
+            if (PRTE_SUCCESS == prte_ess_base_bootstrap_peer_uri(hop.rank, &synth)
+                && NULL != synth) {
+                peer = process_uri(synth);
+                free(synth);
+            }
+        }
+        if (NULL == peer && msg->direct) {
+            /* We could not reach the target directly - most likely its contact
+             * info has not propagated to us yet.  That is not a reason to fail
+             * the message: fall back to the routing tree, which is slower for a
+             * collective but always available.  Clearing the flag first means
+             * the retry cannot loop, and keeps the relay bookkeeping honest if
+             * this message ends up being forwarded by an intermediate hop. */
+            pmix_output_verbose(4, prte_oob_base.output,
+                                "%s oob:base:send no direct path to %s -"
+                                " falling back to the routed path",
+                                PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                                PRTE_NAME_PRINT(&msg->dst));
+            msg->direct = false;
+            hop.rank = prte_rml_get_route(msg->dst.rank);
+            goto resolve_hop;
+        }
+        if (NULL == peer) {
+            // unable to send it - as above, complete rather than release so
+            // the originator's callback runs with a status
+            if (!prte_prteds_term_ordered && !prte_finalizing
+                && !prte_abnormal_term_ordered) {
+                /* Not knowing where a daemon is that has not yet reported for
+                 * duty is the expected state, not an error: the routing tree
+                 * is built from the daemon count the moment a grow records
+                 * them, precisely so wireup can route to them, so anything
+                 * broadcast while a launch is in flight is addressed to
+                 * daemons that have no contact info yet.  errmgr/dvm knows
+                 * this and swallows the state below on the same test - see
+                 * the comment there - so logging it here put four PMIX ERROR
+                 * lines on the user's terminal for a grow that was working.
+                 * A daemon that has reported, or anything that is not a
+                 * daemon, still logs. */
+                if (!daemon_not_yet_reported(&hop)) {
+                    PMIX_ERROR_LOG(rc);
                 }
                 PRTE_ACTIVATE_PROC_STATE(&hop, PRTE_PROC_STATE_UNABLE_TO_SEND_MSG);
-                PMIX_RELEASE(msg);
-                return;
             }
-        } else {
-            // unable to send it
-             if (prte_prteds_term_ordered || prte_finalizing || prte_abnormal_term_ordered) {
-                /* just ignore the problem */
-                PMIX_RELEASE(msg);
-                return;
-            }
-            PRTE_ACTIVATE_PROC_STATE(&hop, PRTE_PROC_STATE_UNABLE_TO_SEND_MSG);
-            PMIX_RELEASE(msg);
+            msg->status = PRTE_ERR_ADDRESSEE_UNKNOWN;
+            PRTE_RML_SEND_COMPLETE(msg);
             return;
        }
    }
@@ -147,12 +277,9 @@ send:
  * Obtain a uri for initial connection purposes
  *
  * During initial wireup, we can only transfer contact info on the daemon
- * command line. This limits what we can send to a string representation of
- * the actual contact info, which gets sent in a uri-like form. Not every
- * oob module can support this transaction, so this function will loop
- * across all oob components/modules, letting each add to the uri string if
- * it supports bootstrap operations. An error will be returned in the cbfunc
- * if NO component can successfully provide a contact.
+ * command line, so we render it as a compact, uri-like string: our process
+ * name followed by the TCP endpoints (IPv4 and, if enabled, IPv6) we are
+ * listening on. Returns *uri == NULL if we have no usable connection.
  *
  * Note: since there is a limit to what an OS will allow on a cmd line, we
  * impose a limit on the length of the resulting uri via an MCA param. The
@@ -177,9 +304,9 @@ void prte_oob_base_get_addr(char **uri)
 
     if (!prte_oob_base.disable_ipv4_family &&
         NULL != prte_oob_base.ipv4conns) {
-        tmp = PMIX_ARGV_JOIN_COMPAT(prte_oob_base.ipv4conns, ',');
-        tp = PMIX_ARGV_JOIN_COMPAT(prte_oob_base.ipv4ports, ',');
-        tm = PMIX_ARGV_JOIN_COMPAT(prte_oob_base.if_masks, ',');
+        tmp = PMIx_Argv_join(prte_oob_base.ipv4conns, ',');
+        tp = PMIx_Argv_join(prte_oob_base.ipv4ports, ',');
+        tm = PMIx_Argv_join(prte_oob_base.if_masks, ',');
         pmix_asprintf(&cptr, "tcp://%s:%s:%s", tmp, tp, tm);
         free(tmp);
         free(tp);
@@ -201,9 +328,9 @@ void prte_oob_base_get_addr(char **uri)
          * an implementation may use an optional version flag to indicate such a format
          * explicitly rather than rely on heuristic determination.
          */
-        tmp = PMIX_ARGV_JOIN_COMPAT(prte_oob_base.ipv6conns, ',');
-        tp = PMIX_ARGV_JOIN_COMPAT(prte_oob_base.ipv6ports, ',');
-        tm = PMIX_ARGV_JOIN_COMPAT(prte_oob_base.if_masks, ',');
+        tmp = PMIx_Argv_join(prte_oob_base.ipv6conns, ',');
+        tp = PMIx_Argv_join(prte_oob_base.ipv6ports, ',');
+        tm = PMIx_Argv_join(prte_oob_base.if_masks, ',');
         if (NULL == cptr) {
             /* no ipv4 stuff */
             pmix_asprintf(&cptr, "tcp6://[%s]:%s:%s", tmp, tp, tm);
@@ -336,12 +463,13 @@ static void set_addr(pmix_proc_t *peer, char **uris)
         }
         *masks_string = '\0';
         masks_string++;
-        masks = PMIX_ARGV_SPLIT_COMPAT(masks_string, ',');
+        masks = PMIx_Argv_split(masks_string, ',');
 
         /* separate the ports from the network addrs */
         ports = strrchr(tcpuri, ':');
         if (NULL == ports) {
             PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
+            PMIx_Argv_free(masks);
             free(tcpuri);
             continue;
         }
@@ -364,16 +492,19 @@ static void set_addr(pmix_proc_t *peer, char **uris)
             }
         }
 #endif // PRTE_ENABLE_IPV6
-        addrs = PMIX_ARGV_SPLIT_COMPAT(hptr, ',');
+        addrs = PMIx_Argv_split(hptr, ',');
 
         /* cycle across the provided addrs */
         for (j = 0; NULL != addrs[j]; j++) {
-            if (NULL == masks[j]) {
-                /* Missing mask information */
-                pmix_output_verbose(2, prte_oob_base.output,
-                                    "%s oob:tcp: uri missing mask information.",
-                                    PRTE_NAME_PRINT(PRTE_PROC_MY_NAME));
-                return;
+            int if_mask;
+            /* A mask may be absent - e.g., from a contact URI synthesized by
+             * the bootstrap path, which cannot know the peer's interface mask.
+             * Treat a missing/empty mask as a /0, i.e. universally reachable,
+             * rather than rejecting the address. */
+            if (NULL == masks || NULL == masks[j] || '\0' == masks[j][0]) {
+                if_mask = 0;
+            } else {
+                if_mask = atoi(masks[j]);
             }
             /* if they gave us "localhost", then just take the first conn on our list */
             if (0 == strcasecmp(addrs[j], "localhost")) {
@@ -412,13 +543,15 @@ static void set_addr(pmix_proc_t *peer, char **uris)
             if (PRTE_SUCCESS
                 != (rc = parse_uri(af_family, host, ports,
                                    (struct sockaddr_storage *) &(maddr->addr)))) {
+                /* one unparseable address is not a reason to tear down the
+                 * peer: it may well be an established one with a live socket
+                 * and queued sends, and the remaining addresses in this URI may
+                 * be perfectly usable. Drop just this address and carry on. */
                 PRTE_ERROR_LOG(rc);
                 PMIX_RELEASE(maddr);
-                pmix_list_remove_item(&prte_oob_base.peers, &pr->super);
-                PMIX_RELEASE(pr);
-                return;
+                continue;
             }
-            maddr->if_mask = atoi(masks[j]);
+            maddr->if_mask = if_mask;
 
             pmix_output_verbose(20, prte_oob_base.output,
                                 "%s set_peer: peer %s is listening on net %s port %s",
@@ -426,7 +559,8 @@ static void set_addr(pmix_proc_t *peer, char **uris)
                                 (NULL == host) ? "NULL" : host, (NULL == ports) ? "NULL" : ports);
             pmix_list_append(&pr->addrs, &maddr->super);
         }
-        PMIX_ARGV_FREE_COMPAT(addrs);
+        PMIx_Argv_free(addrs);
+        PMIx_Argv_free(masks);
         free(tcpuri);
     }
 }
@@ -471,7 +605,7 @@ static prte_oob_tcp_peer_t* process_uri(char *uri)
     }
 
     /* split the rest of the uri into component parts */
-    uris = PMIX_ARGV_SPLIT_COMPAT(cptr, ';');
+    uris = PMIx_Argv_split(cptr, ';');
 
     /* get the peer object for this process */
     pr = get_peer(&peer);
@@ -482,7 +616,7 @@ static prte_oob_tcp_peer_t* process_uri(char *uri)
     }
 
     set_addr(&pr->name, uris);
-    PMIX_ARGV_FREE_COMPAT(uris);
+    PMIx_Argv_free(uris);
     return pr;
 }
 

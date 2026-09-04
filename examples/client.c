@@ -15,7 +15,7 @@
  * Copyright (c) 2011      Oak Ridge National Labs.  All rights reserved.
  * Copyright (c) 2013-2020 Intel, Inc.  All rights reserved.
  * Copyright (c) 2015      Mellanox Technologies, Inc.  All rights reserved.
- * Copyright (c) 2021-2024 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -28,6 +28,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <strings.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -35,6 +36,10 @@
 #include <pmix.h>
 
 static pmix_proc_t myproc;
+
+/* the string ID of the one place this example stops at when asked to stop
+ * somewhere of its own choosing - see "prterun --help stop-in-app" */
+#define EXAMPLE_BREAKPOINT "example-app"
 
 /* this is the event notification function we pass down below
  * when registering for general events - i.e.,, the default
@@ -158,6 +163,7 @@ int main(int argc, char **argv)
     bool local, all_local = false;
     char **peers;
     pmix_rank_t *locals = NULL;
+    char *bkpt;
 
     pid = getpid();
     fprintf(stderr, "Client %lu: Running\n", (unsigned long) pid);
@@ -203,6 +209,18 @@ int main(int argc, char **argv)
      * debugger */
     PMIX_INFO_LOAD(&i2, PMIX_OPTIONAL, NULL, PMIX_BOOL);
     if (PMIX_SUCCESS == (rc = PMIx_Get(&proc, PMIX_DEBUG_STOP_IN_APP, &i2, 1, &val))) {
+        /* the launcher may have named the ONE place it wants us to stop at -
+         * "prterun --stop-in-app=<name>" passes that name down in the
+         * PMIX_BREAKPOINT envar.  This example has exactly one such place,
+         * right here, so a request for any other name is a request not to
+         * stop at all.  An unnamed request stops us wherever we get to
+         * first, which is also here. */
+        bkpt = getenv("PMIX_BREAKPOINT");
+        if (NULL != bkpt && 0 != strcasecmp(bkpt, EXAMPLE_BREAKPOINT)) {
+            fprintf(stderr, "[%s:%d] not stopping at %s - %s was requested\n", myproc.nspace,
+                    myproc.rank, EXAMPLE_BREAKPOINT, bkpt);
+            goto nostop;
+        }
         /* register for debugger release */
         DEBUG_CONSTRUCT_LOCK(&mylock);
         PMIX_INFO_CREATE(info, 1);
@@ -220,10 +238,21 @@ int main(int argc, char **argv)
                     myproc.rank);
             goto done;
         }
+        /* Tell the host we have arrived and are waiting.  Only the
+         * application knows where its own breakpoints are, so nobody else
+         * can say this - and a process that waits without saying it waits
+         * forever: the runtime never reports the job ready for debug, and
+         * no debugger is ever told to attach. */
+        PMIX_INFO_CREATE(info, 2);
+        PMIX_INFO_LOAD(&info[0], PMIX_EVENT_NON_DEFAULT, NULL, PMIX_BOOL);
+        PMIX_INFO_LOAD(&info[1], PMIX_BREAKPOINT, EXAMPLE_BREAKPOINT, PMIX_STRING);
+        PMIx_Notify_event(PMIX_READY_FOR_DEBUG, &myproc, PMIX_RANGE_RM, info, 2, NULL, NULL);
+        PMIX_INFO_FREE(info, 2);
         /* wait for debugger release */
         DEBUG_WAIT_THREAD(&myrel.lock);
         DEBUG_DESTRUCT_MYREL(&myrel);
     }
+nostop:
 
     /* get our universe size */
     if (PMIX_SUCCESS != (rc = PMIx_Get(&proc, PMIX_UNIV_SIZE, NULL, 0, &val))) {
@@ -231,7 +260,7 @@ int main(int argc, char **argv)
                 myproc.rank, rc);
         goto done;
     }
-    PMIX_VALUE_GET_NUMBER(rc, val, n, uint32_t);
+    rc = PMIx_Value_get_number(val, &n, PMIX_UINT32);
     fprintf(stderr, "Client %s:%d universe size %u\n", myproc.nspace, myproc.rank, n);
 
     /* get the number of procs in our job - univ size is the total number of allocated
@@ -241,7 +270,7 @@ int main(int argc, char **argv)
                 myproc.rank, rc);
         goto done;
     }
-    PMIX_VALUE_GET_NUMBER(rc, val, nprocs, uint32_t);
+    rc = PMIx_Value_get_number(val, &nprocs, PMIX_UINT32);
     PMIX_VALUE_RELEASE(val);
     fprintf(stderr, "Client %s:%d num procs %d\n", myproc.nspace, myproc.rank, nprocs);
 
@@ -250,7 +279,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "Client ns %s rank %d: PMIx_Get sessionID failed: %d\n", myproc.nspace,
                 myproc.rank, rc);
     } else {
-        PMIX_VALUE_GET_NUMBER(rc, val, sid, uint32_t);
+        rc = PMIx_Value_get_number(val, &sid, PMIX_UINT32);
         if (PMIX_SUCCESS != rc) {
             fprintf(stderr, "Session ID was not a number: %s\n", PMIx_Error_string(rc));
             goto done;
@@ -274,7 +303,7 @@ int main(int argc, char **argv)
                 myproc.rank, rc);
         goto done;
     }
-    PMIX_VALUE_GET_NUMBER(rc, val, n, uint32_t);
+    rc = PMIx_Value_get_number(val, &n, PMIX_UINT32);
     PMIX_VALUE_RELEASE(val);
     fprintf(stderr, "Client %s:%d num local procs %d\n", myproc.nspace, myproc.rank, n);
 
@@ -366,14 +395,14 @@ int main(int argc, char **argv)
         goto done;
     }
     /* split the returned string to get the rank of each local peer */
-    peers = PMIX_ARGV_SPLIT_COMPAT(val->data.string, ',');
+    peers = PMIx_Argv_split(val->data.string, ',');
     PMIX_VALUE_RELEASE(val);
-    nlocal = PMIX_ARGV_COUNT_COMPAT(peers);
+    nlocal = PMIx_Argv_count(peers);
     if (nprocs == nlocal) {
         all_local = true;
     } else {
         all_local = false;
-        locals = (pmix_rank_t *) malloc(PMIX_ARGV_COUNT_COMPAT(peers) * sizeof(pmix_rank_t));
+        locals = (pmix_rank_t *) malloc(PMIx_Argv_count(peers) * sizeof(pmix_rank_t));
         for (n = 0; NULL != peers[n]; n++) {
             locals[n] = strtoul(peers[n], NULL, 10);
         }

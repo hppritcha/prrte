@@ -18,7 +18,7 @@
  * Copyright (c) 2014-2016 Research Organization for Information Science
  *                         and Technology (RIST). All rights reserved.
  *
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -45,7 +45,6 @@
 #include "src/util/error.h"
 #include "src/util/error_strings.h"
 #include "src/util/pmix_keyval_parse.h"
-#include "src/util/malloc.h"
 #include "src/util/name_fns.h"
 #include "src/util/pmix_if.h"
 #include "src/util/pmix_net.h"
@@ -54,6 +53,7 @@
 #include "src/util/pmix_os_path.h"
 #include "src/util/proc_info.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 #include "src/util/stacktrace.h"
 #include "src/util/sys_limits.h"
 
@@ -69,7 +69,7 @@
 #include "src/mca/ess/base/base.h"
 #include "src/mca/ess/ess.h"
 #include "src/mca/filem/base/base.h"
-#include "src/mca/grpcomm/base/base.h"
+#include "src/grpcomm/grpcomm.h"
 #include "src/mca/iof/base/base.h"
 #include "src/mca/odls/base/base.h"
 #include "src/mca/plm/base/base.h"
@@ -84,6 +84,7 @@
 #include "src/runtime/pmix_init_util.h"
 #include "src/runtime/prte_globals.h"
 #include "src/runtime/prte_locks.h"
+#include "src/runtime/prte_worker_pool.h"
 #include "src/runtime/runtime.h"
 #include "src/runtime/runtime_internals.h"
 
@@ -92,7 +93,6 @@
  */
 bool prte_initialized = false;
 bool prte_finalizing = false;
-bool prte_debug_flag = false;
 int prte_debug_verbosity = -1;
 char *prte_prohibited_session_dirs = NULL;
 bool prte_create_session_dirs = true;
@@ -166,6 +166,7 @@ int prte_init_minimum(void)
 {
     int ret, n;
     char *path = NULL;
+    char *extra;
     char *evar, **prefixes;
     const char *rvers;
     char token[100];
@@ -184,12 +185,27 @@ int prte_init_minimum(void)
      * cross version operations from inside of PRRTE.
      */
     rvers = PMIx_Get_version();
-    ret = sscanf(rvers, "%s %u.%u.%u",
-                 token, &major, &minor, &release);
-    ret = sscanf(PRTE_PMIX_MIN_VERSION_STRING, "%u.%u.%u",
-                 &reqmajor, &reqminor, &reqrelease);
-    ret = sscanf(PRTE_PMIX_MAX_VERSION_STRING, "%u.%u.%u",
-                 &maxmajor, &maxminor, &maxrelease);
+    /* Check what sscanf actually converted. These returns used to be
+     * assigned and thrown away, so a version string we could not parse left
+     * major/minor/release uninitialized and the range checks below then ran
+     * on whatever was on the stack - which can as easily pass as fail. */
+    if (4 != sscanf(rvers, "%s %u.%u.%u",
+                    token, &major, &minor, &release) ||
+        3 != sscanf(PRTE_PMIX_MIN_VERSION_STRING, "%u.%u.%u",
+                    &reqmajor, &reqminor, &reqrelease) ||
+        3 != sscanf(PRTE_PMIX_MAX_VERSION_STRING, "%u.%u.%u",
+                    &maxmajor, &maxminor, &maxrelease)) {
+        fprintf(stderr, "************************************************\n");
+        fprintf(stderr, "We were unable to parse the version of the PMIx\n");
+        fprintf(stderr, "library we were given:\n\n");
+        fprintf(stderr, "    Runtime:  %s\n", (NULL == rvers) ? "NULL" : rvers);
+        fprintf(stderr, "    Minimum:  %s\n", PRTE_PMIX_MIN_VERSION_STRING);
+        fprintf(stderr, "    Maximum:  %s\n\n", PRTE_PMIX_MAX_VERSION_STRING);
+        fprintf(stderr, "Please update your LD_LIBRARY_PATH to point\n");
+        fprintf(stderr, "us to the same PMIx version used to build PRRTE.\n");
+        fprintf(stderr, "************************************************\n");
+        return PRTE_ERR_SILENT;
+    }
 
     /* check the version triplet agains the min values
      * specified in VERSION
@@ -258,9 +274,22 @@ int prte_init_minimum(void)
         return ret;
     }
 
-    /* initialize the MCA infrastructure */
-    if (check_exist(prte_install_dirs.prtelibdir)) {
-        pmix_asprintf(&path, "prte@%s", prte_install_dirs.prtelibdir);
+    /* initialize the MCA infrastructure.  PRTE_MCA_mca_base_component_path
+     * names additional directories to search, mirroring what PMIx offers
+     * for its own components: the installed location is the only one we
+     * would otherwise look in, which leaves no way to run against
+     * components that have been built but not installed - a build tree,
+     * for one, which is where "make check" runs. */
+    extra = getenv("PRTE_MCA_mca_base_component_path");
+    if (check_exist(prte_install_dirs.pmixlibdir)) {
+        if (NULL == extra) {
+            pmix_asprintf(&path, "prte@%s", prte_install_dirs.pmixlibdir);
+        } else {
+            pmix_asprintf(&path, "prte@%s%c%s", extra, PMIX_ENV_SEP,
+                          prte_install_dirs.pmixlibdir);
+        }
+    } else if (NULL != extra) {
+        pmix_asprintf(&path, "prte@%s", extra);
     }
     ret = pmix_init_util(NULL, 0, path);
     if (NULL != path) {
@@ -277,8 +306,67 @@ int prte_init_minimum(void)
         return ret;
     }
 
-    /* pre-load any default mca param files */
-    prte_preload_default_mca_params();
+    /* Registration happens in two phases, and the order below is the whole
+     * point of splitting it: an MCA variable evaluates its environment exactly
+     * once, when it is first registered, and the parameter files are applied
+     * by publishing their contents into the environment.  So anything
+     * registered before that publication would ignore the files entirely -
+     * which is precisely what every prte_* parameter used to do.
+     *
+     * Phase one therefore registers only the parameters that say where the
+     * files are (they cannot come from the files they locate); the files are
+     * then read; and everything else is registered afterwards, so it sees an
+     * environment that already carries the files' values.  The install
+     * directories - and thus the default config-file path - are known by now,
+     * so this is the earliest point at which any of it can run. */
+    ret = prte_register_paramfile_params();
+    if (PRTE_SUCCESS != ret) {
+        if (PRTE_ERR_SILENT != ret) {
+            prte_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true,
+                           "prte register paramfile params", PRTE_ERROR_NAME(ret), ret);
+        }
+        return 1;
+    }
+
+    /* pre-load any default mca param files. A malformed file has to be
+     * fatal: the values in it steer component selection and launch, so
+     * silently carrying on with a partial set - which is what discarding
+     * this return did - starts a DVM configured differently from what the
+     * files say. */
+    ret = prte_preload_default_mca_params();
+    if (PRTE_SUCCESS != ret) {
+        if (PRTE_ERR_SILENT != ret) {
+            prte_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true,
+                           "prte preload mca params", PRTE_ERROR_NAME(ret), ret);
+        }
+        return ret;
+    }
+
+    /* A bootstrapping daemon must publish the DVM-wide MCA parameters it reads
+     * from prte.conf before those parameters are first registered below.  It
+     * runs after the param files so that its own overwrite=true settings win
+     * over them, as a DVM-wide configuration must.  prte_bootstrap_setup comes
+     * either from the argument vector (prted sets it before prte_init_util was
+     * called) or from the parameter registered in phase one above. */
+    if (prte_bootstrap_setup) {
+        if (PRTE_SUCCESS != (ret = prte_ess_base_bootstrap_params())) {
+            if (PRTE_ERR_SILENT != ret) {
+                prte_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true,
+                               "prte bootstrap params", PRTE_ERROR_NAME(ret), ret);
+            }
+            return 1;
+        }
+    }
+
+    /* Register all global MCA Params */
+    if (PRTE_SUCCESS != (ret = prte_register_params())) {
+        if (PRTE_ERR_SILENT != ret) {
+            prte_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true,
+                           "prte register params",
+                           PRTE_ERROR_NAME(ret), ret);
+        }
+        return 1;
+    }
 
     return PRTE_SUCCESS;
 }
@@ -301,9 +389,6 @@ int prte_init_util(prte_proc_type_t flags)
     /* ensure we know the type of proc for when we finalize */
     prte_process_info.proc_type = flags;
 
-    /* initialize the memory allocator */
-    prte_malloc_init();
-
     /* initialize the output system */
     pmix_output_init();
 
@@ -321,7 +406,7 @@ int prte_init_util(prte_proc_type_t flags)
      * doing so twice in cases where the launch agent did it for us
      */
     if (PRTE_SUCCESS != (ret = prte_util_init_sys_limits(&error))) {
-        pmix_show_help("help-prte-runtime.txt", "prte_init:syslimit", false, error);
+        prte_show_help("help-prte-runtime.txt", "prte_init:syslimit", false, error);
         return PRTE_ERR_SILENT;
     }
 
@@ -336,7 +421,7 @@ int prte_init_util(prte_proc_type_t flags)
 
 error:
     if (PRTE_ERR_SILENT != ret) {
-        pmix_show_help("help-prte-runtime", "prte_init:startup:internal-failure", true, error,
+        prte_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true, error,
                        PRTE_ERROR_NAME(ret), ret);
     }
 
@@ -388,8 +473,12 @@ int prte_init(int *pargc, char ***pargv, prte_proc_type_t flags)
     /* let the pmix server register params */
     pmix_server_register_params();
 
-    /* open hwloc */
-    prte_hwloc_base_open();
+    /* open hwloc - this is where the DVM-wide "bindto" value is validated,
+     * so a bad one has to stop us here rather than be diagnosed and ignored */
+    if (PRTE_SUCCESS != (ret = prte_hwloc_base_open())) {
+        error = "prte_hwloc_base_open";
+        goto error;
+    }
 
     /* setup the global job and node arrays */
     prte_job_data = PMIX_NEW(pmix_pointer_array_t);
@@ -471,6 +560,21 @@ int prte_init(int *pargc, char ***pargv, prte_proc_type_t flags)
         goto error;
     }
 
+    /* Stand up the pool of worker threads.  Only the DVM master and the
+     * daemons have anything to put on it - peer sockets and local children -
+     * so a tool spins no threads it will never use.
+     *
+     * This must precede prte_ess.init(), which is where the OOB is opened:
+     * a peer built before the pool exists is pinned to the main progress
+     * thread for its whole life, and a daemon's peer to the HNP - the one
+     * socket everything it does crosses - is built right there. */
+    if (PRTE_PROC_IS_MASTER || PRTE_PROC_IS_DAEMON) {
+        if (PRTE_SUCCESS != (ret = prte_worker_pool_init())) {
+            error = "prte_worker_pool_init";
+            goto error;
+        }
+    }
+
     /* initialize the RTE for this environment */
     if (PRTE_SUCCESS != (ret = prte_ess.init(*pargc, *pargv))) {
         error = "prte_ess_init";
@@ -481,6 +585,14 @@ int prte_init(int *pargc, char ***pargv, prte_proc_type_t flags)
     prte_cache = PMIX_NEW(pmix_pointer_array_t);
     pmix_pointer_array_init(prte_cache, 1, INT_MAX, 1);
 
+    /* initialize launch-fence held-job arrays */
+    prte_held_jobs = PMIX_NEW(pmix_pointer_array_t);
+    pmix_pointer_array_init(prte_held_jobs, 1, INT_MAX, 1);
+    prte_prelaunch_held_jobs = PMIX_NEW(pmix_pointer_array_t);
+    pmix_pointer_array_init(prte_prelaunch_held_jobs, 1, INT_MAX, 1);
+    PMIX_CONSTRUCT(&prte_shrink_campaigns, pmix_list_t);
+    PMIX_CONSTRUCT(&prte_grow_campaigns, pmix_list_t);
+
     /* All done */
     PMIX_ACQUIRE_THREAD(&prte_init_lock);
     prte_initialized = true;
@@ -489,69 +601,92 @@ int prte_init(int *pargc, char ***pargv, prte_proc_type_t flags)
 
 error:
     if (PRTE_ERR_SILENT != ret) {
-        pmix_show_help("help-prte-runtime", "prte_init:startup:internal-failure", true, error,
+        prte_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true, error,
                        PRTE_ERROR_NAME(ret), ret);
     }
 
     return ret;
 }
 
-static bool check_pmix_overlap(char *var, char *value)
+static bool check_pmix_overlap(char *var, char *value, bool overwrite)
 {
     char *tmp;
 
     if (0 == strncmp(var, "dl_", 3)) {
         pmix_asprintf(&tmp, "PMIX_MCA_pdl_%s", &var[3]);
-        setenv(tmp, value, false);
+        setenv(tmp, value, overwrite);
         free(tmp);
         return true;
     } else if (0 == strncmp(var, "oob_", 4) &&
                NULL == strstr(var, "verbose")) {
         pmix_asprintf(&tmp, "PMIX_MCA_ptl_%s", &var[4]);
-        setenv(tmp, value, false);
+        setenv(tmp, value, overwrite);
         free(tmp);
         return true;
     } else if (0 == strncmp(var, "hwloc_", 6)) {
         pmix_asprintf(&tmp, "PMIX_MCA_%s", var);
-        setenv(tmp, value, false);
+        setenv(tmp, value, overwrite);
         free(tmp);
         return true;
     } else if (0 == strncmp(var, "if_", 3)) {
         // need to convert if to pif
         pmix_asprintf(&tmp, "PMIX_MCA_pif_%s", &var[3]);
-        setenv(tmp, value, false);
+        setenv(tmp, value, overwrite);
         free(tmp);
         return true;
     } else if (0 == strncmp(var, "mca_", 4)) {
         pmix_asprintf(&tmp, "PMIX_MCA_%s", var);
-        setenv(tmp, value, false);
+        setenv(tmp, value, overwrite);
         free(tmp);
         return true;
     }
     return false;
 }
 
-void prte_preload_default_mca_params(void)
+int prte_preload_default_mca_params(void)
 {
-    char *file, *home, *tmp;
+    char *file, *home, *tmp, **paths = NULL;
     pmix_list_t params, params2, pfinal;
     pmix_mca_base_var_file_value_t *fv, *fv2, *fvnext, *fvnext2;
     bool match;
+    int i, rc;
 
     home = (char*)pmix_home_directory(-1);
     PMIX_CONSTRUCT(&params, pmix_list_t);
     PMIX_CONSTRUCT(&params2, pmix_list_t);
     PMIX_CONSTRUCT(&pfinal, pmix_list_t);
 
-    /* start with the system-level defaults */
-    file = pmix_os_path(false, prte_install_dirs.sysconfdir, "prte-mca-params.conf", NULL);
-    pmix_mca_base_parse_paramfile(file, &params);
-    free(file);
-
-    /* now get the user-level defaults */
-    file = pmix_os_path(false, home, ".prte", "mca-params.conf", NULL);
-    pmix_mca_base_parse_paramfile(file, &params2);
-    free(file);
+    if (NULL == prte_param_files) {
+        /* start with the system-level defaults */
+        file = pmix_os_path(false, prte_install_dirs.sysconfdir, "prte-mca-params.conf", NULL);
+        rc = pmix_mca_base_parse_paramfile(file, &params);
+        free(file);
+        if (PMIX_SUCCESS != rc && PMIX_ERR_NOT_FOUND != rc) {
+            // it is okay if the file isn't found
+            goto failed;
+        }
+        /* now get the user-level defaults */
+        file = pmix_os_path(false, home, ".prte", "mca-params.conf", NULL);
+        rc = pmix_mca_base_parse_paramfile(file, &params2);
+        free(file);
+        if (PMIX_SUCCESS != rc && PMIX_ERR_NOT_FOUND != rc) {
+            // it is okay if the file isn't found
+            goto failed;
+        }
+    } else {
+        // split the string on commas
+        paths = PMIx_Argv_split(prte_param_files, ',');
+        // process each path
+        for (i=0; NULL != paths[i]; i++) {
+            rc = pmix_mca_base_parse_paramfile(paths[i], &params);
+            if (PMIX_SUCCESS != rc && PMIX_ERR_NOT_FOUND != rc) {
+                // it is okay if the file isn't found
+                PMIx_Argv_free(paths);
+                goto failed;
+            }
+        }
+        PMIx_Argv_free(paths);
+    }
 
     /* cross-check the lists, keeping the params2 entries over any
      * matching params entries as they overwrite the system ones */
@@ -581,6 +716,72 @@ void prte_preload_default_mca_params(void)
     while (NULL != (fv2 = (pmix_mca_base_var_file_value_t*)pmix_list_remove_first(&params2))) {
         pmix_list_append(&pfinal, &fv2->super);
     }
+    PMIX_LIST_DESTRUCT(&params);
+    PMIX_LIST_DESTRUCT(&params2);
+
+    // process any override params. Both lists are re-constructed (params2
+    // stays empty) so that the shared error exit below can destruct all
+    // three unconditionally.
+    PMIX_CONSTRUCT(&params, pmix_list_t);
+    PMIX_CONSTRUCT(&params2, pmix_list_t);
+    if (NULL != prte_override_param_file) {
+        // process the file
+        rc = pmix_mca_base_parse_paramfile(prte_override_param_file, &params);
+        if (PMIX_SUCCESS != rc && PMIX_ERR_NOT_FOUND != rc) {
+            // it is okay if the file isn't found
+            goto failed;
+        }
+        if (0 < pmix_list_get_size(&params)) {
+            // check the params against any given
+            PMIX_LIST_FOREACH(fv, &pfinal, pmix_mca_base_var_file_value_t) {
+                PMIX_LIST_FOREACH(fv2, &params, pmix_mca_base_var_file_value_t) {
+                    if (0 == strcmp(fv->mbvfv_var, fv2->mbvfv_var)) {
+                        if (!prte_suppress_override_warning) {
+                            prte_show_help("help-pmix-mca-var.txt", "overridden-param-set", true, fv->mbvfv_var);
+                        }
+                        free(fv->mbvfv_var);
+                        fv->mbvfv_var = strdup(fv2->mbvfv_var);
+                        free(fv->mbvfv_value);
+                        fv->mbvfv_value = strdup(fv2->mbvfv_value);
+                        break;
+                    }
+                }
+            }
+            // now overwrite any envars
+            PMIX_LIST_FOREACH(fv, &params, pmix_mca_base_var_file_value_t) {
+                if (pmix_pmdl_base_check_pmix_param(fv->mbvfv_var)) {
+                    pmix_asprintf(&tmp, "PMIX_MCA_%s", fv->mbvfv_var);
+                    if (!prte_suppress_override_warning && NULL != getenv(tmp)) {
+                        prte_show_help("help-pmix-mca-var.txt", "overridden-param-set", true, tmp);
+                    }
+                    // set it, and overwrite if they already
+                    // have a value in our environment
+                    setenv(tmp, fv->mbvfv_value, true);
+                    free(tmp);
+                } else {
+                    pmix_asprintf(&tmp, "PRTE_MCA_%s", fv->mbvfv_var);
+                    if (!prte_suppress_override_warning && NULL != getenv(tmp)) {
+                        prte_show_help("help-pmix-mca-var.txt", "overridden-param-set", true, tmp);
+                    }
+                    // set it, and overwrite if they already
+                    // have a value in our environment
+                    setenv(tmp, fv->mbvfv_value, true);
+                    free(tmp);
+                    // if this relates to the DL, OOB, HWLOC, or IF,
+                    // or mca frameworks, then we also need to set
+                    // the equivalent PMIx value
+                    if (check_pmix_overlap(fv->mbvfv_var, fv->mbvfv_value, true) &&
+                        !prte_suppress_override_warning) {
+                        prte_show_help("help-pmix-mca-var.txt", "overridden-param-set", true, fv->mbvfv_var);
+                    }
+                }
+            }
+        }
+        PMIX_LIST_DESTRUCT(&params);
+        PMIX_CONSTRUCT(&params, pmix_list_t);
+    }
+    PMIX_LIST_DESTRUCT(&params);
+    PMIX_LIST_DESTRUCT(&params2);
 
     /* now process the final list - but do not overwrite if the
      * user already has the param in our environment as their
@@ -601,12 +802,18 @@ void prte_preload_default_mca_params(void)
             // if this relates to the DL, OOB, HWLOC, or IF,
             // or mca frameworks, then we also need to set
             // the equivalent PMIx value
-            check_pmix_overlap(fv->mbvfv_var, fv->mbvfv_value);
+            check_pmix_overlap(fv->mbvfv_var, fv->mbvfv_value, false);
         }
     }
 
+    PMIX_LIST_DESTRUCT(&pfinal);
+    return PRTE_SUCCESS;
+
+failed:
+    /* every one of these bail-outs used to return with the three lists still
+     * holding their parsed entries */
     PMIX_LIST_DESTRUCT(&params);
     PMIX_LIST_DESTRUCT(&params2);
     PMIX_LIST_DESTRUCT(&pfinal);
-
+    return rc;
 }

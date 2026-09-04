@@ -30,6 +30,14 @@
  */
 #include "prte_config.h"
 
+#if PRTE_HAVE_SCHED_SETAFFINITY
+#    ifndef _GNU_SOURCE
+#        define _GNU_SOURCE
+#    endif
+#    include <sched.h>
+#endif
+
+#include "src/hwloc/hwloc-internal.h"
 #include "src/mca/mca.h"
 #include "src/mca/base/pmix_mca_base_framework.h"
 #include "src/mca/iof/base/iof_base_setup.h"
@@ -48,15 +56,16 @@ typedef struct {
     pmix_list_t xterm_ranks;
     /* the xterm cmd to be used */
     char **xtermcmd;
-    /* thread pool */
-    int max_threads;
-    int num_threads;
-    int cutoff;
-    prte_event_base_t **ev_bases; // event base array for progress threads
-    char **ev_threads;            // event progress thread names
-    int next_base;                // counter to load-level thread use
     bool signal_direct_children_only;
     char *exec_agent;
+    /* send each daemon its own procs' bindings instead of broadcasting
+     * everybody's to everybody */
+    bool scatter_cpusets;
+    /* launches and cpuset slices that are waiting for each other */
+    pmix_list_t pending_slices;
+    /* microseconds to stall between fork() and the store of the child's
+     * pid - a fault-injection hook, see odls_base_frame.c */
+    int fork_publish_delay;
 } prte_odls_globals_t;
 
 PRTE_EXPORT extern prte_odls_globals_t prte_odls_globals;
@@ -70,6 +79,9 @@ PRTE_EXPORT extern pmix_mca_base_framework_t prte_odls_base_framework;
  */
 PRTE_EXPORT int prte_odls_base_select(void);
 
+/* define a function that will fork a local proc */
+typedef int (*prte_odls_base_fork_local_proc_fn_t)(void *cd);
+
 /*
  * Default functions that are common to most environments - can
  * be overridden by specific environments if they need something
@@ -79,12 +91,34 @@ PRTE_EXPORT int prte_odls_base_default_get_add_procs_data(pmix_data_buffer_t *da
                                                           pmix_nspace_t job);
 
 PRTE_EXPORT int prte_odls_base_default_construct_child_list(pmix_data_buffer_t *data,
-                                                            pmix_nspace_t *job);
+                                                            pmix_nspace_t *job,
+                                                            prte_odls_base_fork_local_proc_fn_t fork_local);
+
+/* Send each daemon in the job's map the bindings of the procs it is about
+ * to fork - the part of the launch message that is of no use to anybody
+ * else.  Called on the master, immediately before the launch message is
+ * broadcast; the two arrive in either order and the receiver waits for
+ * whichever is second. */
+PRTE_EXPORT int prte_odls_base_send_cpuset_slices(prte_job_t *jdata);
+
+/* True while this daemon holds the job but has not yet been sent the
+ * bindings of the procs it will fork.  A binding question about one of them
+ * has no answer yet - and "no cpuset" would be the wrong one. */
+PRTE_EXPORT bool prte_odls_base_awaiting_cpusets(const pmix_nspace_t nspace);
+
+/* Receive one - registered on PRTE_RML_TAG_LAUNCH_SLICE by every daemon,
+ * including the master (which never receives one). */
+PRTE_EXPORT void prte_odls_base_recv_cpuset_slice(int status, pmix_proc_t *sender,
+                                                  pmix_data_buffer_t *buffer,
+                                                  prte_rml_tag_t tag, void *cbdata);
 
 PRTE_EXPORT void prte_odls_base_spawn_proc(int fd, short sd, void *cbdata);
 
-/* define a function that will fork a local proc */
-typedef int (*prte_odls_base_fork_local_proc_fn_t)(void *cd);
+/* Apply the job's, then the app's, envar directives (SET/ADD/UNSET/
+ * PREPEND/APPEND) to app->env. Called by the launch path once per app;
+ * exported so the unit tests can exercise the semantics directly. */
+PRTE_EXPORT void prte_odls_base_process_envars(prte_job_t *jdata,
+                                               prte_app_context_t *app);
 
 /* define an object for fork/exec the local proc */
 typedef struct {
@@ -100,8 +134,26 @@ typedef struct {
     bool index_argv;
     prte_iof_base_io_conf_t opts;
     prte_odls_base_fork_local_proc_fn_t fork_local;
+    /* CPU/memory binding computed by the parent
+       (prte_odls_base_prepare_binding) for the child to apply in the
+       async-signal-safe window before execve(), so the child does no
+       allocation or parsing of its own. */
+    hwloc_cpuset_t bind_cpuset;         /* target cpu set, NULL if no binding */
+    bool bind_fatal;                    /* preparation hit a required-binding error */
+    bool do_membind;                    /* also apply the memory binding policy */
+    hwloc_membind_policy_t membind_policy;
+    int membind_flags;
+    int membind_prep_errno;             /* nonzero: report this instead of
+                                           attempting the memory binding */
+    int membind_mode;                   /* MPOL_* mode for set_mempolicy() */
+    unsigned long *membind_nodemask;    /* NULL for MPOL_DEFAULT */
+    unsigned long membind_maxnode;      /* bits in membind_nodemask */
+#if PRTE_HAVE_SCHED_SETAFFINITY
+    cpu_set_t *bind_mask;               /* CPU_ALLOC'd mask for sched_setaffinity */
+    size_t bind_masksize;               /* CPU_ALLOC_SIZE of bind_mask */
+#endif
 } prte_odls_spawn_caddy_t;
-PMIX_CLASS_DECLARATION(prte_odls_spawn_caddy_t);
+PRTE_EXPORT PMIX_CLASS_DECLARATION(prte_odls_spawn_caddy_t);
 
 /* define an object for starting local launch */
 typedef struct {
@@ -152,27 +204,63 @@ PRTE_EXPORT int prte_odls_base_default_restart_proc(prte_proc_t *child,
  */
 PRTE_EXPORT int prte_odls_base_preload_files_app_context(prte_app_context_t *context);
 
-PRTE_EXPORT void prte_odls_base_start_threads(prte_job_t *jdata);
+/* Binding support.
+ *
+ * prte_odls_base_prepare_binding runs in the parent before the fork: it
+ * parses the mapper's cpuset, classifies the binding, precomputes the
+ * memory-binding policy and (where available) the raw sched_setaffinity
+ * mask, and emits any --report-bindings / warning output. It stashes the
+ * result on the caddy.  prte_odls_base_set then runs in the forked child,
+ * in the async-signal-safe window before execve(), and only issues the
+ * bind syscalls, reporting failures up the pipe. */
+PRTE_EXPORT void prte_odls_base_prepare_binding(prte_odls_spawn_caddy_t *cd);
 
-PRTE_EXPORT void prte_odls_base_harvest_threads(void);
-
-/* Binding support */
+/* Translate the caddy's cpu binding into the mode and kernel nodemask that
+ * set_mempolicy(2) takes, exactly as hwloc_set_membind() would - the child
+ * then has only the syscall left to issue. Called by
+ * prte_odls_base_prepare_binding in the parent; exported (and compiled on
+ * every platform, not just the ones that can issue the syscall) so the unit
+ * tests can drive it directly against a known topology. */
+PRTE_EXPORT void prte_odls_base_prepare_mempolicy(prte_odls_spawn_caddy_t *cd);
 PRTE_EXPORT void prte_odls_base_set(prte_odls_spawn_caddy_t *cd, int write_fd);
 
+/*
+ * Async-signal-safe child->parent error reporting. These are called from
+ * inside the forked child, in the window between fork() and execve(),
+ * where only async-signal-safe operations are permitted. They write a
+ * fixed-size record (no strings, no allocation, no show_help) up the pipe
+ * to the waiting parent, which renders the human-readable diagnostic from
+ * the code and errno. child_fail is fatal - it reports the failure and
+ * terminates the child with _exit(); child_warn reports a non-fatal
+ * condition and returns so the child can continue toward execve().
+ */
+PRTE_EXPORT void prte_odls_base_child_fail(int write_fd, int exit_status,
+                                           prte_odls_child_err_t which,
+                                           int errnum) __prte_attribute_noreturn__;
+PRTE_EXPORT void prte_odls_base_child_warn(int write_fd, prte_odls_child_err_t which,
+                                           int errnum);
 
+
+/* Fail every local child of job "ns" belonging to app index "j" (UINT_MAX
+ * for "every app"), recording status "s" as the proc's exit code.
+ *
+ * NB: "s" is stored verbatim and may be a PMIx status or a PRRTE one -
+ * prte_render_launch_failure() switches on both. Do not convert it on the
+ * way in; see the note in this framework's AGENTS.md. */
 #define PRTE_ODLS_SET_ERROR(ns, s, j)                                                   \
 do {                                                                                    \
     int _idx;                                                                           \
     prte_proc_t *_cld;                                                                  \
-    unsigned int _j = (unsigned int)j;                                                  \
+    unsigned int _j = (unsigned int)(j);                                                \
+    int _s = (s);                                                                       \
     for (_idx = 0; _idx < prte_local_children->size; _idx++) {                          \
         _cld = (prte_proc_t *) pmix_pointer_array_get_item(prte_local_children, _idx);  \
         if (NULL == _cld) {                                                             \
             continue;                                                                   \
         }                                                                               \
-        if (PMIX_CHECK_NSPACE(ns, _cld->name.nspace) &&                                 \
+        if (PMIX_CHECK_NSPACE((ns), _cld->name.nspace) &&                               \
             (UINT_MAX == _j || _j == _cld->app_idx)) {                                  \
-            _cld->exit_code = s;                                                        \
+            _cld->exit_code = _s;                                                       \
             PRTE_ACTIVATE_PROC_STATE(&_cld->name, PRTE_PROC_STATE_FAILED_TO_LAUNCH);    \
         }                                                                               \
     }                                                                                   \

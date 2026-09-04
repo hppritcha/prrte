@@ -13,7 +13,7 @@
  * Copyright (c) 2015      Research Organization for Information Science
  *                         and Technology (RIST). All rights reserved.
  * Copyright (c) 2015-2020 Intel, Inc.  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -62,6 +62,7 @@
 #include "src/util/name_fns.h"
 #include "src/util/proc_info.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 
 #include "src/mca/errmgr/errmgr.h"
 #include "src/mca/ras/base/base.h"
@@ -185,11 +186,11 @@ static int setup_base(void)
 {
     int rc;
 
-    // only do this once
+    // only do this once, and only latch that once it has actually worked -
+    // a failed attempt used to be remembered as a success
     if (setup_base_complete) {
         return PRTE_SUCCESS;
     }
-    setup_base_complete = true;
 
     /* Ensure that system info is set */
     prte_proc_info();
@@ -197,29 +198,32 @@ static int setup_base(void)
     /* BEFORE doing anything else, check to see if this prefix is
      * allowed by the system
      */
-    if (NULL != prte_prohibited_session_dirs || NULL != prte_process_info.tmpdir_base) {
+    if (NULL != prte_prohibited_session_dirs && NULL != prte_process_info.tmpdir_base) {
         char **list;
         int i, len;
         /* break the string into tokens - it should be
          * separated by ','
          */
-        list = PMIX_ARGV_SPLIT_COMPAT(prte_prohibited_session_dirs, ',');
-        len = PMIX_ARGV_COUNT_COMPAT(list);
+        list = PMIx_Argv_split(prte_prohibited_session_dirs, ',');
+        len = PMIx_Argv_count(list);
         /* cycle through the list */
         for (i = 0; i < len; i++) {
             /* check if prefix matches */
             if (0 == strncmp(prte_process_info.tmpdir_base, list[i], strlen(list[i]))) {
                 /* this is a prohibited location */
-                pmix_show_help("help-prte-runtime.txt", "prte:session:dir:prohibited", true,
+                prte_show_help("help-prte-runtime.txt", "prte:session:dir:prohibited", true,
                                prte_process_info.tmpdir_base, prte_prohibited_session_dirs);
-                PMIX_ARGV_FREE_COMPAT(list);
+                PMIx_Argv_free(list);
                 return PRTE_ERR_FATAL;
             }
         }
-        PMIX_ARGV_FREE_COMPAT(list); /* done with this */
+        PMIx_Argv_free(list); /* done with this */
     }
 
     rc = _setup_top_session_dir();
+    if (PRTE_SUCCESS == rc) {
+        setup_base_complete = true;
+    }
 
     return rc;
 }
@@ -261,7 +265,7 @@ int prte_session_dir(pmix_proc_t *proc)
         }
     }
 
-    if (prte_debug_flag) {
+    if (prte_debug_daemons_flag) {
         pmix_output(0, "jobdir: %s", PRTE_PRINTF_FIX_STRING(jdata->session_dir));
         pmix_output(0, "top: %s", PRTE_PRINTF_FIX_STRING(prte_process_info.top_session_dir));
         pmix_output(0, "tmp: %s", PRTE_PRINTF_FIX_STRING(prte_process_info.tmpdir_base));
@@ -293,6 +297,7 @@ void prte_job_session_dir_finalize(prte_job_t *jdata)
         if (prte_finalizing) {
             if (NULL != prte_process_info.top_session_dir) {
                 pmix_os_dirpath_destroy(prte_process_info.top_session_dir, true, _check_file);
+                /* if the top session dir is now empty, remove it */
                 rmdir(prte_process_info.top_session_dir);
                 free(prte_process_info.top_session_dir);
                 prte_process_info.top_session_dir = NULL;
@@ -328,6 +333,7 @@ static bool _check_file(const char *root, const char *path)
         if (0 != stat(fullpath, &st)) {
             pmix_output(0, "%s Syscall failure for stat: %s(%d)",
                         PMIX_NAME_PRINT(&pmix_globals.myid), strerror(errno), errno);
+            free(fullpath);
             return true;
         }
         free(fullpath);

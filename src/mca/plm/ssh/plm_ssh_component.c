@@ -20,7 +20,7 @@
  * Copyright (c) 2015-2020 Intel, Inc.  All rights reserved.
  * Copyright (c) 2019      Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -55,6 +55,7 @@
 #include "src/runtime/prte_globals.h"
 #include "src/util/name_fns.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 
 #include "src/mca/plm/base/plm_private.h"
 #include "src/mca/plm/plm.h"
@@ -73,7 +74,6 @@ static int ssh_component_close(void);
 static int ssh_launch_agent_lookup(const char *agent_list, char *path);
 
 /* Local variables */
-static char *prte_plm_ssh_delay_string = NULL;
 static int agent_var_id = -1;
 
 /*
@@ -83,7 +83,7 @@ static int agent_var_id = -1;
 
 prte_mca_plm_ssh_component_t prte_mca_plm_ssh_component = {
     .super = {
-        PRTE_PLM_BASE_VERSION_2_0_0,
+        PRTE_MCA_BASE_VERSION(plm),
 
         /* Component name and version */
         .pmix_mca_component_name = "ssh",
@@ -104,7 +104,6 @@ PMIX_MCA_BASE_COMPONENT_INIT(prte, plm, ssh)
 static int ssh_component_register(void)
 {
     pmix_mca_base_component_t *c = &prte_mca_plm_ssh_component.super;
-    int var_id;
 
     prte_mca_plm_ssh_component.num_concurrent = 128;
     (void) pmix_mca_base_component_var_register(c, "num_concurrent",
@@ -126,7 +125,7 @@ static int ssh_component_register(void)
 
     prte_mca_plm_ssh_component.daemonize_qrsh = false;
     (void) pmix_mca_base_component_var_register(c, "daemonize_qrsh",
-                                                "Daemonize the orted under the Grid Engine parallel environment",
+                                                "Daemonize the prted under the Grid Engine parallel environment",
                                                 PMIX_MCA_BASE_VAR_TYPE_BOOL,
                                                 &prte_mca_plm_ssh_component.daemonize_qrsh);
 
@@ -138,20 +137,20 @@ static int ssh_component_register(void)
 
     prte_mca_plm_ssh_component.daemonize_llspawn = false;
     (void) pmix_mca_base_component_var_register(c, "daemonize_llspawn",
-                                                "Daemonize the orted when under the LoadLeveler environment",
+                                                "Daemonize the prted when under the LoadLeveler environment",
                                                 PMIX_MCA_BASE_VAR_TYPE_BOOL,
                                                 &prte_mca_plm_ssh_component.daemonize_llspawn);
+
+    prte_mca_plm_ssh_component.disable_tmrsh = false;
+    (void) pmix_mca_base_component_var_register(c, "disable_tmrsh",
+                                                "Disable the use of pbs_tmrsh when under the PBS environment",
+                                                PMIX_MCA_BASE_VAR_TYPE_BOOL,
+                                                &prte_mca_plm_ssh_component.disable_tmrsh);
 
     prte_mca_plm_ssh_component.priority = 10;
     (void) pmix_mca_base_component_var_register(c, "priority", "Priority of the ssh plm component",
                                                 PMIX_MCA_BASE_VAR_TYPE_INT,
                                                 &prte_mca_plm_ssh_component.priority);
-
-    prte_plm_ssh_delay_string = NULL;
-    (void) pmix_mca_base_component_var_register(c, "delay",
-                                                "Delay between invocations of the remote agent (sec[:usec])",
-                                                PMIX_MCA_BASE_VAR_TYPE_STRING,
-                                                &prte_plm_ssh_delay_string);
 
     prte_mca_plm_ssh_component.no_tree_spawn = false;
     (void) pmix_mca_base_component_var_register(c, "no_tree_spawn",
@@ -161,26 +160,17 @@ static int ssh_component_register(void)
 
     /* local ssh/ssh launch agent */
     prte_mca_plm_ssh_component.agent = "ssh : rsh";
-    var_id = pmix_mca_base_component_var_register(c, "agent",
-                                                  "The command used to launch executables on remote nodes (typically \"ssh\")",
-                                                  PMIX_MCA_BASE_VAR_TYPE_STRING,
-                                                  &prte_mca_plm_ssh_component.agent);
-    (void) pmix_mca_base_var_register_synonym(var_id, "prte", "pls", NULL, "ssh_agent",
-                                              PMIX_MCA_BASE_VAR_SYN_FLAG_DEPRECATED);
-    (void) pmix_mca_base_var_register_synonym(var_id, "prte", "prte", NULL, "ssh_agent",
-                                              PMIX_MCA_BASE_VAR_SYN_FLAG_DEPRECATED);
-    agent_var_id = var_id;
+    agent_var_id = pmix_mca_base_component_var_register(c, "agent",
+                                                       "The command used to launch executables on remote nodes (typically \"ssh\")",
+                                                       PMIX_MCA_BASE_VAR_TYPE_STRING,
+                                                       &prte_mca_plm_ssh_component.agent);
 
     prte_mca_plm_ssh_component.assume_same_shell = true;
-    var_id = pmix_mca_base_component_var_register(c, "assume_same_shell",
-                                                  "If set to true, assume that the shell on the remote node is the same as the shell on the "
-                                                  "local node.  Otherwise, probe for what the remote shell [default: 1]",
-                                                  PMIX_MCA_BASE_VAR_TYPE_BOOL,
-                                                  &prte_mca_plm_ssh_component.assume_same_shell);
-    /* XXX -- var_conversion -- Why does this component register prte_assume_same_shell? Components
-     * should ONLY register THEIR OWN variables. */
-    (void) pmix_mca_base_var_register_synonym(var_id, "prte", "prte", NULL, "assume_same_shell",
-                                              PMIX_MCA_BASE_VAR_SYN_FLAG_DEPRECATED);
+    (void) pmix_mca_base_component_var_register(c, "assume_same_shell",
+                                                "If set to true, assume that the shell on the remote node is the same as the shell on the "
+                                                "local node.  Otherwise, probe for what the remote shell [default: 1]",
+                                                PMIX_MCA_BASE_VAR_TYPE_BOOL,
+                                                &prte_mca_plm_ssh_component.assume_same_shell);
 
     prte_mca_plm_ssh_component.pass_environ_mca_params = true;
     (void) pmix_mca_base_component_var_register(c, "pass_environ_mca_params",
@@ -209,28 +199,17 @@ static int ssh_component_register(void)
 
 static int ssh_component_open(void)
 {
-    char *ctmp;
-
     /* initialize globals */
     prte_mca_plm_ssh_component.using_qrsh = false;
     prte_mca_plm_ssh_component.using_llspawn = false;
+    prte_mca_plm_ssh_component.using_tmrsh = false;
     prte_mca_plm_ssh_component.agent_argv = NULL;
 
     /* lookup parameters */
     if (prte_mca_plm_ssh_component.num_concurrent <= 0) {
-        pmix_show_help("help-plm-ssh.txt", "concurrency-less-than-zero", true,
+        prte_show_help("help-plm-ssh.txt", "concurrency-less-than-zero", true,
                        prte_mca_plm_ssh_component.num_concurrent);
         prte_mca_plm_ssh_component.num_concurrent = 1;
-    }
-
-    if (NULL != prte_plm_ssh_delay_string) {
-        prte_mca_plm_ssh_component.delay.tv_sec = strtol(prte_plm_ssh_delay_string, &ctmp, 10);
-        if (ctmp == prte_plm_ssh_delay_string) {
-            prte_mca_plm_ssh_component.delay.tv_sec = 0;
-        }
-        if (':' == ctmp[0]) {
-            prte_mca_plm_ssh_component.delay.tv_nsec = 1000 * strtol(ctmp + 1, NULL, 10);
-        }
     }
 
     return PRTE_SUCCESS;
@@ -272,6 +251,10 @@ static int ssh_component_query(pmix_mca_base_module_t **module, int *priority)
             *module = NULL;
             return PRTE_ERROR;
         }
+        /* the MCA var system handed us a heap copy of the default and will
+         * free whatever pointer it finds here at deregistration, so release
+         * the one we are replacing rather than dropping it */
+        free(prte_mca_plm_ssh_component.agent);
         prte_mca_plm_ssh_component.agent = tmp;
         prte_mca_plm_ssh_component.using_qrsh = true;
         goto success;
@@ -289,8 +272,21 @@ static int ssh_component_query(pmix_mca_base_module_t **module, int *priority)
             *module = NULL;
             return PRTE_ERROR;
         }
+        free(prte_mca_plm_ssh_component.agent);
         prte_mca_plm_ssh_component.agent = strdup("llspawn");
         prte_mca_plm_ssh_component.using_llspawn = true;
+        goto success;
+    }
+
+    /* otherwise, check for PBS */
+    if (!prte_mca_plm_ssh_component.disable_tmrsh &&
+        NULL != getenv("PBS_ENVIRONMENT") &&
+        NULL != getenv("PBS_JOBID")) {
+        /* we already found the absolute path to pbs_tmrsh */
+        PMIx_Argv_append_nosize(&prte_mca_plm_ssh_component.agent_argv , PRTE_PBSTRMSH_PATH);
+        free(prte_mca_plm_ssh_component.agent);
+        prte_mca_plm_ssh_component.agent = strdup("pbs_tmrsh");
+        prte_mca_plm_ssh_component.using_tmrsh = true;
         goto success;
     }
 
@@ -302,7 +298,7 @@ lookup:
          * then we want to error out and not continue */
         if (NULL != prte_mca_plm_ssh_component.agent &&
             0 != strcmp(prte_mca_plm_ssh_component.agent, "ssh : rsh")) {
-            pmix_show_help("help-plm-ssh.txt", "agent-not-found", true,
+            prte_show_help("help-plm-ssh.txt", "agent-not-found", true,
                            prte_mca_plm_ssh_component.agent);
             PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_NEVER_LAUNCHED);
             return PRTE_ERR_FATAL;
@@ -350,18 +346,18 @@ char **prte_plm_ssh_search(const char *agent_list, const char *path)
         pmix_string_copy(cwd, path, PRTE_PATH_MAX);
     }
     if (NULL == agent_list) {
-        lines = PMIX_ARGV_SPLIT_COMPAT(prte_mca_plm_ssh_component.agent, ':');
+        lines = PMIx_Argv_split(prte_mca_plm_ssh_component.agent, ':');
     } else {
-        lines = PMIX_ARGV_SPLIT_COMPAT(agent_list, ':');
+        lines = PMIx_Argv_split(agent_list, ':');
     }
     for (i = 0; NULL != lines[i]; ++i) {
         line = lines[i];
 
         /* Trim whitespace at the beginning and end of the line */
-        for (j = 0; '\0' != line[j] && isspace(line[j]); ++line) {
-            continue;
+        while ('\0' != *line && isspace((int) *line)) {
+            ++line;
         }
-        for (j = strlen(line) - 2; j > 0 && isspace(line[j]); ++j) {
+        for (j = (int) strlen(line) - 1; j >= 0 && isspace((int) line[j]); --j) {
             line[j] = '\0';
         }
         if (strlen(line) <= 0) {
@@ -369,23 +365,23 @@ char **prte_plm_ssh_search(const char *agent_list, const char *path)
         }
 
         /* Split it */
-        tokens = PMIX_ARGV_SPLIT_COMPAT(line, ' ');
+        tokens = PMIx_Argv_split(line, ' ');
 
         /* Look for the first token in the PATH */
         tmp = pmix_path_findv(tokens[0], X_OK, environ, cwd);
         if (NULL != tmp) {
             free(tokens[0]);
             tokens[0] = tmp;
-            PMIX_ARGV_FREE_COMPAT(lines);
+            PMIx_Argv_free(lines);
             return tokens;
         }
 
         /* Didn't find it */
-        PMIX_ARGV_FREE_COMPAT(tokens);
+        PMIx_Argv_free(tokens);
     }
 
     /* Doh -- didn't find anything */
-    PMIX_ARGV_FREE_COMPAT(lines);
+    PMIx_Argv_free(lines);
     return NULL;
 }
 
@@ -424,7 +420,7 @@ static int ssh_launch_agent_lookup(const char *agent_list, char *path)
     if (0 == strcmp(bname, "ssh")) {
         /* if xterm option was given, add '-X', ensuring we don't do it twice */
         if (NULL != prte_xterm) {
-            PMIX_ARGV_APPEND_UNIQUE_COMPAT(&prte_mca_plm_ssh_component.agent_argv, "-X");
+            PMIx_Argv_append_unique_nosize(&prte_mca_plm_ssh_component.agent_argv, "-X");
         } else if (0 >= pmix_output_get_verbosity(prte_plm_base_framework.framework_output)) {
             /* if debug was not specified, and the user didn't explicitly
              * specify X11 forwarding/non-forwarding, add "-x" if it
@@ -436,7 +432,7 @@ static int ssh_launch_agent_lookup(const char *agent_list, char *path)
                 }
             }
             if (NULL == prte_mca_plm_ssh_component.agent_argv[i]) {
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&prte_mca_plm_ssh_component.agent_argv, "-x");
+                PMIx_Argv_append_nosize(&prte_mca_plm_ssh_component.agent_argv, "-x");
             }
         }
     }

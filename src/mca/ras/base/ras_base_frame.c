@@ -15,7 +15,7 @@
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2017-2019 Intel, Inc.  All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -50,13 +50,13 @@
  * Global variables
  */
 prte_ras_base_t prte_ras_base = {
-    .first_pass_completed = false,
-    .allocation_read = false,
-    .active_module = NULL,
+    .selected_modules = PMIX_LIST_STATIC_INIT(prte_ras_base.selected_modules),
+    .scheduler_owned = false,
+    .deferred_releases = PMIX_LIST_STATIC_INIT(prte_ras_base.deferred_releases),
     .total_slots_alloc = 0,
     .multiplier = 0,
     .launch_orted_on_hn = false,
-    .simulated = false
+    .allocation_established = false
 };
 
 static int ras_register(pmix_mca_base_register_flag_t flags)
@@ -79,25 +79,46 @@ static int ras_register(pmix_mca_base_register_flag_t flags)
 
 static int prte_ras_base_close(void)
 {
-    /* Close selected component */
-    if (NULL != prte_ras_base.active_module) {
-        prte_ras_base.active_module->finalize();
+    prte_ras_base_selected_module_t *mod;
+
+    /* Answer anything still parked behind a grow that is never going to
+     * resolve now.  The requester released nothing, so it must be told rather
+     * than left waiting on a completion event the DVM can no longer raise. */
+    prte_ras_base_flush_deferred_releases(PMIX_ERR_UNREACH);
+
+    /* Close selected components */
+    PMIX_LIST_FOREACH(mod, &prte_ras_base.selected_modules, prte_ras_base_selected_module_t) {
+        if (NULL != mod->module->finalize) {
+            mod->module->finalize();
+        }
     }
+    PMIX_LIST_DESTRUCT(&prte_ras_base.selected_modules);
+    PMIX_LIST_DESTRUCT(&prte_ras_base.deferred_releases);
 
     return pmix_mca_base_framework_components_close(&prte_ras_base_framework, NULL);
 }
 
 /**
- *  * Function for finding and opening either all MCA components, or the one
- *   * that was specifically requested via a MCA parameter.
- *    */
+ * Function for finding and opening either all MCA components, or the one
+ * that was specifically requested via a MCA parameter.
+ */
 static int prte_ras_base_open(pmix_mca_base_open_flag_t flags)
 {
+    /* init the globals.  The static initializers above leave each list's
+     * sentinel NULL-linked -- safe to read as empty, but NOT safe to append
+     * to -- so both have to be constructed here before anything uses them. */
+    PMIX_CONSTRUCT(&prte_ras_base.selected_modules, pmix_list_t);
+    PMIX_CONSTRUCT(&prte_ras_base.deferred_releases, pmix_list_t);
+
     /* Open up all available components */
     return pmix_mca_base_framework_components_open(&prte_ras_base_framework, flags);
 }
 
-PMIX_MCA_BASE_FRAMEWORK_DECLARE(prte, ras, "PRTE Resource Allocation Subsystem", ras_register,
+PRTE_MCA_BASE_FRAMEWORK_DECLARE(ras, "PRTE Resource Allocation Subsystem", ras_register,
                                 prte_ras_base_open, prte_ras_base_close,
                                 prte_ras_base_static_components,
                                 PMIX_MCA_BASE_FRAMEWORK_FLAG_DEFAULT);
+
+PMIX_CLASS_INSTANCE(prte_ras_base_selected_module_t,
+                    pmix_list_item_t,
+                    NULL, NULL);

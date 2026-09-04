@@ -13,7 +13,7 @@
  * Copyright (c) 2011-2013 Los Alamos National Security, LLC.
  *                         All rights reserved.
  * Copyright (c) 2014-2020 Intel, Inc.  All rights reserved.
- * Copyright (c) 2021-2024 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -42,7 +42,99 @@
  * sending a job object is to communicate the data required to dynamically
  * spawn another job - so we only pack that limited set of required data
  */
-int prte_job_pack(pmix_data_buffer_t *bkt, prte_job_t *job)
+
+/* Encode a list of strings as a single compressed value.
+ *
+ * The delimiter is the caller's, not the encoder's: PMIx_generate_regex2
+ * replaced PMIx_generate_ppn precisely because a per-node rank map and a
+ * node map differ only in what character joins their fields.
+ */
+static int pack_map(pmix_data_buffer_t *bkt, char **list, char delim)
+{
+    pmix_status_t rc;
+    char *joined;
+
+    joined = PMIx_Argv_join(list, delim);
+    if (NULL == joined) {
+        PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+        return PRTE_ERR_OUT_OF_RESOURCE;
+    }
+#if PRTE_PMIX_HAVE_REGEX2
+    {
+        pmix_regex2_t regex = PMIX_REGEX2_STATIC_INIT;
+        rc = PMIx_generate_regex2(joined, NULL, 0, &regex);
+        free(joined);
+        if (PMIX_SUCCESS != rc) {
+            PMIX_ERROR_LOG(rc);
+            return prte_pmix_convert_status(rc);
+        }
+        rc = PMIx_Data_pack(NULL, bkt, &regex, 1, PMIX_REGEX2);
+        PMIx_Regex2_destruct(&regex);
+    }
+#else
+    rc = PMIx_Data_pack(NULL, bkt, &joined, 1, PMIX_STRING);
+    free(joined);
+#endif
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        return prte_pmix_convert_status(rc);
+    }
+    return PRTE_SUCCESS;
+}
+
+/* One app's proc map: for each node of the job's map, in map order, the
+ * ranks of that app resident on it.  A node where this app has no procs
+ * contributes "-" rather than an empty field, so the map stays aligned with
+ * the node map - an empty field would be dropped by the argv split at the
+ * far end and silently shift every later node's ranks onto the wrong node.
+ *
+ * The per-node walk is node->procs in array order, which is exactly the
+ * order compute_local_rank() assigns local ranks in, and the apps are walked
+ * in the same order there and here.  That is what makes local_rank
+ * derivable rather than merely guessable.
+ */
+static int pack_proc_map(pmix_data_buffer_t *bkt, prte_job_t *job, prte_app_idx_t idx)
+{
+    char **fields = NULL, **micro;
+    char *tmp;
+    prte_node_t *node;
+    prte_proc_t *proc;
+    int n, m, rc;
+
+    for (n = 0; n < job->map->nodes->size; n++) {
+        node = (prte_node_t *) pmix_pointer_array_get_item(job->map->nodes, n);
+        if (NULL == node) {
+            continue;
+        }
+        micro = NULL;
+        for (m = 0; m < node->procs->size; m++) {
+            proc = (prte_proc_t *) pmix_pointer_array_get_item(node->procs, m);
+            if (NULL == proc) {
+                continue;
+            }
+            if (!PMIX_CHECK_NSPACE(job->nspace, proc->name.nspace)) {
+                continue;
+            }
+            if (proc->app_idx != idx) {
+                continue;
+            }
+            PMIx_Argv_append_nosize(&micro, PRTE_VPID_PRINT(proc->name.rank));
+        }
+        if (NULL == micro) {
+            PMIx_Argv_append_nosize(&fields, "-");
+        } else {
+            tmp = PMIx_Argv_join(micro, ',');
+            PMIx_Argv_free(micro);
+            PMIx_Argv_append_nosize(&fields, tmp);
+            free(tmp);
+        }
+    }
+    rc = pack_map(bkt, fields, ';');
+    PMIx_Argv_free(fields);
+    return rc;
+}
+
+int prte_job_pack(pmix_data_buffer_t *bkt, prte_job_t *job, prte_job_pack_mode_t mode)
 {
     pmix_status_t rc;
     int32_t j, count, bookmark;
@@ -51,6 +143,30 @@ int prte_job_pack(pmix_data_buffer_t *bkt, prte_job_t *job)
     prte_attribute_t *kv;
     pmix_list_t *cache;
     prte_info_item_t *val;
+    prte_node_t *nptr;
+    bool devices;
+
+    /* Whether the procs carry a device assignment is a property of the whole
+     * job, so it travels once, here - ahead of the proc array.  It cannot be
+     * derived while reading a proc: the map is packed after them, so at that
+     * point the decoder has not yet seen the mapping policy. */
+    devices = (NULL != job->map
+               && PRTE_MAPPING_BYDEVICE == PRTE_GET_MAPPING_POLICY(job->map->mapping));
+
+    /* Lead with what this buffer contains.  The per-proc records are not
+     * always the same shape - the launch path scatters the cpusets - and the
+     * decoder has to know which one it is looking at before it reads the
+     * first of them.  One byte, once per job, ahead of everything else. */
+    rc = PMIx_Data_pack(NULL, bkt, &mode, 1, PMIX_UINT8);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        return prte_pmix_convert_status(rc);
+    }
+    rc = PMIx_Data_pack(NULL, bkt, &devices, 1, PMIX_BOOL);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        return prte_pmix_convert_status(rc);
+    }
 
     /* pack the nspace */
     rc = PMIx_Data_pack(NULL, bkt, (void *) &job->nspace, 1, PMIX_PROC_NSPACE);
@@ -126,7 +242,7 @@ int prte_job_pack(pmix_data_buffer_t *bkt, prte_job_t *job)
     }
 
     /* pack the personality */
-    count = PMIX_ARGV_COUNT_COMPAT(job->personality);
+    count = PMIx_Argv_count(job->personality);
     rc = PMIx_Data_pack(NULL, bkt, (void *) &count, 1, PMIX_INT32);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
@@ -173,12 +289,65 @@ int prte_job_pack(pmix_data_buffer_t *bkt, prte_job_t *job)
         return prte_pmix_convert_status(rc);
     }
 
-    if (0 < job->num_procs) {
+    /* The placement, as maps rather than as a per-proc array.
+     *
+     * The node map names the nodes this job is mapped onto, in map order.
+     * One proc map per app then gives, for each of those nodes in the same
+     * order, the ranks of that app resident on it - "-" where the app has
+     * none there, so the two lists stay in step.  Between them they carry
+     * every proc's rank, its hosting daemon, its app, its app rank and its
+     * local rank, in a form that compresses with the number of NODES rather
+     * than growing with the number of processes.  See prte_job_unpack for
+     * why each of those five is derivable.
+     *
+     * An unmapped job - a spawn request on its way to the HNP, which has not
+     * been through rmaps yet - packs a zero here and nothing else. */
+    if (NULL == job->map || 0 == job->map->num_nodes || 0 == job->num_procs) {
+        j = 0;
+        rc = PMIx_Data_pack(NULL, bkt, &j, 1, PMIX_INT32);
+        if (PMIX_SUCCESS != rc) {
+            PMIX_ERROR_LOG(rc);
+            return prte_pmix_convert_status(rc);
+        }
+    } else {
+        char **nodenames = NULL;
+        j = job->map->num_nodes;
+        rc = PMIx_Data_pack(NULL, bkt, &j, 1, PMIX_INT32);
+        if (PMIX_SUCCESS != rc) {
+            PMIX_ERROR_LOG(rc);
+            return prte_pmix_convert_status(rc);
+        }
+        for (j = 0; j < job->map->nodes->size; j++) {
+            nptr = (prte_node_t *) pmix_pointer_array_get_item(job->map->nodes, j);
+            if (NULL == nptr) {
+                continue;
+            }
+            PMIx_Argv_append_nosize(&nodenames, nptr->name);
+        }
+        rc = pack_map(bkt, nodenames, ',');
+        PMIx_Argv_free(nodenames);
+        if (PRTE_SUCCESS != rc) {
+            PRTE_ERROR_LOG(rc);
+            return rc;
+        }
+
+        for (j = 0; j < job->apps->size; j++) {
+            if (NULL == (app = (prte_app_context_t *) pmix_pointer_array_get_item(job->apps, j))) {
+                continue;
+            }
+            rc = pack_proc_map(bkt, job, app->idx);
+            if (PRTE_SUCCESS != rc) {
+                PRTE_ERROR_LOG(rc);
+                return rc;
+            }
+        }
+
+        /* ...and then what the maps cannot say, in rank order */
         for (j = 0; j < job->procs->size; j++) {
             if (NULL == (proc = (prte_proc_t *) pmix_pointer_array_get_item(job->procs, j))) {
                 continue;
             }
-            rc = prte_proc_pack(bkt, proc);
+            rc = prte_proc_pack(bkt, proc, devices, mode);
             if (PMIX_SUCCESS != rc) {
                 PMIX_ERROR_LOG(rc);
                 return prte_pmix_convert_status(rc);
@@ -336,32 +505,20 @@ int prte_node_pack(pmix_data_buffer_t *bkt, prte_node_t *node)
 /*
  * PROC
  */
-int prte_proc_pack(pmix_data_buffer_t *bkt, prte_proc_t *proc)
+int prte_proc_pack(pmix_data_buffer_t *bkt, prte_proc_t *proc, bool devices,
+                   prte_job_pack_mode_t mode)
 {
     pmix_status_t rc;
-    int32_t count;
-    prte_attribute_t *kv;
 
-    /* pack the name */
-    rc = PMIx_Data_pack(NULL, bkt, &proc->name, 1, PMIX_PROC);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
-        return prte_pmix_convert_status(rc);
-    }
-
-    /* pack the daemon/node it is on */
-    rc = PMIx_Data_pack(NULL, bkt, &proc->parent, 1, PMIX_PROC_RANK);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
-        return prte_pmix_convert_status(rc);
-    }
-
-    /* pack the local rank */
-    rc = PMIx_Data_pack(NULL, bkt, &proc->local_rank, 1, PMIX_UINT16);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
-        return prte_pmix_convert_status(rc);
-    }
+    /* Only what the job's node and proc maps cannot say.
+     *
+     * A proc's rank, its hosting daemon, its app index, its app rank and its
+     * local rank are all properties of WHERE it was placed, and the maps
+     * packed by prte_job_pack say exactly that - so packing them here was
+     * repeating the map once per process.  What is left is genuinely
+     * per-proc: the node rank counts procs of every job on that node, so one
+     * job's map cannot produce it; the cpuset is the binding the mapper
+     * computed; the state and attributes are its own. */
 
     /* pack the node rank */
     rc = PMIx_Data_pack(NULL, bkt, &proc->node_rank, 1, PMIX_UINT16);
@@ -377,57 +534,74 @@ int prte_proc_pack(pmix_data_buffer_t *bkt, prte_proc_t *proc)
         return prte_pmix_convert_status(rc);
     }
 
-    /* pack the app context index */
-    rc = PMIx_Data_pack(NULL, bkt, &proc->app_idx, 1, PMIX_UINT32);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
-        return prte_pmix_convert_status(rc);
+    /* The cpuset, unless it is being scattered.
+     *
+     * It is the largest of the three and the only one that is of no use to
+     * anybody but the daemon that forks the proc: node rank and state are
+     * read for procs this daemon does not host, the binding is not.  In
+     * PRTE_JOB_PACK_NO_CPUSETS mode it therefore travels to that daemon
+     * alone - see prte_odls_base_send_cpuset_slices(). */
+    if (PRTE_JOB_PACK_NO_CPUSETS != mode) {
+        rc = PMIx_Data_pack(NULL, bkt, (void *) &proc->cpuset, 1, PMIX_STRING);
+        if (PMIX_SUCCESS != rc) {
+            PMIX_ERROR_LOG(rc);
+            return prte_pmix_convert_status(rc);
+        }
     }
 
-    /* pack the app rank */
-    rc = PMIx_Data_pack(NULL, bkt, &proc->app_rank, 1, PMIX_PROC_RANK);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
-        return prte_pmix_convert_status(rc);
+    /* The device this proc was mapped against, when the job was mapped by
+     * one.  Packed as its own field rather than as an attribute, because no
+     * attribute list goes on the wire (see below), and packed only for a
+     * job that asked for a device map, so that every other job pays nothing
+     * for it - the size discipline the comment below describes applies here
+     * too. Both ends test the same condition, and the job's mapping policy
+     * has already been packed by the time this runs. */
+    if (devices) {
+        pmix_data_array_t *devs = NULL;
+        uint16_t ndevs;
+        prte_get_attribute(&proc->attributes, PRTE_PROC_DEVICE_ID,
+                           (void **) &devs, PMIX_DATA_ARRAY);
+        ndevs = (NULL == devs) ? 0 : (uint16_t) devs->size;
+        rc = PMIx_Data_pack(NULL, bkt, &ndevs, 1, PMIX_UINT16);
+        if (PMIX_SUCCESS == rc && 0 < ndevs) {
+            rc = PMIx_Data_pack(NULL, bkt, devs->array, ndevs, PMIX_DEVICE);
+        }
+        if (NULL != devs) {
+            PMIX_DATA_ARRAY_FREE(devs);
+        }
+        if (PMIX_SUCCESS != rc) {
+            PMIX_ERROR_LOG(rc);
+            return prte_pmix_convert_status(rc);
+        }
     }
 
-    /* pack the cpuset */
-    rc = PMIx_Data_pack(NULL, bkt, (void *) &proc->cpuset, 1, PMIX_STRING);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
-        return prte_pmix_convert_status(rc);
-    }
-
-    /* pack the attributes that will go */
-    count = 0;
+    /* NO ATTRIBUTE LIST GOES ON THE WIRE.
+     *
+     * Exactly one proc attribute exists anywhere in this tree -
+     * PRTE_PROC_NOBARRIER - and it is PRTE_ATTR_LOCAL, which this filter
+     * excluded; it is also set by the odls on the daemon that forks the
+     * proc, which is after this packing and on the far side of it. So the
+     * count was 4 bytes per proc introducing a list that has been empty in
+     * every job ever launched - 512 KB of a 1.9 MB launch message at
+     * 1000 nodes x 128 ppn, buying nothing at any scale.
+     *
+     * If you add a PRTE_ATTR_GLOBAL proc attribute, it has to come back
+     * here and in prte_proc_unpack, together. The check below is what will
+     * tell you, because nothing else would: the attribute would simply not
+     * arrive, and the receiving daemon would read a default. */
+#if PRTE_ENABLE_DEBUG
+    prte_attribute_t *kv;
     PMIX_LIST_FOREACH(kv, &proc->attributes, prte_attribute_t)
     {
         if (PRTE_ATTR_GLOBAL == kv->local) {
-            ++count;
+            pmix_output(0, "%s prte_proc_pack: proc %s carries global attribute %d, "
+                        "which is NOT packed - see the comment here",
+                        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                        PRTE_NAME_PRINT(&proc->name), (int) kv->key);
+            break;
         }
     }
-    rc = PMIx_Data_pack(NULL, bkt, &count, 1, PMIX_INT32);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
-        return prte_pmix_convert_status(rc);
-    }
-    if (0 < count) {
-        PMIX_LIST_FOREACH(kv, &proc->attributes, prte_attribute_t)
-        {
-            if (PRTE_ATTR_GLOBAL == kv->local) {
-                rc = PMIx_Data_pack(NULL, bkt, (void *) &kv->key, 1, PMIX_UINT16);
-                if (PMIX_SUCCESS != rc) {
-                    PMIX_ERROR_LOG(rc);
-                    return prte_pmix_convert_status(rc);
-                }
-                rc = PMIx_Data_pack(NULL, bkt, (void *) &kv->data, 1, PMIX_VALUE);
-                if (PMIX_SUCCESS != rc) {
-                    PMIX_ERROR_LOG(rc);
-                    return prte_pmix_convert_status(rc);
-                }
-            }
-        }
-    }
+#endif
 
     return PRTE_SUCCESS;
 }
@@ -470,7 +644,7 @@ int prte_app_pack(pmix_data_buffer_t *bkt, prte_app_context_t *app)
     }
 
     /* pack the number of entries in the argv array */
-    count = PMIX_ARGV_COUNT_COMPAT(app->argv);
+    count = PMIx_Argv_count(app->argv);
     rc = PMIx_Data_pack(NULL, bkt, &count, 1, PMIX_INT32);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
@@ -487,7 +661,7 @@ int prte_app_pack(pmix_data_buffer_t *bkt, prte_app_context_t *app)
     }
 
     /* pack the number of entries in the enviro array */
-    count = PMIX_ARGV_COUNT_COMPAT(app->env);
+    count = PMIx_Argv_count(app->env);
     rc = PMIx_Data_pack(NULL, bkt, &count, 1, PMIX_INT32);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
@@ -561,21 +735,10 @@ int prte_map_pack(pmix_data_buffer_t *bkt, struct prte_job_map_t *mp)
     pmix_status_t rc;
     prte_job_map_t *map = (prte_job_map_t *) mp;
 
-    /* pack the requested mapper */
-    rc = PMIx_Data_pack(NULL, bkt, &map->req_mapper, 1, PMIX_STRING);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
-        return prte_pmix_convert_status(rc);
-    }
-
-    /* pack the last mapper */
-    rc = PMIx_Data_pack(NULL, bkt, &map->last_mapper, 1, PMIX_STRING);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
-        return prte_pmix_convert_status(rc);
-    }
-
-    /* pack the policies */
+    /* pack the policies. Note there is no mapper name on the wire: mapping
+     * happens only on the HNP, so the identity of the component that did it
+     * was never read at the far end - it was two strings per job, per
+     * daemon, that nothing consumed. */
     rc = PMIx_Data_pack(NULL, bkt, &map->mapping, 1, PMIX_UINT16);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);

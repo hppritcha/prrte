@@ -72,9 +72,10 @@ void prte_iof_hnp_recv(int status, pmix_proc_t *sender, pmix_data_buffer_t *buff
     prte_iof_tag_t stream;
     int32_t count, numbytes;
     int rc;
-    prte_iof_proc_t *proct;
+    unsigned char *stdindata = NULL;
     pmix_iof_channel_t pchan;
     prte_iof_deliver_t *p;
+    prte_job_t *jdata;
     pmix_status_t prc;
     PRTE_HIDE_UNUSED_PARAMS(status, tag, cbdata);
 
@@ -90,6 +91,49 @@ void prte_iof_hnp_recv(int status, pmix_proc_t *sender, pmix_data_buffer_t *buff
         goto CLEAN_RETURN;
     }
 
+    /* A flow-control message consists solely of the tag - there is no proc
+     * and no payload behind it, so it has to be recognized here, before the
+     * unpack below reads off the end of the buffer and reports the daemon's
+     * XOFF as a corrupted message.
+     *
+     * Acting on it means reaching the producer, and the producer is not ours:
+     * stdin originates in a PMIx server's read of its own stdin, or in a
+     * tool's PMIx_IOF_push. PMIx_server_IOF_flow_control is how we ask PMIx
+     * to stop them - it suspends any stdin the library is reading here and
+     * relays the request to every tool that has pushed stdin to us, leaving
+     * the unread bytes in the producer's own input stream where the OS
+     * applies the back-pressure. Nothing is buffered on behalf of a
+     * suspended stream and nothing is dropped; an XOFF is not permission to
+     * lose data.
+     *
+     * We do not know which producer a given daemon's backlog came from - the
+     * message says only that this daemon is behind - so the request is made
+     * wildcard, against every process feeding us stdin. That is the correct
+     * conservative reading: any of them may be the one filling that sink.
+     *
+     * Against a PMIx too old to have the API we do what we always did -
+     * consume the message quietly. The daemon's sink then queues, bounded
+     * only by iof_base_output_limit, which is the pre-existing behavior and
+     * is still better than logging an unpack failure at the user every time
+     * a proc reads its stdin slowly.
+     */
+    if ((PRTE_IOF_XON | PRTE_IOF_XOFF) & stream) {
+        PMIX_OUTPUT_VERBOSE((1, prte_iof_base_framework.framework_output,
+                             "%s received %s from daemon %s",
+                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                             (PRTE_IOF_XON & stream) ? "xon" : "xoff",
+                             PRTE_NAME_PRINT(sender)));
+#if PRTE_PMIX_IOF_FLOW_CONTROL
+        prc = PMIx_server_IOF_flow_control(NULL, PMIX_FWD_STDIN_CHANNEL,
+                                           (PRTE_IOF_XOFF & stream) ? true : false,
+                                           NULL, 0, NULL, NULL);
+        if (PMIX_SUCCESS != prc && PMIX_OPERATION_SUCCEEDED != prc) {
+            PMIX_ERROR_LOG(prc);
+        }
+#endif
+        goto CLEAN_RETURN;
+    }
+
     /* get name of the process whose io we are discussing */
     count = 1;
     rc = PMIx_Data_unpack(NULL, buffer, &origin, &count, PMIX_PROC);
@@ -102,6 +146,85 @@ void prte_iof_hnp_recv(int status, pmix_proc_t *sender, pmix_data_buffer_t *buff
                          "%s received IOF cmd for source %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                          PRTE_NAME_PRINT(&origin)));
 
+    /* A daemon telling us that somebody attached to IT wants this job's
+     * output. That tool's IOF subscription is held by that daemon's PMIx
+     * server and only that server can deliver to it, so we have to relay
+     * a copy of this job's output there - which we will not do unless the
+     * daemon is in the job's interested set. Record it and we are done;
+     * the message carries no payload. Sent by record_interest() in
+     * src/prted/pmix/pmix_server_gen.c, on PRTE_RML_TAG_IOF_HNP - the
+     * upstream tag this handler is registered on. */
+    if (PRTE_IOF_PULL & stream) {
+        jdata = prte_get_job_data_object(origin.nspace);
+        if (NULL == jdata) {
+            /* a job we have never heard of, or one already gone */
+            PMIX_OUTPUT_VERBOSE((1, prte_iof_base_framework.framework_output,
+                                 "%s iof:hnp interest from daemon %s in unknown job %s",
+                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                                 PRTE_NAME_PRINT(sender), origin.nspace));
+            goto CLEAN_RETURN;
+        }
+        PMIX_OUTPUT_VERBOSE((1, prte_iof_base_framework.framework_output,
+                             "%s iof:hnp daemon %s is interested in job %s output",
+                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                             PRTE_NAME_PRINT(sender), origin.nspace));
+        pmix_bitmap_set_bit(&jdata->iof_daemons, (int) sender->rank);
+        goto CLEAN_RETURN;
+    }
+
+    /* a daemon that is hosting a tool cannot route the tool's stdin - only
+     * we know which daemon hosts the target proc - so it relays the push to
+     * us and we inject it exactly as if the tool were attached here. In that
+     * case the proc we just unpacked is the intended recipient rather than
+     * the source of some output. This is screened ahead of the zero-length
+     * test below because a zero-byte stdin push is the sentinel that closes
+     * the target's stdin, not an empty message to be dropped */
+    if (PRTE_IOF_STDIN & stream) {
+        count = 1;
+        rc = PMIx_Data_unpack(NULL, buffer, &numbytes, &count, PMIX_INT32);
+        if (PMIX_SUCCESS != rc) {
+            PMIX_ERROR_LOG(rc);
+            goto CLEAN_RETURN;
+        }
+        if (0 > numbytes) {
+            /* corrupted message */
+            PRTE_ERROR_LOG(PRTE_ERR_COMM_FAILURE);
+            goto CLEAN_RETURN;
+        }
+        if (0 < numbytes) {
+            stdindata = (unsigned char *) malloc(numbytes);
+            if (NULL == stdindata) {
+                PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+                goto CLEAN_RETURN;
+            }
+            count = numbytes;
+            rc = PMIx_Data_unpack(NULL, buffer, stdindata, &count, PMIX_BYTE);
+            if (PMIX_SUCCESS != rc) {
+                PMIX_ERROR_LOG(rc);
+                free(stdindata);
+                goto CLEAN_RETURN;
+            }
+            /* count holds the number of bytes actually delivered */
+            numbytes = count;
+        }
+        PMIX_OUTPUT_VERBOSE((1, prte_iof_base_framework.framework_output,
+                             "%s injecting %d relayed stdin bytes for %s",
+                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), numbytes,
+                             PRTE_NAME_PRINT(&origin)));
+        rc = prte_iof.push_stdin(&origin, stdindata, (size_t) numbytes);
+        /* a target that has already finalized (ADDRESSEE_UNKNOWN) and a sink
+         * that has backed up (OUT_OF_RESOURCE) are both expected outcomes
+         * here, exactly as they are for a locally-attached tool */
+        if (PRTE_SUCCESS != rc && PRTE_ERR_ADDRESSEE_UNKNOWN != rc
+            && PRTE_ERR_OUT_OF_RESOURCE != rc) {
+            PRTE_ERROR_LOG(rc);
+        }
+        if (NULL != stdindata) {
+            free(stdindata);
+        }
+        goto CLEAN_RETURN;
+    }
+
     /* this must have come from a daemon forwarding output - unpack the data */
     count = 1;
     rc = PMIx_Data_unpack(NULL, buffer, &numbytes, &count, PMIX_INT32);
@@ -109,13 +232,20 @@ void prte_iof_hnp_recv(int status, pmix_proc_t *sender, pmix_data_buffer_t *buff
         PMIX_ERROR_LOG(rc);
         goto CLEAN_RETURN;
     }
-    if (0 == numbytes) {
-        /* nothing to do - shouldn't have been sent */
+    if (0 >= numbytes) {
+        /* nothing to do - shouldn't have been sent. A negative
+         * count indicates a corrupted message
+         */
         goto CLEAN_RETURN;
     }
     p = PMIX_NEW(prte_iof_deliver_t);
     PMIX_XFER_PROCID(&p->source, &origin);
     p->bo.bytes = (char*)malloc(numbytes);
+    if (NULL == p->bo.bytes) {
+        PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+        PMIX_RELEASE(p);
+        goto CLEAN_RETURN;
+    }
     rc = PMIx_Data_unpack(NULL, buffer, p->bo.bytes, &numbytes, PMIX_BYTE);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
@@ -128,21 +258,17 @@ void prte_iof_hnp_recv(int status, pmix_proc_t *sender, pmix_data_buffer_t *buff
                          "%s unpacked %d bytes from remote proc %s",
                          PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), numbytes, PRTE_NAME_PRINT(&origin)));
 
-    /* do we already have this process in our list? */
-    PMIX_LIST_FOREACH(proct, &prte_mca_iof_hnp_component.procs, prte_iof_proc_t)
-    {
-        if (PMIX_CHECK_PROCID(&proct->name, &origin)) {
-            /* found it */
-            goto NSTEP;
-        }
-    }
-
-    /* if we get here, then we don't yet have this proc in our list */
-    proct = PMIX_NEW(prte_iof_proc_t);
-    PMIX_XFER_PROCID(&proct->name, &origin);
-    pmix_list_append(&prte_mca_iof_hnp_component.procs, &proct->super);
-
-NSTEP:
+    /* NOTE: we deliberately do NOT record "origin" in our procs list.
+     * That list holds endpoint bundles - a stdin sink and the read events
+     * for a proc WE forked - and a proc on some other node has none of
+     * those here: the entry this used to create carried a name and three
+     * NULL slots, and nothing ever read it. What it cost was one object
+     * and one list node on the DVM master for every remote process that
+     * ever produced output, retained until the job completed, and a linear
+     * walk of that list on every stdin fragment and every close. At the
+     * scales this runtime is built for that is the master's memory and the
+     * length of a hot-path scan, spent on bookkeeping with no reader.
+     */
     pchan = 0;
     if (PRTE_IOF_STDOUT & stream) {
         pchan |= PMIX_FWD_STDOUT_CHANNEL;
@@ -153,6 +279,13 @@ NSTEP:
     if (PRTE_IOF_STDDIAG & stream) {
         pchan |= PMIX_FWD_STDDIAG_CHANNEL;
     }
+    /* a tool watching this job may be attached to some other daemon, which
+     * cannot see this output - only we do. Send it a copy, unless the daemon
+     * that forwarded this to us is that same daemon, in which case it already
+     * gave its own PMIx server a copy before forwarding */
+    prte_iof_hnp_relay_to_tool(&origin, stream, (unsigned char *) p->bo.bytes,
+                               numbytes, sender->rank);
+
     /* output this thru our PMIx server */
     prc = PMIx_server_IOF_deliver(&p->source, pchan, &p->bo, NULL, 0, lkcbfunc, (void*)p);
     if (PMIX_SUCCESS != prc) {
@@ -162,4 +295,116 @@ NSTEP:
 
 CLEAN_RETURN:
     return;
+}
+
+/*
+ * Stdin arriving on PRTE_RML_TAG_IOF_PROXY.
+ *
+ * The HNP normally writes stdin directly into a local proc's sink from
+ * push_stdin. The exception is a wildcard target: that is xcast to every
+ * daemon, and the xcast machinery delivers a copy to the sender as well -
+ * so the HNP receives its own broadcast here and must service the procs it
+ * hosts, exactly as a prted does for the procs it hosts. Without this
+ * receive the message goes unmatched and every proc local to the HNP is
+ * silently skipped.
+ */
+void prte_iof_hnp_stdin_recv(int status, pmix_proc_t *sender, pmix_data_buffer_t *buffer,
+                             prte_rml_tag_t tag, void *cbdata)
+{
+    unsigned char *data = NULL;
+    prte_iof_tag_t stream;
+    int32_t count, numbytes;
+    pmix_proc_t target;
+    prte_iof_proc_t *proct;
+    int rc;
+    PRTE_HIDE_UNUSED_PARAMS(status, sender, tag, cbdata);
+
+    /* see what stream generated this data */
+    count = 1;
+    rc = PMIx_Data_unpack(NULL, buffer, &stream, &count, PMIX_UINT16);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        return;
+    }
+
+    /* only stdin travels on this tag */
+    if (PRTE_IOF_STDIN != stream) {
+        PRTE_ERROR_LOG(PRTE_ERR_COMM_FAILURE);
+        return;
+    }
+
+    /* unpack the intended target */
+    count = 1;
+    rc = PMIx_Data_unpack(NULL, buffer, &target, &count, PMIX_PROC);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        return;
+    }
+
+    /* unpack the byte count, then storage sized to match it */
+    count = 1;
+    rc = PMIx_Data_unpack(NULL, buffer, &numbytes, &count, PMIX_INT32);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        return;
+    }
+    if (0 > numbytes) {
+        /* corrupted message */
+        PRTE_ERROR_LOG(PRTE_ERR_COMM_FAILURE);
+        return;
+    }
+    if (0 < numbytes) {
+        data = (unsigned char *) malloc(numbytes);
+        if (NULL == data) {
+            PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+            return;
+        }
+        count = numbytes;
+        rc = PMIx_Data_unpack(NULL, buffer, data, &count, PMIX_BYTE);
+        if (PMIX_SUCCESS != rc) {
+            PMIX_ERROR_LOG(rc);
+            free(data);
+            return;
+        }
+        numbytes = count;
+    }
+
+    PMIX_OUTPUT_VERBOSE((1, prte_iof_base_framework.framework_output,
+                         "%s unpacked %d bytes of stdin for local proc %s",
+                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), numbytes, PRTE_NAME_PRINT(&target)));
+
+    /* deliver to every proc we host that matches the target - PMIX_CHECK_RANK
+     * honors the wildcard, which is the case that brought us here
+     */
+    PMIX_LIST_FOREACH(proct, &prte_mca_iof_hnp_component.procs, prte_iof_proc_t)
+    {
+        if (!PMIX_CHECK_NSPACE(target.nspace, proct->name.nspace) ||
+            !PMIX_CHECK_RANK(target.rank, proct->name.rank)) {
+            continue;
+        }
+        /* a proc that never pulled stdin has no sink - the list also holds
+         * entries created for remote procs whose output we forward
+         */
+        if (NULL == proct->stdinev || NULL == proct->stdinev->wev) {
+            continue;
+        }
+        /* a zero-byte write is forwarded too - it flushes what precedes it
+         * and then closes the proc's stdin
+         */
+        if (PRTE_IOF_MAX_INPUT_BUFFERS < prte_iof_base_write_output(&proct->name, stream, data,
+                                                                    numbytes,
+                                                                    proct->stdinev->wev)) {
+            /* we are the source of this stdin, so there is no upstream to
+             * throttle - just note it
+             */
+            PMIX_OUTPUT_VERBOSE((1, prte_iof_base_framework.framework_output,
+                                 "%s stdin buffer backed up for %s",
+                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                                 PRTE_NAME_PRINT(&proct->name)));
+        }
+    }
+
+    if (NULL != data) {
+        free(data);
+    }
 }

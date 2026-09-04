@@ -64,7 +64,13 @@ BEGIN_C_DECLS
 struct prte_mca_iof_hnp_component_t {
     prte_iof_base_component_t super;
     pmix_list_t procs;
-    prte_event_t stdinsig;
+    /* set when we have told PMIx to stop the processes feeding us stdin
+     * because one of OUR OWN local procs' stdin sinks passed
+     * PRTE_IOF_MAX_INPUT_BUFFERS. This is the HNP's counterpart to
+     * prte_mca_iof_prted_component.xoff - a daemon tells us over the RML,
+     * but we have no one above us to tell, so we tell PMIx directly. It
+     * latches so the XON is sent exactly once, when the sink drains */
+    bool xoff;
 };
 typedef struct prte_mca_iof_hnp_component_t prte_mca_iof_hnp_component_t;
 
@@ -74,14 +80,20 @@ extern prte_iof_base_module_t prte_iof_hnp_module;
 void prte_iof_hnp_recv(int status, pmix_proc_t *sender, pmix_data_buffer_t *buffer,
                        prte_rml_tag_t tag, void *cbdata);
 
+void prte_iof_hnp_stdin_recv(int status, pmix_proc_t *sender, pmix_data_buffer_t *buffer,
+                             prte_rml_tag_t tag, void *cbdata);
+
 void prte_iof_hnp_read_local_handler(int fd, short event, void *cbdata);
-void prte_iof_hnp_stdin_cb(int fd, short event, void *cbdata);
-bool prte_iof_hnp_stdin_check(int fd);
 
 int prte_iof_hnp_send_data_to_endpoint(const pmix_proc_t *host,
                                        const pmix_proc_t *target,
                                        prte_iof_tag_t tag,
                                        unsigned char *data, int numbytes);
+
+void prte_iof_hnp_relay_to_tool(const pmix_proc_t *source,
+                                prte_iof_tag_t stream,
+                                unsigned char *data, int numbytes,
+                                pmix_rank_t already_delivered);
 
 END_C_DECLS
 

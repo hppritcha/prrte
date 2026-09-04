@@ -5,7 +5,7 @@
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2020      IBM Corporation.  All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -33,18 +33,16 @@
 #include "src/util/pmix_argv.h"
 
 #include "src/mca/errmgr/errmgr.h"
-#include "src/mca/grpcomm/grpcomm.h"
 #include "src/mca/iof/base/base.h"
 #include "src/mca/plm/plm.h"
-#include "src/mca/rmaps/rmaps_types.h"
+#include "src/mca/rmaps/base/base.h"
 #include "src/rml/rml.h"
 #include "src/prted/pmix/pmix_server_internal.h"
 #include "src/runtime/data_server/prte_data_server.h"
 #include "src/runtime/prte_globals.h"
-#include "src/runtime/prte_wait.h"
 #include "src/threads/pmix_threads.h"
-#include "src/util/session_dir.h"
-#include "src/util/pmix_show_help.h"
+#include "src/util/name_fns.h"
+#include "src/util/prte_show_help.h"
 
 #include "src/mca/state/base/base.h"
 
@@ -53,6 +51,15 @@ void prte_state_base_activate_job_state(prte_job_t *jdata, prte_job_state_t stat
     pmix_list_item_t *itm, *any = NULL, *error = NULL;
     prte_state_t *s;
     prte_state_caddy_t *caddy;
+
+    /* The state log records the moment a transition was ORDERED, which is
+     * here - the dispatch below only queues the handler.  It is deliberately
+     * ahead of everything else, so that a state nothing is registered for
+     * still appears in the record: that a transition was ordered and then
+     * dropped is exactly what the log exists to show. */
+    if (prte_state_base.log_jobstate) {
+        prte_state_base_log_job(jdata, state);
+    }
 
     for (itm = pmix_list_get_first(&prte_job_states); itm != pmix_list_get_end(&prte_job_states);
          itm = pmix_list_get_next(itm)) {
@@ -75,9 +82,12 @@ void prte_state_base_activate_job_state(prte_job_t *jdata, prte_job_state_t stat
                 return;
             }
             caddy = PMIX_NEW(prte_state_caddy_t);
+            /* the state is always recorded, even when no job accompanies it -
+             * handlers reached via the ERROR/ANY fallback read it to decide
+             * what happened */
+            caddy->job_state = state;
             if (NULL != jdata) {
                 caddy->jdata = jdata;
-                caddy->job_state = state;
                 PMIX_RETAIN(jdata);
             }
             PRTE_PMIX_THREADSHIFT(caddy, prte_event_base, s->cbfunc);
@@ -103,9 +113,11 @@ void prte_state_base_activate_job_state(prte_job_t *jdata, prte_job_state_t stat
         return;
     }
     caddy = PMIX_NEW(prte_state_caddy_t);
+    /* record the state that actually fired, not the fallback we matched -
+     * this is the only way the ERROR/ANY handler can tell what happened */
+    caddy->job_state = state;
     if (NULL != jdata) {
         caddy->jdata = jdata;
-        caddy->job_state = state;
         PMIX_RETAIN(jdata);
     }
     PRTE_REACHING_JOB_STATE(jdata, state);
@@ -193,6 +205,20 @@ void prte_state_base_activate_proc_state(pmix_proc_t *proc, prte_proc_state_t st
     pmix_list_item_t *itm, *any = NULL, *error = NULL;
     prte_state_t *s;
     prte_state_caddy_t *caddy;
+
+    /* as above: log the order, not the dispatch */
+    if (prte_state_base.log_procstate) {
+        prte_state_base_log_proc(proc, state);
+    }
+
+    /* the proc machine is keyed entirely on the name - there is nothing
+     * to dispatch without one */
+    if (NULL == proc) {
+        PMIX_OUTPUT_VERBOSE((1, prte_state_base_framework.framework_output,
+                             "ACTIVATE: NULL PROC FOR STATE %s",
+                             prte_proc_state_to_str(state)));
+        return;
+    }
 
     for (itm = pmix_list_get_first(&prte_proc_states); itm != pmix_list_get_end(&prte_proc_states);
          itm = pmix_list_get_next(itm)) {
@@ -318,9 +344,16 @@ void prte_state_base_print_proc_state_machine(void)
 void prte_state_base_local_launch_complete(int fd, short argc, void *cbdata)
 {
     prte_state_caddy_t *state = (prte_state_caddy_t *) cbdata;
-    prte_job_t *jdata = state->jdata;
+    prte_job_t *jdata;
     bool found = false;
     PRTE_HIDE_UNUSED_PARAMS(fd, argc);
+
+    PMIX_ACQUIRE_OBJECT(state);
+    jdata = state->jdata;
+    if (NULL == jdata) {
+        PMIX_RELEASE(state);
+        return;
+    }
 
     found = prte_get_attribute(&jdata->attributes, PRTE_JOB_SHOW_PROGRESS, NULL, PMIX_BOOL);
     if (found) {
@@ -332,26 +365,6 @@ void prte_state_base_local_launch_complete(int fd, short argc, void *cbdata)
     PMIX_RELEASE(state);
 }
 
-void prte_state_base_cleanup_job(int fd, short argc, void *cbdata)
-{
-    prte_state_caddy_t *caddy = (prte_state_caddy_t *) cbdata;
-    prte_job_t *jdata;
-    PRTE_HIDE_UNUSED_PARAMS(fd, argc);
-
-    PMIX_ACQUIRE_OBJECT(caddy);
-    jdata = caddy->jdata;
-
-    PMIX_OUTPUT_VERBOSE((2, prte_state_base_framework.framework_output,
-                         "%s state:base:cleanup on job %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                         (NULL == jdata) ? "NULL" : PRTE_JOBID_PRINT(jdata->nspace)));
-
-    /* flag that we were notified */
-    jdata->state = PRTE_JOB_STATE_NOTIFIED;
-    /* send us back thru job complete */
-    PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_TERMINATED);
-    PMIX_RELEASE(caddy);
-}
-
 void prte_state_base_report_progress(int fd, short argc, void *cbdata)
 {
     prte_state_caddy_t *caddy = (prte_state_caddy_t *) cbdata;
@@ -360,6 +373,10 @@ void prte_state_base_report_progress(int fd, short argc, void *cbdata)
 
     PMIX_ACQUIRE_OBJECT(caddy);
     jdata = caddy->jdata;
+    if (NULL == jdata) {
+        PMIX_RELEASE(caddy);
+        return;
+    }
 
     pmix_output(prte_clean_output,
                 "App launch reported: %d (out of %d) daemons - %d (out of %d) procs",
@@ -368,16 +385,28 @@ void prte_state_base_report_progress(int fd, short argc, void *cbdata)
     PMIX_RELEASE(caddy);
 }
 
-void prte_state_base_notify_data_server(pmix_proc_t *target)
+/* Tell an EXTERNAL data server - one living in another DVM - that a
+ * lifetime has ended, so it can drop the published data that was not to
+ * outlive it.
+ *
+ * Our own store needs no message: prte_data_server_purge_local() is a call,
+ * and the store that has to act is always one this process already holds.
+ * The far end is the exception, because it is reached over a PMIx tool
+ * connection that only the master holds.
+ *
+ * The lifetime that ended is named in the message, and the two horizons
+ * that a pmix_proc_t cannot express on its own carry a qualifier beside it:
+ * which application, or which session.  Without the horizon the server
+ * cannot tell this from an explicit "remove everything I published" and
+ * would take data the publisher asked to keep. */
+static void send_purge(pmix_rank_t dest, prte_rml_tag_t tag, pmix_proc_t *target,
+                       pmix_persistence_t persist, uint32_t qualifier)
 {
     pmix_data_buffer_t *buf;
+    pmix_info_t directives[2];
     int rc, room = -1;
     uint8_t cmd = PRTE_PMIX_PURGE_PROC_CMD;
-
-    /* if nobody local to us published anything, then we can ignore this */
-    if (PMIX_NSPACE_INVALID(prte_pmix_server_globals.server.nspace)) {
-        return;
-    }
+    size_t n, ninfo;
 
     PMIX_DATA_BUFFER_CREATE(buf);
 
@@ -405,19 +434,221 @@ void prte_state_base_notify_data_server(pmix_proc_t *target)
         return;
     }
 
-    /* send the request to the server */
-    PRTE_RML_SEND(rc, prte_pmix_server_globals.server.rank,
-                  buf, PRTE_RML_TAG_DATA_SERVER);
+    /* the lifetime that just ended, and what it needs to say beyond a
+     * process name */
+    ninfo = 1;
+    PMIX_INFO_LOAD(&directives[0], PMIX_PERSISTENCE, &persist, PMIX_PERSIST);
+    if (PMIX_PERSIST_APP == persist) {
+        PMIX_INFO_LOAD(&directives[1], PRTE_PURGE_APP_IDX, &qualifier, PMIX_UINT32);
+        ninfo = 2;
+    } else if (PMIX_PERSIST_SESSION == persist) {
+        PMIX_INFO_LOAD(&directives[1], PMIX_SESSION_ID, &qualifier, PMIX_UINT32);
+        ninfo = 2;
+    }
+    rc = PMIx_Data_pack(NULL, buf, &ninfo, 1, PMIX_SIZE);
+    if (PMIX_SUCCESS == rc) {
+        rc = PMIx_Data_pack(NULL, buf, directives, (int32_t) ninfo, PMIX_INFO);
+    }
+    for (n = 0; n < ninfo; n++) {
+        PMIX_INFO_DESTRUCT(&directives[n]);
+    }
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        PMIX_DATA_BUFFER_RELEASE(buf);
+        return;
+    }
+
+    PRTE_RML_RELIABLE_SEND(rc, dest, buf, tag);
     if (PRTE_SUCCESS != rc) {
         PMIX_DATA_BUFFER_RELEASE(buf);
     }
 }
 
-static void opcbfunc(pmix_status_t status, void *cbdata)
+/* A lifetime ended: tell every store that has to act on it.
+ *
+ * There are two, and between them they already know everything these rules
+ * need.  A daemon's store holds only the PMIX_RANGE_LOCAL items its own
+ * local clients published, and the daemon reaps those clients itself; the
+ * master's store holds everything else, and the master tracks every
+ * process, application, namespace and session in the DVM.  So each store is
+ * purged by the process that owns it, with a call rather than a message -
+ * which is what makes the PROC horizon affordable, since that one fires
+ * once per terminating process.
+ *
+ * The one thing that does need a message is an EXTERNAL data server, which
+ * lives in another DVM and is reachable only over the PMIx tool connection
+ * the master holds.  A daemon never relays: its own store is local-range
+ * data, which never leaves this DVM.
+ */
+static void purge_data(pmix_proc_t *target, pmix_persistence_t horizon,
+                       uint32_t qualifier)
 {
-    prte_pmix_lock_t *lock = (prte_pmix_lock_t *) cbdata;
-    PRTE_HIDE_UNUSED_PARAMS(status);
-    PRTE_PMIX_WAKEUP_THREAD(lock);
+    prte_data_server_purge_local(target, horizon, qualifier);
+
+    if (NULL != prte_data_server_uri && PRTE_PROC_IS_MASTER) {
+        send_purge(PRTE_PROC_MY_HNP->rank, PRTE_RML_TAG_DATA_SERVER, target,
+                   horizon, qualifier);
+    }
+}
+
+void prte_state_base_purge_proc(pmix_proc_t *proc)
+{
+    purge_data(proc, PMIX_PERSIST_PROC, UINT32_MAX);
+}
+
+void prte_state_base_purge_app(prte_job_t *jdata, prte_app_idx_t idx)
+{
+    pmix_proc_t target;
+
+    /* an application is not a process, and it is not a namespace either:
+     * every app of a job shares the job's namespace, so the target names
+     * them all and the index says which one ended */
+    PMIX_LOAD_PROCID(&target, jdata->nspace, PMIX_RANK_WILDCARD);
+    purge_data(&target, PMIX_PERSIST_APP, (uint32_t) idx);
+}
+
+void prte_state_base_purge_nspace(pmix_nspace_t nspace)
+{
+    pmix_proc_t target;
+
+    PMIX_LOAD_PROCID(&target, nspace, PMIX_RANK_WILDCARD);
+    purge_data(&target, PMIX_PERSIST_NSPACE, UINT32_MAX);
+}
+
+void prte_state_base_purge_session(uint32_t session_id)
+{
+    pmix_proc_t target;
+
+    /* A session outlives the jobs that ran in it, and their job objects: by
+     * the time it ends there may be no namespace left to name.  So the
+     * target admits anybody - an empty namespace is a wildcard to
+     * PMIX_CHECK_PROCID - and the session id recorded on each item at
+     * publish is what selects. */
+    PMIX_LOAD_PROCID(&target, NULL, PMIX_RANK_WILDCARD);
+    purge_data(&target, PMIX_PERSIST_SESSION, session_id);
+}
+
+/* A proc reported a state and we hold no job object to account it against.
+ *
+ * Both track_procs implementations used to drop such a report with a bare
+ * "goto cleanup", and the silence is what turned a lost job object into a
+ * hang.  Every conclusion about a job is derived HERE, from the job object:
+ * the per-proc counting, the TERMINATED activation it rolls up into, and -
+ * on a one-shot DVM - the "is anything still alive?" scan that only ever
+ * runs when a job reaches TERMINATED.  With no job object none of that
+ * happens, so the DVM waits forever on a job it can no longer see, having
+ * said nothing about why.  (Seen when a spawned job's object was released
+ * one reference early: prterun never exited, and the only output was an
+ * odls "Not found" naming a file and a line.)
+ *
+ * The job itself cannot be recovered - it is gone.  What is still owed is a
+ * report saying so, and a conclusion: a runtime that has lost a job must
+ * stop waiting for it rather than hang.  Nothing here concludes while any
+ * local child is still running, so a straggler is not torn down under.
+ */
+void prte_state_base_orphaned_proc(pmix_proc_t *proc, prte_proc_state_t state)
+{
+    prte_proc_t *proct;
+    prte_job_t *jptr;
+    int i;
+
+    /* Only a report that the process is really gone matters.  The callers are
+     * also reached by the running states (RUNNING, REGISTERED, IOF_COMPLETE,
+     * ...), and those have nothing to account for - complaining about each of
+     * them would bury the one report that does.  Everything above
+     * PRTE_PROC_STATE_ERROR is a way of having died, and with the job gone
+     * none of them is recoverable, so they all count. */
+    if (PRTE_PROC_STATE_WAITPID_FIRED != state &&
+        PRTE_PROC_STATE_TERMINATED != state &&
+        PRTE_PROC_STATE_ERROR >= state) {
+        return;
+    }
+
+    /* A teardown in progress releases job objects as it goes, so procs
+     * reported during one are expected to find no job and there is nothing
+     * left to conclude - the conclusion has already been reached. */
+    if (prte_finalizing || prte_abnormal_term_ordered) {
+        return;
+    }
+
+    prte_show_help("help-state-base.txt", "orphaned-proc", true,
+                   PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(proc));
+
+    /* Retire the proc ourselves.  Clearing PRTE_PROC_FLAG_ALIVE and dropping
+     * the PMIx client are done by the accounted TERMINATED path below, which
+     * reaches the proc THROUGH the job object - so with no job object the
+     * proc stays marked alive forever, and every "is anything still running?"
+     * test in the runtime (including the one right below) answers yes.  The
+     * proc object itself is still perfectly good; only the job that owned it
+     * is gone, and prte_local_children holds the daemon's own reference. */
+    for (i = 0; i < prte_local_children->size; i++) {
+        proct = (prte_proc_t *) pmix_pointer_array_get_item(prte_local_children, i);
+        if (NULL == proct || !PMIX_CHECK_PROCID(&proct->name, proc)) {
+            continue;
+        }
+        if (PRTE_FLAG_TEST(proct, PRTE_PROC_FLAG_ALIVE)) {
+            PRTE_FLAG_UNSET(proct, PRTE_PROC_FLAG_ALIVE);
+            PMIx_server_deregister_client(proc, NULL, NULL);
+        }
+        if (proct->state < PRTE_PROC_STATE_TERMINATED) {
+            proct->state = PRTE_PROC_STATE_TERMINATED;
+        }
+        break;
+    }
+
+    /* nothing concludes while a local child is still running - this is the
+     * same guard the accounted termination paths apply before exiting */
+    for (i = 0; i < prte_local_children->size; i++) {
+        proct = (prte_proc_t *) pmix_pointer_array_get_item(prte_local_children, i);
+        if (NULL != proct && PRTE_FLAG_TEST(proct, PRTE_PROC_FLAG_ALIVE)) {
+            pmix_output_verbose(5, prte_state_base_framework.framework_output,
+                                "%s state:base orphaned proc %s, but %s is still alive",
+                                PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(proc),
+                                PRTE_NAME_PRINT(&proct->name));
+            return;
+        }
+    }
+
+    if (!PRTE_PROC_IS_MASTER) {
+        /* a daemon concludes only when it has been told to go and its routes
+         * are gone - the identical condition its accounted path checks */
+        if (prte_prteds_term_ordered && 0 == prte_rml_base.n_children) {
+            pmix_output_verbose(5, prte_state_base_framework.framework_output,
+                                "%s state:base orphaned proc, all routes and children gone"
+                                " - exiting",
+                                PRTE_NAME_PRINT(PRTE_PROC_MY_NAME));
+            PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_DAEMONS_TERMINATED);
+        }
+        return;
+    }
+
+    /* On the master: a persistent DVM outlives its jobs and must stay up
+     * whatever it has lost - a later job is still perfectly launchable.  A
+     * one-shot DVM exists only to run these jobs, so once none of the ones
+     * it CAN still see is running, it has to end.  prte_prteds_term_ordered
+     * says the teardown is already under way (terminate_orteds sets it), so
+     * this stays a one-shot however many orphans arrive. */
+    if (prte_persistent || prte_prteds_term_ordered) {
+        return;
+    }
+    for (i = 0; i < prte_job_data->size; i++) {
+        jptr = (prte_job_t *) pmix_pointer_array_get_item(prte_job_data, i);
+        if (NULL == jptr ||
+            PMIX_CHECK_NSPACE(jptr->nspace, PRTE_PROC_MY_NAME->nspace)) {
+            continue;
+        }
+        if (jptr->state < PRTE_JOB_STATE_TERMINATED) {
+            /* something we can still account for is running */
+            return;
+        }
+    }
+
+    pmix_output_verbose(5, prte_state_base_framework.framework_output,
+                        "%s state:base orphaned proc and no job left running - terminating",
+                        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME));
+    /* the run did not do what was asked of it - do not report success */
+    PRTE_UPDATE_EXIT_STATUS(1);
+    prte_plm.terminate_orteds();
 }
 
 void prte_state_base_track_procs(int fd, short argc, void *cbdata)
@@ -427,8 +658,8 @@ void prte_state_base_track_procs(int fd, short argc, void *cbdata)
     prte_proc_state_t state;
     prte_job_t *jdata;
     prte_proc_t *pdata;
+    prte_app_context_t *app;
     int i;
-    pmix_proc_t target;
     pmix_rank_t threshold;
     PRTE_HIDE_UNUSED_PARAMS(fd, argc);
 
@@ -443,6 +674,7 @@ void prte_state_base_track_procs(int fd, short argc, void *cbdata)
 
     /* get the job object for this proc */
     if (NULL == (jdata = prte_get_job_data_object(proc->nspace))) {
+        prte_state_base_orphaned_proc(proc, state);
         goto cleanup;
     }
     if (PRTE_PROC_STATE_READY_FOR_DEBUG == state) {
@@ -521,13 +753,44 @@ void prte_state_base_track_procs(int fd, short argc, void *cbdata)
             PRTE_ACTIVATE_PROC_STATE(proc, PRTE_PROC_STATE_TERMINATED);
         }
     } else if (PRTE_PROC_STATE_TERMINATED == state) {
-        if (pdata->state == state) {
+        /* Have we already counted this proc?  Ask the flag, not the state
+         * word.  Testing "pdata->state == state" looks equivalent and is not,
+         * for exactly the procs this matters most for: every failure state is
+         * PRTE_PROC_STATE_ERROR (50) + n, i.e. GREATER than
+         * PRTE_PROC_STATE_TERMINATED (20), so the assignment below - guarded
+         * by "< TERMINATED" so a terminal diagnosis is never overwritten by
+         * the generic one - deliberately leaves such a proc's state above
+         * TERMINATED.  The comparison therefore never matches for a proc that
+         * failed, and every repeat activation counted it again.
+         *
+         * A repeat is not hypothetical on the HNP: for a *remote* failed proc
+         * errmgr/dvm force-marks WAITPID_FIRED and IOF_COMPLETE ("we won't
+         * hear anything more about it"), and its daemon then relays the real
+         * pair as well - two completions, two counts, for one proc.
+         * num_terminated then reaches num_procs while a survivor is still
+         * running, the job is declared NORMALLY TERMINATED, and the DVM is
+         * torn down under that survivor: its final output is discarded and it
+         * never terminates properly.  Seen as an intermittently missing last
+         * line from a random rank whenever a job had a failure in it.
+         *
+         * state/prted has always used the flag here; this is the same test. */
+        if (PRTE_FLAG_TEST(pdata, PRTE_PROC_FLAG_RECORDED)) {
             pmix_output_verbose(5, prte_state_base_framework.framework_output,
-                                "%s state:base:track_procs proc %s already in state %s. Skip transition.",
+                                "%s state:base:track_procs proc %s already recorded as %s. Skip transition.",
                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(proc),
                                 prte_proc_state_to_str(state));
             goto cleanup;
         }
+        PRTE_FLAG_SET(pdata, PRTE_PROC_FLAG_RECORDED);
+
+        /* If this proc was connected to others, they are owed an event: the
+         * PMIx definition of "connected" is that a member which departs
+         * without first calling PMIx_Disconnect is a reportable event for
+         * the rest of the assemblage.  This is the one place that sees every
+         * proc in the DVM stop, whether it exited, failed, or was on a node
+         * whose daemon died, and the RECORDED flag just set above is what
+         * makes it exactly once per proc. */
+        prte_pmix_server_connection_terminated(pdata);
 
         /* update the proc state */
         PRTE_FLAG_UNSET(pdata, PRTE_PROC_FLAG_ALIVE);
@@ -541,7 +804,7 @@ void prte_state_base_track_procs(int fd, short argc, void *cbdata)
          * gone, then terminate ourselves IF no local procs
          * remain (might be some from another job)
          */
-        if (prte_prteds_term_ordered && 0 == pmix_list_get_size(&prte_rml_base.children)) {
+        if (prte_prteds_term_ordered && 0 == prte_rml_base.n_children) {
             for (i = 0; i < prte_local_children->size; i++) {
                 pdata = (prte_proc_t *) pmix_pointer_array_get_item(prte_local_children, i);
                 if (NULL != pdata &&
@@ -557,6 +820,29 @@ void prte_state_base_track_procs(int fd, short argc, void *cbdata)
             PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_DAEMONS_TERMINATED);
             goto cleanup;
         }
+        /* This proc's own published data goes now.  A call, not a message:
+         * the store is this process's own, and a store nothing was ever
+         * published into answers immediately - which is what makes a purge
+         * per terminating process affordable. */
+        prte_state_base_purge_proc(proc);
+
+        /* ...and if that was the last process of its APPLICATION, so does
+         * what the application published.  An app is not a job: an MPMD
+         * job's apps share the one namespace assigned to the job and need
+         * not end together, so this is the only place the app horizon can
+         * be seen at all.  (MPI hides that by requiring its apps to
+         * terminate together, which is an MPI rule and not a general one.) */
+        app = (prte_app_context_t *) pmix_pointer_array_get_item(jdata->apps,
+                                                                 pdata->app_idx);
+        if (NULL != app) {
+            app->num_terminated++;
+            if (app->num_terminated == app->num_procs &&
+                PRTE_APP_STATE_COMPLETED != app->state) {
+                app->state = PRTE_APP_STATE_COMPLETED;
+                prte_state_base_purge_app(jdata, pdata->app_idx);
+            }
+        }
+
         /* track job status */
         jdata->num_terminated++;
         if (jdata->num_terminated == jdata->num_procs) {
@@ -564,303 +850,18 @@ void prte_state_base_track_procs(int fd, short argc, void *cbdata)
             if (prte_state_base.run_fdcheck) {
                 prte_state_base_check_fds(jdata);
             }
-            /* if ompi-server is around, then notify it to purge
-             * any session-related info */
-            if (NULL != prte_data_server_uri) {
-                PMIX_LOAD_PROCID(&target, jdata->nspace, PMIX_RANK_WILDCARD);
-                prte_state_base_notify_data_server(&target);
-            }
+            /* tell the data server the namespace is over, so it can drop
+             * what this job published that was not to outlive it.  This
+             * used to be done only when an external data server was
+             * configured, which left the built-in one - the usual case -
+             * never told a job had ended, so nothing was ever reclaimed
+             * from it short of the DVM shutting down */
+            prte_state_base_purge_nspace(jdata->nspace);
             PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_TERMINATED);
         }
     }
 
 cleanup:
-    PMIX_RELEASE(caddy);
-}
-
-void prte_state_base_check_all_complete(int fd, short args, void *cbdata)
-{
-    prte_state_caddy_t *caddy = (prte_state_caddy_t *) cbdata;
-    prte_job_t *jdata;
-    prte_proc_t *proc;
-    int i;
-    int32_t j;
-    prte_job_t *job;
-    prte_node_t *node;
-    prte_job_map_t *map;
-    int32_t index;
-    bool one_still_alive, flag;
-    pmix_rank_t lowest = 0;
-    int32_t i32, *i32ptr;
-    prte_pmix_lock_t lock;
-    prte_app_context_t *app;
-    prte_pmix_server_pset_t *pst, *pst2;
-    PRTE_HIDE_UNUSED_PARAMS(fd, args);
-
-    PMIX_ACQUIRE_OBJECT(caddy);
-    jdata = caddy->jdata;
-
-    pmix_output_verbose(2, prte_state_base_framework.framework_output,
-                        "%s state:base:check_job_complete on job %s",
-                        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                        (NULL == jdata) ? "NULL" : PRTE_JOBID_PRINT(jdata->nspace));
-
-    if (NULL == jdata || PMIX_CHECK_NSPACE(jdata->nspace, PRTE_PROC_MY_NAME->nspace)) {
-        /* just check to see if the daemons are complete */
-        PMIX_OUTPUT_VERBOSE(
-            (2, prte_state_base_framework.framework_output,
-             "%s state:base:check_job_complete - received NULL job, checking daemons",
-             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
-        goto CHECK_DAEMONS;
-    } else {
-        /* mark the job as terminated, but don't override any
-         * abnormal termination flags
-         */
-        if (jdata->state < PRTE_JOB_STATE_UNTERMINATED) {
-            jdata->state = PRTE_JOB_STATE_TERMINATED;
-        }
-    }
-
-    /* tell the IOF that the job is complete */
-    if (NULL != prte_iof.complete) {
-        prte_iof.complete(jdata);
-    }
-
-    /* tell the PMIx server to release its data */
-    PRTE_PMIX_CONSTRUCT_LOCK(&lock);
-    PMIx_server_deregister_nspace(jdata->nspace, opcbfunc, &lock);
-    PRTE_PMIX_WAIT_THREAD(&lock);
-    PRTE_PMIX_DESTRUCT_LOCK(&lock);
-
-    i32ptr = &i32;
-    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_NUM_NONZERO_EXIT, (void **) &i32ptr, PMIX_INT32)) {
-        flag = prte_get_attribute(&jdata->attributes, PRTE_JOB_ERROR_NONZERO_EXIT, NULL, PMIX_BOOL);
-        if (flag) {
-            if (!prte_report_child_jobs_separately || 1 == PRTE_LOCAL_JOBID(jdata->nspace)) {
-                /* update the exit code */
-                PRTE_UPDATE_EXIT_STATUS(lowest);
-            }
-
-            /* warn user */
-            pmix_show_help("help-state-base.txt", "normal-termination-but", true,
-                           (1 == PRTE_LOCAL_JOBID(jdata->nspace)) ? "the primary" : "child",
-                           (1 == PRTE_LOCAL_JOBID(jdata->nspace))
-                               ? ""
-                               : PRTE_LOCAL_JOBID_PRINT(jdata->nspace),
-                           i32,
-                           (1 == i32) ? "process returned\na non-zero exit code."
-                                      : "processes returned\nnon-zero exit codes.");
-        }
-    }
-
-    PMIX_OUTPUT_VERBOSE((2, prte_state_base_framework.framework_output,
-                         "%s state:base:check_job_completed declared job %s terminated with state "
-                         "%s - checking all jobs",
-                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_JOBID_PRINT(jdata->nspace),
-                         prte_job_state_to_str(jdata->state)));
-
-    /* if this job is a continuously operating one or recoverable, then don't do
-     * anything further - just return here
-     */
-    if (NULL != jdata &&
-        (prte_get_attribute(&jdata->attributes, PRTE_JOB_CONTINUOUS, NULL, PMIX_BOOL) ||
-         prte_get_attribute(&jdata->attributes, PRTE_JOB_RECOVERABLE, NULL, PMIX_BOOL))) {
-        goto CHECK_ALIVE;
-    }
-
-    /* if the job that is being checked is the HNP, then we are
-     * trying to terminate the orteds. In that situation, we
-     * do -not- check all jobs - we simply notify the HNP
-     * that the orteds are complete. Also check special case
-     * if jdata is NULL - we want
-     * to definitely declare the job done if the orteds
-     * have completed, no matter what else may be happening.
-     * This can happen if a ctrl-c hits in the "wrong" place
-     * while launching
-     */
-CHECK_DAEMONS:
-    if (jdata == NULL || PMIX_CHECK_NSPACE(jdata->nspace, PRTE_PROC_MY_NAME->nspace)) {
-        if (0 == pmix_list_get_size(&prte_rml_base.children)) {
-            /* orteds are done! */
-            PMIX_OUTPUT_VERBOSE((2, prte_state_base_framework.framework_output,
-                                 "%s orteds complete - exiting",
-                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
-            if (NULL == jdata) {
-                jdata = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
-            }
-            PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_DAEMONS_TERMINATED);
-            PMIX_RELEASE(caddy);
-            return;
-        }
-        PMIX_RELEASE(caddy);
-        return;
-    }
-
-    /* Release the resources used by this job. Since some errmgrs may want
-     * to continue using resources allocated to the job as part of their
-     * fault recovery procedure, we only do this once the job is "complete".
-     * Note that an aborted/killed job -is- flagged as complete and will
-     * therefore have its resources released. We need to do this after
-     * we call the errmgr so that any attempt to restart the job will
-     * avoid doing so in the exact same place as the current job
-     */
-    if (NULL != jdata->map && jdata->state == PRTE_JOB_STATE_TERMINATED) {
-        map = jdata->map;
-        for (index = 0; index < map->nodes->size; index++) {
-            node = (prte_node_t *) pmix_pointer_array_get_item(map->nodes, index);
-            if (NULL == node) {
-                continue;
-            }
-            PMIX_OUTPUT_VERBOSE((2, prte_state_base_framework.framework_output,
-                                 "%s releasing procs for job %s from node %s",
-                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                                 PRTE_JOBID_PRINT(jdata->nspace), node->name));
-            for (i = 0; i < node->procs->size; i++) {
-                proc = (prte_proc_t *) pmix_pointer_array_get_item(node->procs, i);
-                if (NULL == proc) {
-                    continue;
-                }
-                app = (prte_app_context_t*) pmix_pointer_array_get_item(jdata->apps, proc->app_idx);
-                if (!PMIX_CHECK_NSPACE(proc->name.nspace, jdata->nspace)) {
-                    /* skip procs from another job */
-                    continue;
-                }
-                if (!PRTE_FLAG_TEST(app, PRTE_APP_FLAG_TOOL) &&
-                    !PRTE_FLAG_TEST(jdata, PRTE_JOB_FLAG_TOOL)) {
-                    node->slots_inuse--;
-                    node->num_procs--;
-                }
-                PMIX_OUTPUT_VERBOSE((2, prte_state_base_framework.framework_output,
-                                     "%s releasing proc %s from node %s",
-                                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                                     PRTE_NAME_PRINT(&proc->name), node->name));
-                /* set the entry in the node array to NULL */
-                pmix_pointer_array_set_item(node->procs, i, NULL);
-                /* release the proc once for the map entry */
-                PMIX_RELEASE(proc);
-            }
-            /* set the node location to NULL */
-            pmix_pointer_array_set_item(map->nodes, index, NULL);
-            /* maintain accounting */
-            PMIX_RELEASE(node);
-        }
-        PMIX_RELEASE(map);
-        jdata->map = NULL;
-    }
-    // if this job has apps that named a pset, then remove them
-    PMIX_LIST_FOREACH_SAFE(pst, pst2, &prte_pmix_server_globals.psets, prte_pmix_server_pset_t) {
-        if (pst->jdata == jdata) {
-            pmix_list_remove_item(&prte_pmix_server_globals.psets, &pst->super);
-            PMIX_RELEASE(pst);
-        }
-    }
-
-CHECK_ALIVE:
-    /* now check to see if all jobs are done - trigger notification of this jdata
-     * object when we find it
-     */
-    one_still_alive = false;
-    for (j = 0; j < prte_job_data->size; j++) {
-        job = (prte_job_t *) pmix_pointer_array_get_item(prte_job_data, j);
-        if (NULL == job) {
-            continue;
-        }
-        /* skip the daemon job */
-        if (PMIX_CHECK_NSPACE(job->nspace, PRTE_PROC_MY_NAME->nspace)) {
-            continue;
-        }
-        /* if this is the job we are checking AND it normally terminated,
-         * then activate the "notify_completed" state - this will release
-         * the job state, but is provided so that the HNP main code can
-         * take alternative actions if desired. If the state is killed_by_cmd,
-         * then go ahead and release it. We cannot release it if it
-         * abnormally terminated as mpirun needs the info so it can
-         * report appropriately to the user
-         *
-         * NOTE: do not release the primary job (j=1) so we
-         * can pretty-print completion message
-         */
-        if (NULL != jdata && PMIX_CHECK_NSPACE(job->nspace, jdata->nspace)) {
-            if (jdata->state == PRTE_JOB_STATE_TERMINATED) {
-                PMIX_OUTPUT_VERBOSE(
-                    (2, prte_state_base_framework.framework_output,
-                     "%s state:base:check_job_completed state is terminated - activating notify",
-                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
-                PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_NOTIFY_COMPLETED);
-                one_still_alive = true;
-            } else if (jdata->state == PRTE_JOB_STATE_KILLED_BY_CMD
-                       || jdata->state == PRTE_JOB_STATE_NOTIFIED) {
-                PMIX_OUTPUT_VERBOSE(
-                    (2, prte_state_base_framework.framework_output,
-                     "%s state:base:check_job_completed state is killed or notified - cleaning up",
-                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
-                /* release this object, ensuring that the
-                 * pointer array internal accounting
-                 * is maintained!
-                 */
-                pmix_pointer_array_set_item(prte_job_data, j, NULL);
-                PMIX_RELEASE(jdata);
-            }
-            continue;
-        }
-        /* if the job is flagged to not be monitored, skip it */
-        if (PRTE_FLAG_TEST(job, PRTE_JOB_FLAG_DO_NOT_MONITOR)) {
-            continue;
-        }
-        /* when checking for job termination, we must be sure to NOT check
-         * our own job as it - rather obviously - has NOT terminated!
-         */
-        if (PRTE_JOB_STATE_NOTIFIED != job->state) {
-            /* we have at least one job that is not done yet - we cannot
-             * just return, though, as we need to ensure we cleanout the
-             * job data for the job that just completed
-             */
-            PMIX_OUTPUT_VERBOSE(
-                (2, prte_state_base_framework.framework_output,
-                 "%s state:base:check_job_completed job %s is not terminated (%d:%d)",
-                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_JOBID_PRINT(job->nspace),
-                 job->num_terminated, job->num_procs));
-            one_still_alive = true;
-        } else {
-            PMIX_OUTPUT_VERBOSE(
-                (2, prte_state_base_framework.framework_output,
-                 "%s state:base:check_job_completed job %s is terminated (%d vs %d [%s])",
-                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_JOBID_PRINT(job->nspace),
-                 job->num_terminated, job->num_procs,
-                 (NULL == jdata) ? "UNKNOWN" : prte_job_state_to_str(jdata->state)));
-        }
-    }
-
-    /* if a job is still alive, we just return */
-    if (one_still_alive) {
-        PMIX_OUTPUT_VERBOSE((2, prte_state_base_framework.framework_output,
-                             "%s state:base:check_job_completed at least one job is not terminated",
-                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
-        PMIX_RELEASE(caddy);
-        return;
-    }
-    /* if we get here, then all jobs are done, so terminate */
-    PMIX_OUTPUT_VERBOSE((2, prte_state_base_framework.framework_output,
-                         "%s state:base:check_job_completed all jobs terminated",
-                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
-
-    /* stop the job timeout event, if set */
-    if (NULL != prte_mpiexec_timeout) {
-        PMIX_RELEASE(prte_mpiexec_timeout);
-        prte_mpiexec_timeout = NULL;
-    }
-
-    /* set the exit status to 0 - this will only happen if it
-     * wasn't already set by an error condition
-     */
-    PRTE_UPDATE_EXIT_STATUS(0);
-
-    /* order daemon termination - this tells us to cleanup
-     * our local procs as well as telling remote daemons
-     * to die
-     */
-    prte_plm.terminate_orteds();
-
     PMIX_RELEASE(caddy);
 }
 
@@ -889,10 +890,11 @@ void prte_state_base_check_fds(prte_job_t *jdata)
             /* no open fd in that slot */
             continue;
         }
-        snprintf(path, 1024, "/proc/self/fd/%d", i);
-        memset(info, 0, 256);
-        /* read the info about this fd */
-        rc = readlink(path, info, 256);
+        snprintf(path, sizeof(path), "/proc/self/fd/%d", i);
+        memset(info, 0, sizeof(info));
+        /* read the info about this fd.  readlink() does not NUL-terminate,
+         * so leave room for the terminator the memset above supplied */
+        rc = readlink(path, info, sizeof(info) - 1);
         if (-1 == rc) {
             /* this fd is unavailable */
             continue;
@@ -909,13 +911,13 @@ void prte_state_base_check_fds(prte_job_t *jdata)
         }
         /* construct the list of capabilities */
         if (fdflags & FD_CLOEXEC) {
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&list, "cloexec");
+            PMIx_Argv_append_nosize(&list, "cloexec");
         }
         if (flflags & O_APPEND) {
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&list, "append");
+            PMIx_Argv_append_nosize(&list, "append");
         }
         if (flflags & O_NONBLOCK) {
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&list, "nonblock");
+            PMIx_Argv_append_nosize(&list, "nonblock");
         }
         /* from the man page:
          *  Unlike the other values that can be specified in flags,
@@ -924,22 +926,22 @@ void prte_state_base_check_fds(prte_job_t *jdata)
          * the low order two bits of flags, and defined respectively
          * as 0, 1, and 2. */
         if (O_RDONLY == (flflags & 3)) {
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&list, "rdonly");
+            PMIx_Argv_append_nosize(&list, "rdonly");
         } else if (O_WRONLY == (flflags & 3)) {
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&list, "wronly");
+            PMIx_Argv_append_nosize(&list, "wronly");
         } else {
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&list, "rdwr");
+            PMIx_Argv_append_nosize(&list, "rdwr");
         }
         if (flk && F_UNLCK != fl.l_type) {
             if (F_WRLCK == fl.l_type) {
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&list, "wrlock");
+                PMIx_Argv_append_nosize(&list, "wrlock");
             } else {
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&list, "rdlock");
+                PMIx_Argv_append_nosize(&list, "rdlock");
             }
         }
         if (NULL != list) {
-            status = PMIX_ARGV_JOIN_COMPAT(list, ' ');
-            PMIX_ARGV_FREE_COMPAT(list);
+            status = PMIx_Argv_join(list, ' ');
+            PMIx_Argv_free(list);
             list = NULL;
             if (NULL == result) {
                 pmix_asprintf(&result, "    %d\t(%s)\t%s\n", i, info, status);
@@ -952,9 +954,145 @@ void prte_state_base_check_fds(prte_job_t *jdata)
         }
         ++cnt;
     }
+    /* on a platform with no /proc (e.g. macOS) every readlink above fails and
+     * result is still NULL - do not hand that to a "%s" conversion */
     pmix_asprintf(&r2, "%s: %d open file descriptors after job %d completed\n%s",
-                  PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), cnt, PRTE_LOCAL_JOBID(jdata->nspace), result);
+                  PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), cnt, PRTE_LOCAL_JOBID(jdata->nspace),
+                  (NULL == result) ? "" : result);
     pmix_output(0, "%s", r2);
-    free(result);
+    if (NULL != result) {
+        free(result);
+    }
     free(r2);
+}
+
+void prte_state_base_recover_resources(prte_job_t *jdata, prte_proc_t *pptr)
+{
+    prte_node_t *node, *nptr;
+    prte_job_map_t *map;
+    prte_proc_t *p;
+    int n, node_idx, proc_idx, rc;
+    bool takeall, empty;
+    hwloc_obj_t obj;
+    hwloc_obj_type_t type;
+    hwloc_cpuset_t boundcpus, tgt;
+
+    node = pptr->node;
+    map = jdata->map;
+
+    /* Find this proc in the node's proc array.  This routine can be entered
+     * more than once for the same proc - e.g. a daemon loss marks the proc
+     * PRTE_PROC_STATE_TERM_WO_SYNC and a subsequent job abort delivers a
+     * second terminal state - so it must be idempotent.  If the proc is no
+     * longer in the node array, its resources were already recovered on an
+     * earlier pass; recovering again would double-decrement the node counters
+     * and, worse, release the proc a second time (see the release below),
+     * freeing an object still held in jdata->procs and corrupting the eventual
+     * job teardown.  So treat an already-recovered proc as a no-op. */
+    proc_idx = INT_MAX;
+    for (n=0; n < node->procs->size; n++) {
+        p = (prte_proc_t*)pmix_pointer_array_get_item(node->procs, n);
+        if (NULL == p) {
+            continue;
+        }
+        if (p == pptr) {
+            proc_idx = n;
+            break;
+        }
+    }
+    if (INT_MAX == proc_idx) {
+        return;
+    }
+
+    // recover node resources
+    node->slots_inuse--;
+    node->num_procs--;
+
+    // find the node in the map
+    node_idx = INT_MAX;
+    for (n=0; n < jdata->map->nodes->size; n++) {
+        nptr = (prte_node_t*)pmix_pointer_array_get_item(jdata->map->nodes, n);
+        if (NULL == nptr) {
+            continue;
+        }
+        if (nptr == node) {
+            node_idx = n;
+        }
+    }
+
+    // determine how cpus were handled
+    takeall = false;
+    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_HWT_CPUS, NULL, PMIX_BOOL)) {
+        type = HWLOC_OBJ_PU;
+    } else {
+        type = HWLOC_OBJ_CORE;
+    }
+    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_PES_PER_PROC, NULL, PMIX_UINT16) ||
+        PRTE_MAPPING_BYUSER == PRTE_GET_MAPPING_POLICY(map->mapping) ||
+        PRTE_MAPPING_SEQ == PRTE_GET_MAPPING_POLICY(map->mapping)) {
+        takeall = true;
+    }
+
+    boundcpus = hwloc_bitmap_alloc();
+    /* release the resources held by the proc - only the first
+     * cpu in the proc's cpuset was used to mark usage */
+    if (NULL != pptr->cpuset) {
+        if (0 != (rc = hwloc_bitmap_list_sscanf(boundcpus, pptr->cpuset))) {
+            pmix_output(0, "hwloc_bitmap_sscanf returned %s for the string %s",
+                        prte_strerror(rc), pptr->cpuset);
+            goto next;
+        }
+        if (takeall) {
+            tgt = boundcpus;
+        } else {
+            /* we only want to restore the first CPU of whatever region
+             * the proc was bound to, so we have to first narrow the
+             * bitmap down to only that region */
+            hwloc_bitmap_andnot(prte_rmaps_base.available, boundcpus, node->available);
+            /* the set bits in the result are the bound cpus that are still
+             * marked as in-use */
+            obj = hwloc_get_obj_inside_cpuset_by_type(node->topology->topo,
+                                                      prte_rmaps_base.available, type, 0);
+            if (NULL == obj) {
+                pmix_output(0, "COULD NOT GET BOUND CPU FOR RESOURCE RELEASE");
+                goto next;
+            }
+            tgt = obj->cpuset;
+        }
+        hwloc_bitmap_or(node->available, node->available, tgt);
+    }
+
+next:
+    if (proc_idx < INT_MAX) {
+        /* set the entry in the node's proc array to NULL */
+        pmix_pointer_array_set_item(node->procs, proc_idx, NULL);
+    }
+    /* release the proc once for the map entry */
+    PMIX_RELEASE(pptr);
+
+    // if the node is empty for this job, then remove it from the map
+    empty = true;
+    for (n=0; n < node->procs->size; n++) {
+        p = (prte_proc_t*)pmix_pointer_array_get_item(node->procs, n);
+        if (NULL != p && PMIx_Check_nspace(p->name.nspace, jdata->nspace)) {
+            empty = false;
+            break;
+        }
+    }
+    if (empty) {
+        if (node_idx < INT_MAX) {
+            /* set the node location to NULL */
+            pmix_pointer_array_set_item(map->nodes, node_idx, NULL);
+        }
+        /* flag that the node is no longer in a map.  This must happen BEFORE
+         * the release below: the map holds a reference, and dropping it can
+         * be the last one, leaving the flag update to touch freed memory */
+        PRTE_FLAG_UNSET(node, PRTE_NODE_FLAG_MAPPED);
+        /* maintain accounting */
+        PMIX_RELEASE(node);
+    }
+
+    // release the scratch bitmap
+    hwloc_bitmap_free(boundcpus);
+
 }

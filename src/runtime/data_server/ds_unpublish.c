@@ -15,7 +15,7 @@
  * Copyright (c) 2015-2020 Intel, Inc.  All rights reserved.
  * Copyright (c) 2017-2018 Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * Copyright (c) 2025      Triad National Security, LLC. All rights
  *                         reserved.
  * $COPYRIGHT$
@@ -77,6 +77,7 @@ pmix_status_t prte_ds_unpublish(pmix_proc_t *sender,
     rc = PMIx_Data_unpack(NULL, buffer, &rq.requestor, &count, PMIX_PROC);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
+        PMIX_DESTRUCT(&rq);
         return rc;
     }
 
@@ -90,11 +91,13 @@ pmix_status_t prte_ds_unpublish(pmix_proc_t *sender,
     rc = PMIx_Data_unpack(NULL, buffer, &ninfo, &count, PMIX_SIZE);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
+        PMIX_DESTRUCT(&rq);
         return rc;
     }
     if (0 == ninfo) {
         /* they forgot to send us the keys?? */
         PMIX_ERROR_LOG(PMIX_ERR_BAD_PARAM);
+        PMIX_DESTRUCT(&rq);
         return PMIX_ERR_BAD_PARAM;
     }
 
@@ -107,7 +110,7 @@ pmix_status_t prte_ds_unpublish(pmix_proc_t *sender,
             PMIX_DESTRUCT(&rq);
             return rc;
         }
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&rq.keys, str);
+        PMIx_Argv_append_nosize(&rq.keys, str);
         free(str);
     }
 
@@ -116,6 +119,7 @@ pmix_status_t prte_ds_unpublish(pmix_proc_t *sender,
     rc = PMIx_Data_unpack(NULL, buffer, &ninfo, &count, PMIX_SIZE);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
+        PMIX_DESTRUCT(&rq);
         return rc;
     }
     if (0 < ninfo) {
@@ -125,16 +129,25 @@ pmix_status_t prte_ds_unpublish(pmix_proc_t *sender,
         if (PMIX_SUCCESS != rc) {
             PMIX_ERROR_LOG(rc);
             PMIX_INFO_FREE(info, ninfo);
+            PMIX_DESTRUCT(&rq);
             return rc;
         }
-        /* scan the directives for things we care about */
+        /* Scan the directives for things we care about, which for a
+         * removal is who is asking - the identity the ownership test below
+         * is answered about.  PMIX_RANGE is not among them: an owner may
+         * take back what it published on any range, and the range named on
+         * the unpublish does not narrow that. */
         for (n = 0; n < ninfo; n++) {
             if (PMIx_Check_key(info[n].key, PMIX_USERID)) {
                 rq.uid = info[n].value.data.uint32;
-            } else if (PMIx_Check_key(info[n].key, PMIX_RANGE)) {
-                rq.range = info[n].value.data.range;
+            } else if (PMIx_Check_key(info[n].key, PMIX_GRPID)) {
+                rq.gid = info[n].value.data.uint32;
             }
         }
+        /* a relay unpublishing on behalf of a process in its own DVM.
+         * After the scan, and before the ownership test below, which is
+         * what says only the owner may remove an item. */
+        prte_ds_check_requestor(&rq.requestor, &rq.uid, &rq.gid, info, ninfo);
         /* ignore anything else for now */
         PMIX_INFO_FREE(info, ninfo);
     }
@@ -147,19 +160,32 @@ pmix_status_t prte_ds_unpublish(pmix_proc_t *sender,
             if (NULL == data) {
                 continue;
             }
-            /* can only access data posted by the same user id */
-            if (rq.uid != data->uid) {
+            /* Published data is owned by the USER that published it, and
+             * only its owner may remove it.
+             *
+             * The test used to be the publishing PROCESS - namespace and
+             * rank both.  That is stricter than it looks: a process takes
+             * no data with it when it exits, so an item published by a job
+             * that has ended, or that died before it could unpublish, was
+             * removable by nobody at all.  Its own user's next job could
+             * read it, could not replace it (that is a duplicate) and could
+             * not remove it, so the name was wedged for the life of the
+             * DVM.  Keying on the uid is what lets a user clean up after
+             * itself, and it moves no boundary that matters: nothing here
+             * crosses between users. */
+            if (!prte_data_server_owns(rq.uid, rq.gid, data)) {
                 continue;
             }
-            /* can only access data posted by the same process */
-            if (!PMIX_CHECK_NSPACE(rq.requestor.nspace, data->owner.nspace) ||
-                rq.requestor.rank != data->owner.rank) {
-                continue;
-            }
-            /* check the range */
-            if (PMIX_SUCCESS != prte_data_server_check_range(&rq, data)) {
-                continue;
-            }
+            /* Ownership is the whole rule for removal, and the test above
+             * has just established it: an owner may unpublish what it
+             * published on ANY range.  Range and access permissions govern
+             * who may READ an item, and neither belongs here - applying
+             * the read rule refused an owner its own data whenever the
+             * range was one the owner does not itself fall within (a
+             * PMIX_RANGE_RM item admits only the host's namespace, a
+             * PMIX_RANGE_CUSTOM one only the accessors it named), while
+             * still answering SUCCESS, and the item then sat in the store
+             * until its job ended. */
             /* see if we have this key */
             PMIX_LIST_FOREACH_SAFE(ds1, ds2, &data->info, prte_info_item_t) {
                 if (PMIx_Check_key(ds1->info.key, rq.keys[i])) {
@@ -170,20 +196,25 @@ pmix_status_t prte_ds_unpublish(pmix_proc_t *sender,
             }
             /* if all the data has been removed, then remove the object */
             if (0 == pmix_list_get_size(&data->info)) {
-                pmix_pointer_array_set_item(&prte_data_store.store, data->index, NULL);
-                PMIX_RELEASE(data);
+                prte_ds_drop(data);
+            } else {
+                /* some keys went and others stayed: recharge what is left */
+                prte_ds_charge(data);
             }
         }
     }
     PMIX_DESTRUCT(&rq);
 
     if (PMIX_SUCCESS == rc) {
+        pmix_status_t st = PMIX_SUCCESS;
+
         // send back an answer
-        rc = PMIx_Data_pack(NULL, answer, &rc, 1, PMIX_STATUS);
+        rc = PMIx_Data_pack(NULL, answer, &st, 1, PMIX_STATUS);
         if (PMIX_SUCCESS != rc) {
             PMIX_ERROR_LOG(rc);
+            return rc;
         }
-        PRTE_RML_SEND(rc, sender->rank, answer, PRTE_RML_TAG_DATA_CLIENT);
+        PRTE_RML_RELIABLE_SEND(rc, sender->rank, answer, PRTE_RML_TAG_DATA_CLIENT);
         if (PRTE_SUCCESS != rc) {
             PRTE_ERROR_LOG(rc);
             PMIX_DATA_BUFFER_RELEASE(answer);

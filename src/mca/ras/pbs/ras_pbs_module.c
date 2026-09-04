@@ -32,6 +32,7 @@
 #include "src/util/pmix_net.h"
 #include "src/util/pmix_os_path.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 
 #include "src/mca/errmgr/errmgr.h"
 #include "src/runtime/prte_globals.h"
@@ -57,6 +58,7 @@ static char *filename;
  * Global variable
  */
 prte_ras_base_module_t prte_ras_pbs_module = {
+    .scheduler_owned = true,
     .allocate = allocate,
     .finalize = finalize
 };
@@ -82,8 +84,11 @@ static int allocate(prte_job_t *jdata, pmix_list_t *nodes)
     }
 
     /* save that value in the global job ident string for
-     * later use in any error reporting
-     */
+     * later use in any error reporting. Release any previous value:
+     * allocate() can run more than once in a session. */
+    if (NULL != prte_job_ident) {
+        free(prte_job_ident);
+    }
     prte_job_ident = strdup(pbs_jobid);
 
     if (PRTE_SUCCESS != (ret = discover(nodes, pbs_jobid))) {
@@ -95,7 +100,7 @@ static int allocate(prte_job_t *jdata, pmix_list_t *nodes)
      * is an unrecoverable error - report it
      */
     if (pmix_list_is_empty(nodes)) {
-        pmix_show_help("help-ras-pbs.txt", "no-nodes-found", true, filename);
+        prte_show_help("help-ras-pbs.txt", "no-nodes-found", true, filename);
         return PRTE_ERR_NOT_FOUND;
     }
 
@@ -151,7 +156,7 @@ static int discover(pmix_list_t *nodelist, char *pbs_jobid)
      */
     if (prte_mca_ras_pbs_component.smp_mode) {
         if (NULL == (cppn = getenv("PBS_PPN"))) {
-            pmix_show_help("help-ras-pbs.txt", "smp-error", true);
+            prte_show_help("help-ras-pbs.txt", "smp-error", true);
             return PRTE_ERR_NOT_FOUND;
         }
         ppn = strtol(cppn, NULL, 10);
@@ -165,7 +170,7 @@ static int discover(pmix_list_t *nodelist, char *pbs_jobid)
         /* try the Cobalt variant */
         filename = getenv("COBALT_NODEFILE");
         if (NULL == filename) {
-            pmix_show_help("help-ras-pbs.txt", "no-nodefile", true);
+            prte_show_help("help-ras-pbs.txt", "no-nodefile", true);
             return PRTE_ERR_NOT_FOUND;
         }
     }
@@ -194,7 +199,7 @@ static int discover(pmix_list_t *nodelist, char *pbs_jobid)
             if (0 == strcmp(node->name, hostname)) {
                 if (prte_mca_ras_pbs_component.smp_mode) {
                     /* this cannot happen in smp mode */
-                    pmix_show_help("help-ras-pbs.txt", "smp-multi", true);
+                    prte_show_help("help-ras-pbs.txt", "smp-multi", true);
                     fclose(fp);
                     free(hostname);
                     return PRTE_ERR_BAD_PARAM;
@@ -226,6 +231,8 @@ static int discover(pmix_list_t *nodelist, char *pbs_jobid)
             node->slots_inuse = 0;
             node->slots_max = 0;
             node->slots = ppn;
+            /* the count came from PBS_NODEFILE - authoritative */
+            PRTE_FLAG_SET(node, PRTE_NODE_FLAG_SLOTS_GIVEN);
             node->state = PRTE_NODE_STATE_UP;
             pmix_list_append(nodelist, &node->super);
         } else {
@@ -242,16 +249,27 @@ static int discover(pmix_list_t *nodelist, char *pbs_jobid)
     return PRTE_SUCCESS;
 }
 
+/* Return the next non-empty line of the nodefile with its trailing newline
+ * stripped, or NULL at end of file.  Blank lines are skipped rather than
+ * turned into a node named "": a nodefile with a stray blank line would
+ * otherwise inject an unusable, unresolvable node into the allocation.
+ * Note also that the final line of a file need not be newline-terminated,
+ * so the newline is removed only if it is actually there. */
 static char *pbs_getline(FILE *fp)
 {
-    char *ret, *buff;
+    char *ret;
+    size_t len;
     char input[PBS_FILE_MAX_LINE_LENGTH];
 
-    ret = fgets(input, PBS_FILE_MAX_LINE_LENGTH, fp);
-    if (NULL != ret) {
-        input[strlen(input) - 1] = '\0'; /* remove newline */
-        buff = strdup(input);
-        return buff;
+    while (NULL != (ret = fgets(input, PBS_FILE_MAX_LINE_LENGTH, fp))) {
+        len = strlen(input);
+        while (0 < len && ('\n' == input[len - 1] || '\r' == input[len - 1])) {
+            input[--len] = '\0';
+        }
+        if (0 == len) {
+            continue;
+        }
+        return strdup(input);
     }
 
     return NULL;

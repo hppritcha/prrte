@@ -121,20 +121,26 @@ struct prte_errmgr_base_component_3_0_0_t {
     /** MCA base component */
     pmix_mca_base_component_t base_version;
 
-    /** Verbosity Level */
-    int verbose;
-    /** Output Handle for pmix_output */
-    int output_handle;
     /** Default Priority */
     int priority;
 };
+/* NOTE: this used to carry "verbose" and "output_handle" as well.  Nothing
+ * ever set or read either one - framework verbosity comes from the
+ * auto-provided errmgr_base_verbose and is reached through
+ * prte_errmgr_base_framework.framework_output - so they were two ints of
+ * documentation for a facility that does not exist. */
 typedef struct prte_errmgr_base_component_3_0_0_t prte_errmgr_base_component_3_0_0_t;
 typedef prte_errmgr_base_component_3_0_0_t prte_errmgr_base_component_t;
 
-/*
- * Macro for use in components that are of type errmgr
- */
-#define PRTE_ERRMGR_BASE_VERSION_3_0_0 PRTE_MCA_BASE_VERSION_3_0_0("errmgr", 3, 0, 0)
+/* The errmgr framework interface version. It is stated here and nowhere
+ * else: components stamp it into their struct with
+ * PRTE_MCA_BASE_VERSION(errmgr), and the framework's declaration reaches
+ * the same three by pasting its name, so the two cannot drift apart.
+ * Bump it on any change to the module interface that a component built
+ * against the previous one would not survive. */
+#define PRTE_MCA_errmgr_MAJOR_VERSION   3
+#define PRTE_MCA_errmgr_MINOR_VERSION   0
+#define PRTE_MCA_errmgr_RELEASE_VERSION 0
 
 END_C_DECLS
 

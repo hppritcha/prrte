@@ -18,7 +18,7 @@
  * Copyright (c) 2016-2019 Research Organization for Information Science
  *                         and Technology (RIST). All rights reserved.
  * Copyright (c) 2020      IBM Corporation.  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * Copyright (c) 2022-2023 Triad National Security, LLC.
  *                         All rights reserved.
  * $COPYRIGHT$
@@ -32,6 +32,7 @@
 #include "constants.h"
 
 #include <ctype.h>
+#include <limits.h>
 #include <stddef.h>
 #include <stdio.h>
 #ifdef HAVE_UNISTD_H
@@ -47,51 +48,291 @@
 #include "src/util/pmix_os_path.h"
 #include "src/util/pmix_output.h"
 #include "src/util/pmix_path.h"
+#include "src/util/pmix_printf.h"
 #include "src/util/proc_info.h"
 #include "src/util/pmix_environ.h"
 #include "src/util/pmix_getcwd.h"
 #include "src/util/prte_cmd_line.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 
 #include "src/runtime/prte_globals.h"
 
 #include "src/prted/prted.h"
 
+/* One occurrence of one option: the option's name, and one of the values
+ * it was given. */
+typedef struct {
+    const char *key;
+    const char *value;
+} prte_cli_occ_t;
+
 /*
- * This function takes a "char ***app_env" parameter to handle the
- * specific case:
+ * Collect every value the cmd line carried, in the order it was given.
  *
- *   prun --mca foo bar -app appfile
+ * A parse result groups the occurrences of an option onto that option's
+ * single instance, which loses the interleaving: once a key exists, a
+ * later occurrence of it is filed behind whatever came in between. PMIx
+ * therefore also stamps each stored value with the position it was given
+ * at, and reports the flat, ordered view built from those stamps.
  *
- * That is, we'll need to keep foo=bar, but the presence of the app
- * file will cause an invocation of parse_appfile(), which will cause
- * one or more recursive calls back to create_app().  Since the
- * foo=bar value applies globally to all apps in the appfile, we need
- * to pass in the "base" environment (that contains the foo=bar value)
- * when we parse each line in the appfile.
+ * Built against a PMIx that predates PMIX_CAP_CLI_ORDER there are no
+ * stamps, so fall back to walking the instances in list order. That is
+ * correct for every command line except one that repeats an option after
+ * another has intervened - which is precisely the case the stamps exist
+ * for, and the reason to prefer a PMIx that has them.
  *
- * This is really just a special case -- when we have a simple case like:
+ * Either way the entries point into the result, so the array is valid
+ * for as long as the result is and is released with a plain free().
+ */
+static int collect_ordered(pmix_cli_result_t *results,
+                           prte_cli_occ_t **ordered, size_t *nordered)
+{
+    pmix_cli_item_t *opt;
+    prte_cli_occ_t *out;
+    size_t num = 0, m = 0;
+
+    *ordered = NULL;
+    *nordered = 0;
+
+    PMIX_LIST_FOREACH(opt, &results->instances, pmix_cli_item_t) {
+        num += (size_t) PMIx_Argv_count(opt->values);
+    }
+    if (0 == num) {
+        return PRTE_SUCCESS;
+    }
+    out = (prte_cli_occ_t *) malloc(num * sizeof(prte_cli_occ_t));
+    if (NULL == out) {
+        return PRTE_ERR_OUT_OF_RESOURCE;
+    }
+
+#if PRTE_PMIX_CLI_ORDER
+    {
+        pmix_cli_occurrence_t *occ = NULL;
+        size_t nocc = 0, n;
+
+        if (PMIX_SUCCESS != pmix_cmd_line_get_ordered(results, &occ, &nocc)) {
+            free(out);
+            return PRTE_ERR_OUT_OF_RESOURCE;
+        }
+        for (n = 0; n < nocc; n++) {
+            if (NULL == occ[n].value) {
+                /* an option given without a value carries no directive -
+                 * it is its own presence that says something */
+                continue;
+            }
+            out[m].key = occ[n].key;
+            out[m].value = occ[n].value;
+            ++m;
+        }
+        free(occ);
+    }
+#else
+    {
+        int n;
+
+        PMIX_LIST_FOREACH(opt, &results->instances, pmix_cli_item_t) {
+            for (n = 0; NULL != opt->values && NULL != opt->values[n]; n++) {
+                out[m].key = opt->key;
+                out[m].value = opt->values[n];
+                ++m;
+            }
+        }
+    }
+#endif
+
+    *ordered = out;
+    *nordered = m;
+    return PRTE_SUCCESS;
+}
+
+/*
+ * Turn the environment options into directives on the app's info list.
  *
- *   prun --mca foo bar -np 4 hostname
+ * These are applied to the process environment IN THE ORDER GIVEN, and
+ * the info list is what carries that order downstream (see the
+ * PRTE_JOB_*_ENVAR loop in odls_base_default_fns.c). The order matters
+ * because the directives edit each other: SET replaces a value outright
+ * while PREPEND/APPEND edit the one already there, so
  *
- * Then the upper-level function (parse_locals()) calls create_app()
- * with a NULL value for app_env, meaning that there is no "base"
- * environment that the app needs to be created from.
+ *     --prepend-env "FOO[:]" x --set-env FOO=1     leaves  FOO=1
+ *     --set-env FOO=1 --prepend-env "FOO[:]" x     leaves  FOO=x:1
+ *
+ * Both are what the user asked for; neither is a merge policy we get to
+ * choose. So walk the occurrences in the order they were given rather
+ * than looking each key up in a fixed sequence - and rather than walking
+ * the instances list, which orders keys by first appearance and so puts
+ * the second --set-env of
+ *
+ *     --set-env FOO=1 --prepend-env "FOO[:]" x --set-env FOO=2
+ *
+ * ahead of the prepend, arriving at FOO=x:2 where the user asked for
+ * FOO=2.
+ */
+static int add_envar_directives(prte_pmix_app_t *app,
+                                pmix_cli_result_t *results)
+{
+    prte_cli_occ_t *ordered = NULL;
+    size_t nordered = 0, k;
+    char *param, *value, *ptr, *tval;
+    const char *key;
+    pmix_envar_t envt;
+    int i, rc;
+
+    rc = collect_ordered(results, &ordered, &nordered);
+    if (PRTE_SUCCESS != rc) {
+        return rc;
+    }
+
+    for (k = 0; k < nordered; k++) {
+        key = ordered[k].key;
+
+        if (0 == strcmp(key, PRTE_CLI_FWD_ENVAR)) {
+            /* Construct the envar before every use.  Forwarding a variable
+             * has no separator, but the field is packed and shipped with
+             * the rest of the directive, so leaving it whatever was on the
+             * stack put an uninitialized byte into the launch message. */
+            PMIX_ENVAR_CONSTRUCT(&envt);
+            param = strdup(ordered[k].value);
+            /* if there is an '=' in it, then they are setting a value */
+            if (NULL != (value = strchr(param, '='))) {
+                *value = '\0';
+                ++value;
+                envt.envar = param;
+                envt.value = strdup(value);
+                PMIX_INFO_LIST_ADD(rc, app->info, PMIX_SET_ENVAR, &envt, PMIX_ENVAR);
+                PMIX_ENVAR_DESTRUCT(&envt);
+            } else {
+                // have to support the wildcard here
+                if (NULL != (ptr = strchr(param, '*'))) {
+                    *ptr = '\0';
+                    for (i=0; NULL != environ[i]; i++) {
+                        if (0 == strncmp(environ[i], param, strlen(param))) {
+                            // this is a var to fwd
+                            // extract the name and value
+                            PMIX_ENVAR_CONSTRUCT(&envt);
+                            ptr = strdup(environ[i]);
+                            value = strchr(ptr, '=');
+                            *value = '\0';
+                            ++value;
+                            envt.envar = ptr;
+                            envt.value = strdup(value);
+                            PMIX_INFO_LIST_ADD(rc, app->info, PMIX_SET_ENVAR, &envt, PMIX_ENVAR);
+                            PMIX_ENVAR_DESTRUCT(&envt);
+                        }
+                    }
+                    free(param);
+                } else {
+                    // given a unique name
+                    value = getenv(param);
+                    if (NULL == value) {
+                        prte_show_help("help-schizo-base.txt", "missing-envar-param", true, param);
+                        free(param);
+                    } else {
+                        PMIX_ENVAR_CONSTRUCT(&envt);
+                        envt.envar = param;
+                        envt.value = strdup(value);
+                        PMIX_INFO_LIST_ADD(rc, app->info, PMIX_SET_ENVAR, &envt, PMIX_ENVAR);
+                        PMIX_ENVAR_DESTRUCT(&envt);
+                    }
+                }
+            }
+
+        } else if (0 == strcmp(key, PMIX_CLI_PREPEND_ENVAR) ||
+                   0 == strcmp(key, PMIX_CLI_APPEND_ENVAR)) {
+            /* these two store the variable's name and the value as SEPARATE
+             * occurrences, given one immediately after the other */
+            bool prepend = (0 == strcmp(key, PMIX_CLI_PREPEND_ENVAR));
+
+            PMIX_ENVAR_CONSTRUCT(&envt);
+            param = strdup(ordered[k].value);
+            if (k + 1 >= nordered || 0 != strcmp(ordered[k + 1].key, key)) {
+                // the value it edits with is missing
+                prte_show_help("help-prun.txt", "malformed-envar", true,
+                               prepend ? "prepend" : "append", app->app.cmd, param);
+                rc = PRTE_ERR_SILENT;
+                free(param);
+                goto done;
+            }
+            // find the [] enclosing the separator
+            i = strlen(param);
+            if (3 > i || ']' != param[i-1] || '[' != param[i-3]) {
+                prte_show_help("help-prun.txt", "malformed-envar", true,
+                               prepend ? "prepend" : "append", app->app.cmd, param);
+                rc = PRTE_ERR_SILENT;
+                free(param);
+                goto done;
+            }
+            param[i-3] = '\0';
+            envt.envar = param;
+            envt.value = strdup(ordered[k + 1].value);
+            envt.separator = param[i-2];
+            PMIX_INFO_LIST_ADD(rc, app->info,
+                               prepend ? PMIX_PREPEND_ENVAR : PMIX_APPEND_ENVAR,
+                               &envt, PMIX_ENVAR);
+            PMIX_ENVAR_DESTRUCT(&envt);
+            // the value has now been consumed
+            ++k;
+
+        } else if (0 == strcmp(key, PMIX_CLI_SET_ENVAR)) {
+            /* --set-env stores ONE value per occurrence ("NAME=value"),
+             * unlike --prepend-env/--append-env above */
+            param = strdup(ordered[k].value);
+            // find the '=' separating name from value
+            tval = strchr(param, '=');
+            if (NULL == tval) {
+                prte_show_help("help-prun.txt", "malformed-envar", true,
+                               "set", app->app.cmd, param);
+                rc = PRTE_ERR_SILENT;
+                free(param);
+                goto done;
+            }
+            *tval = '\0';
+            ++tval;
+            PMIX_ENVAR_CONSTRUCT(&envt);
+            envt.envar = param;
+            envt.value = strdup(tval);
+            PMIX_INFO_LIST_ADD(rc, app->info, PMIX_SET_ENVAR, &envt, PMIX_ENVAR);
+            PMIX_ENVAR_DESTRUCT(&envt);
+
+        } else if (0 == strcmp(key, PMIX_CLI_UNSET_ENVAR)) {
+            PMIX_INFO_LIST_ADD(rc, app->info, PMIX_UNSET_ENVAR,
+                               (char *) ordered[k].value, PMIX_STRING);
+        }
+    }
+    rc = PRTE_SUCCESS;
+
+done:
+    if (NULL != ordered) {
+        free(ordered);
+    }
+    return rc;
+}
+
+/*
+ * Build one app context from one segment of the command line.
+ *
+ * There used to be a "char ***app_env" parameter here, described as the
+ * base environment to carry across the recursive create_app() calls that an
+ * appfile produced.  There is no recursion any more - an appfile is read
+ * into the command line up front, by prte_parse_appfile() in prte.c, before
+ * any of this runs - and this function had long since stopped writing
+ * through the parameter, so the caller's variable was always NULL and
+ * everything it was plumbed through was a no-op.  It is gone rather than
+ * left looking load-bearing.
  */
 static int create_app(prte_schizo_base_module_t *schizo, char **argv,
-                      prte_pmix_app_t **app_ptr, bool *made_app, char ***app_env,
+                      prte_pmix_app_t **app_ptr, bool *made_app,
                       char ***hostfiles, char ***hosts, pmix_list_t *jobdata)
 {
     char cwd[PRTE_PATH_MAX];
-    int i, n, count, rc;
+    int i, count, rc;
     char *param, *value, *ptr;
     prte_pmix_app_t *app = NULL;
     pmix_cli_item_t *opt, *opt2;
     pmix_cli_result_t results;
     char *tval;
     prte_info_item_t *iptr;
-    pmix_envar_t envt;
-    PRTE_HIDE_UNUSED_PARAMS(app_env);
 
     *made_app = false;
 
@@ -125,12 +366,12 @@ static int create_app(prte_schizo_base_module_t *schizo, char **argv,
     }
     /* Setup application context */
     app = PMIX_NEW(prte_pmix_app_t);
-    app->app.argv = PMIX_ARGV_COPY_COMPAT(results.tail);
+    app->app.argv = PMIx_Argv_copy(results.tail);
     // app->app.cmd is setup below.
 
     /* get the cwd - we may need it in several places */
     if (PRTE_SUCCESS != (rc = pmix_getcwd(cwd, sizeof(cwd)))) {
-        pmix_show_help("help-prun.txt", "prun:init-failure", true, "get the cwd", rc);
+        prte_show_help("help-prun.txt", "prun:init-failure", true, "get the cwd", rc);
         goto cleanup;
     }
 
@@ -187,13 +428,13 @@ static int create_app(prte_schizo_base_module_t *schizo, char **argv,
                 opt->values[i] = value;
             }
         }
-        tval = PMIX_ARGV_JOIN_COMPAT(opt->values, ',');
+        tval = PMIx_Argv_join(opt->values, ',');
         PMIX_INFO_LIST_ADD(rc, app->info, PMIX_HOSTFILE,
                            tval, PMIX_STRING);
         free(tval);
         if (NULL != hostfiles) {
             for (i=0; NULL != opt->values[i]; i++) {
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(hostfiles, opt->values[i]);
+                PMIx_Argv_append_nosize(hostfiles, opt->values[i]);
             }
         }
     }
@@ -208,7 +449,7 @@ static int create_app(prte_schizo_base_module_t *schizo, char **argv,
                 opt->values[i] = value;
             }
         }
-        tval = PMIX_ARGV_JOIN_COMPAT(opt->values, ',');
+        tval = PMIx_Argv_join(opt->values, ',');
         PMIX_INFO_LIST_ADD(rc, app->info, PMIX_ADD_HOSTFILE,
                            tval, PMIX_STRING);
         free(tval);
@@ -219,12 +460,12 @@ static int create_app(prte_schizo_base_module_t *schizo, char **argv,
     /* Did the user specify any hosts? */
     opt = pmix_cmd_line_get_param(&results, PRTE_CLI_HOST);
     if (NULL != opt) {
-        tval = PMIX_ARGV_JOIN_COMPAT(opt->values, ',');
+        tval = PMIx_Argv_join(opt->values, ',');
         PMIX_INFO_LIST_ADD(rc, app->info, PMIX_HOST, tval, PMIX_STRING);
         free(tval);
         if (NULL != hosts) {
             for (i=0; NULL != opt->values[i]; i++) {
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(hosts, opt->values[i]);
+                PMIx_Argv_append_nosize(hosts, opt->values[i]);
             }
         }
     }
@@ -232,22 +473,83 @@ static int create_app(prte_schizo_base_module_t *schizo, char **argv,
     /* Did the user specify any add-hosts? */
     opt = pmix_cmd_line_get_param(&results, PRTE_CLI_ADDHOST);
     if (NULL != opt) {
-        tval = PMIX_ARGV_JOIN_COMPAT(opt->values, ',');
+        tval = PMIx_Argv_join(opt->values, ',');
         PMIX_INFO_LIST_ADD(rc, app->info, PMIX_ADD_HOST, tval, PMIX_STRING);
         free(tval);
         // we don't add these to the hosts array as they
         // are not part of an initial DVM
     }
 
+    /* Did the user ask that nodes already in the allocation be brought
+     * into the DVM? */
+    opt = pmix_cmd_line_get_param(&results, PRTE_CLI_ACTIVATE);
+    if (NULL != opt) {
+        char **atokens;
+        int a;
+
+        tval = PMIx_Argv_join(opt->values, ',');
+        /* a "file=" entry names a hostfile that the DVM MASTER will read, so
+         * a relative path has to be resolved against OUR cwd here - the same
+         * thing --hostfile and --add-hostfile do above, and for the same
+         * reason: the HNP is another process, very likely on another node,
+         * and its cwd is not ours */
+        atokens = PMIx_Argv_split(tval, ',');
+        free(tval);
+        for (a = 0; NULL != atokens[a]; a++) {
+            if (0 != strncmp(atokens[a], "file=", 5) ||
+                '\0' == atokens[a][5] ||
+                pmix_path_is_absolute(&atokens[a][5])) {
+                /* leave a bare "file=" alone: turning it into the cwd would
+                 * hand the DVM a directory, where what it should report is
+                 * that no filename was given */
+                continue;
+            }
+            value = pmix_os_path(false, cwd, &atokens[a][5], NULL);
+            free(atokens[a]);
+            pmix_asprintf(&atokens[a], "file=%s", value);
+            free(value);
+        }
+        tval = PMIx_Argv_join(atokens, ',');
+        PMIx_Argv_free(atokens);
+        PMIX_INFO_LIST_ADD(rc, app->info, PRTE_ACTIVATE_HOSTS, tval, PMIX_STRING);
+        free(tval);
+        // these name nodes the allocation already holds, so they are
+        // likewise no part of an initial DVM
+    }
+
     /* check for bozo error */
     opt = pmix_cmd_line_get_param(&results, PRTE_CLI_NP);
     if (NULL != opt) {
-        count = strtol(opt->values[0], NULL, 10);
+        char *npend = NULL;
+        long nprocs;
+
+        /* A value that is not a number at all reads as 0, which is the
+         * spelling of "let the mapping policy compute it" - so "-n four"
+         * quietly launched some other number of processes rather than
+         * being refused.  maxprocs is an int, so a value that does not fit
+         * one has to go the same way: truncating it silently turns, say,
+         * 4294967297 into 1. */
+        errno = 0;
+        nprocs = strtol(opt->values[0], &npend, 10);
+        if (!isdigit((unsigned char) opt->values[0][0]) ||
+            NULL == npend || '\0' != *npend || 0 != errno ||
+            nprocs > (long) INT_MAX) {
+            prte_show_help("help-prun.txt", "bad-option-input", true,
+                           prte_tool_basename, "--" PRTE_CLI_NP,
+                           opt->values[0], "a number of processes");
+            rc = PRTE_ERR_FATAL;
+            goto cleanup;
+        }
+        count = (int) nprocs;
+        /* the leading-digit test above already refuses a sign, so this is
+         * unreachable from the command line - it is kept because the check
+         * is what the message names and the two must not drift apart */
         if (0 > count) {
-            pmix_show_help("help-prun.txt", "prun:negative-nprocs", true,
+            prte_show_help("help-prun.txt", "prun:negative-nprocs", true,
                            prte_tool_basename,
-                           app->app.argv[0], count, NULL);
-            return PRTE_ERR_FATAL;
+                           app->app.argv[0], count);
+            rc = PRTE_ERR_FATAL;
+            goto cleanup;
         }
         /* we don't require that the user provide --np or -n because
          * the cmd line might stipulate a mapping policy that computes
@@ -266,11 +568,12 @@ static int create_app(prte_schizo_base_module_t *schizo, char **argv,
                     if (NULL == param) {
                         param = opt->values[i];
                     } else if (0 != strcmp(param, opt->values[i])) {
-                        pmix_show_help("help-plm-base.txt", "multiple-prefixes", true,
+                        prte_show_help("help-plm-base.txt", "multiple-prefixes", true,
                                        prte_tool_basename, PRTE_CLI_PREFIX,
                                        PRTE_CLI_PREFIX, "PRRTE", PRTE_CLI_PREFIX,
                                        param, opt->values[i]);
-                        return PRTE_ERR_FATAL;
+                        rc = PRTE_ERR_FATAL;
+                        goto cleanup;
                     }
                 }
             }
@@ -281,18 +584,24 @@ static int create_app(prte_schizo_base_module_t *schizo, char **argv,
 
         opt = pmix_cmd_line_get_param(&results, PRTE_CLI_PMIX_PREFIX);
         if (NULL != opt) {
-            // only allow one instance of it, or all must be the same
-            if (1 < (count = pmix_cmd_line_get_ninsts(&results, PRTE_CLI_PREFIX))) {
+            /* Only allow one instance of it, or all must be the same.
+             * Count THIS option's values: counting PRTE_CLI_PREFIX's here
+             * both skipped the check whenever no --prefix was given, and
+             * walked opt->values past its terminator when more --prefix
+             * values were given than --pmix-prefix ones - "--prefix /x
+             * --prefix /x --pmix-prefix /y" segfaulted on the NULL. */
+            if (1 < (count = pmix_cmd_line_get_ninsts(&results, PRTE_CLI_PMIX_PREFIX))) {
                 param = NULL;
                 for (i=0; i < count; i++) {
                     if (NULL == param) {
                         param = opt->values[i];
                     } else if (0 != strcmp(param, opt->values[i])) {
-                        pmix_show_help("help-plm-base.txt", "multiple-prefixes", true,
+                        prte_show_help("help-plm-base.txt", "multiple-prefixes", true,
                                        prte_tool_basename, PRTE_CLI_PMIX_PREFIX,
                                        PRTE_CLI_PMIX_PREFIX, "PMIx", PRTE_CLI_PMIX_PREFIX,
                                        param, opt->values[i]);
-                        return PRTE_ERR_FATAL;
+                        rc = PRTE_ERR_FATAL;
+                        goto cleanup;
                     }
                 }
             }
@@ -321,7 +630,7 @@ static int create_app(prte_schizo_base_module_t *schizo, char **argv,
 
     app->app.cmd = strdup(app->app.argv[0]);
     if (NULL == app->app.cmd) {
-        pmix_show_help("help-prun.txt", "prun:call-failed", true, "prun", "library",
+        prte_show_help("help-prun.txt", "prun:call-failed", true, "prun", "library",
                        "strdup returned NULL", errno);
         rc = PRTE_ERR_SILENT;
         goto cleanup;
@@ -345,134 +654,10 @@ static int create_app(prte_schizo_base_module_t *schizo, char **argv,
     }
 
     // check for any envar directives
-    opt = pmix_cmd_line_get_param(&results, PRTE_CLI_FWD_ENVAR);
-    if (NULL != opt) {
-        for (n=0; NULL != opt->values[n]; n++) {
-            param = strdup(opt->values[n]);
-            /* if there is an '=' in it, then they are setting a value */
-            if (NULL != (value = strchr(param, '='))) {
-                *value = '\0';
-                ++value;
-                envt.envar = param;
-                envt.value = strdup(value);
-                PMIX_INFO_LIST_ADD(rc, app->info, PMIX_SET_ENVAR, &envt, PMIX_ENVAR);
-                PMIX_ENVAR_DESTRUCT(&envt);
-            } else {
-                // have to support the wildcard here
-                if (NULL != (ptr = strchr(param, '*'))) {
-                    *ptr = '\0';
-                    for (i=0; NULL != environ[i]; i++) {
-                        if (0 == strncmp(environ[i], param, strlen(param))) {
-                            // this is a var to fwd
-                            // extract the name and value
-                            ptr = strdup(environ[i]);
-                            value = strchr(ptr, '=');
-                            *value = '\0';
-                            ++value;
-                            envt.envar = ptr;
-                            envt.value = strdup(value);
-                            PMIX_INFO_LIST_ADD(rc, app->info, PMIX_SET_ENVAR, &envt, PMIX_ENVAR);
-                            PMIX_ENVAR_DESTRUCT(&envt);
-                        }
-                    }
-                    free(param);
-                } else {
-                    // given a unique name
-                    value = getenv(param);
-                    if (NULL == value) {
-                        pmix_show_help("help-schizo-base.txt", "missing-envar-param", true, param);
-                        free(param);
-                    } else {
-                        envt.envar = param;
-                        envt.value = strdup(value);
-                        PMIX_INFO_LIST_ADD(rc, app->info, PMIX_SET_ENVAR, &envt, PMIX_ENVAR);
-                        PMIX_ENVAR_DESTRUCT(&envt);
-                    }
-                }
-            }
-        }
+    rc = add_envar_directives(app, &results);
+    if (PRTE_SUCCESS != rc) {
+        goto cleanup;
     }
-
-#ifdef PMIX_CLI_PREPEND_ENVAR
-    opt = pmix_cmd_line_get_param(&results, PMIX_CLI_PREPEND_ENVAR);
-    if (NULL != opt) {
-        for (n=0; NULL != opt->values[n]; n+=2) {
-            param = strdup(opt->values[n]);
-            // find the [] enclosing the separator
-            i = strlen(param);
-            if (']' != param[i-1] || '[' != param[i-3]) {
-                pmix_show_help("help-prun.txt", "malformed-envar", true,
-                               "prepend", app->app.cmd, param);
-                rc = PRTE_ERR_SILENT;
-                free(param);
-                goto cleanup;
-            }
-            param[i-3] = '\0';
-            envt.envar = param;
-            envt.value = strdup(opt->values[n+1]);
-            envt.separator = param[i-2];
-            PMIX_INFO_LIST_ADD(rc, app->info, PMIX_PREPEND_ENVAR, &envt, PMIX_ENVAR);
-            PMIX_ENVAR_DESTRUCT(&envt);
-        }
-    }
-#endif
-#ifdef PMIX_CLI_APPEND_ENVAR
-    opt = pmix_cmd_line_get_param(&results, PMIX_CLI_APPEND_ENVAR);
-    if (NULL != opt) {
-        for (n=0; NULL != opt->values[n]; n+=2) {
-            param = strdup(opt->values[n]);
-            // find the [] enclosing the separator
-            i = strlen(param);
-            if (']' != param[i-1] || '[' != param[i-3]) {
-                pmix_show_help("help-prun.txt", "malformed-envar", true,
-                               "append", app->app.cmd, param);
-                rc = PRTE_ERR_SILENT;
-                free(param);
-                goto cleanup;
-            }
-            param[i-3] = '\0';
-            envt.envar = param;
-            envt.value = strdup(opt->values[n+1]);
-            envt.separator = param[i-2];
-            PMIX_INFO_LIST_ADD(rc, app->info, PMIX_APPEND_ENVAR, &envt, PMIX_ENVAR);
-            PMIX_ENVAR_DESTRUCT(&envt);
-        }
-    }
-#endif
-
-#ifdef PMIX_CLI_SET_ENVAR
-    opt = pmix_cmd_line_get_param(&results, PMIX_CLI_SET_ENVAR);
-    if (NULL != opt) {
-        for (n=0; NULL != opt->values[n]; n+=2) {
-            param = strdup(opt->values[n]);
-            // find the '=' separating name from value
-            tval = strchr(param, '=');
-            if (NULL == tval) {
-                pmix_show_help("help-prun.txt", "malformed-envar", true,
-                               "set", app->app.cmd, param);
-                rc = PRTE_ERR_SILENT;
-                free(param);
-                goto cleanup;
-            }
-            *tval = '\0';
-            ++tval;
-            PMIX_ENVAR_CONSTRUCT(&envt);
-            envt.envar = param;
-            envt.value = strdup(tval);
-            PMIX_INFO_LIST_ADD(rc, app->info, PMIX_SET_ENVAR, &envt, PMIX_ENVAR);
-            PMIX_ENVAR_DESTRUCT(&envt);
-        }
-    }
-#endif
-
-#ifdef PMIX_CLI_UNSET_ENVAR
-    opt = pmix_cmd_line_get_param(&results, PMIX_CLI_UNSET_ENVAR);
-    if (NULL != opt) {
-        for (n=0; NULL != opt->values[n]; n++) {
-            PMIX_INFO_LIST_ADD(rc, app->info, PMIX_UNSET_ENVAR, opt->values[n], PMIX_STRING);
-        }
-    }
-#endif
 
     // check for PMIx prefix for the application
     opt = pmix_cmd_line_get_param(&results, PRTE_CLI_APP_PREFIX);
@@ -484,10 +669,11 @@ static int create_app(prte_schizo_base_module_t *schizo, char **argv,
                 if (NULL == param) {
                     param = opt->values[i];
                 } else if (0 != strcmp(param, opt->values[i])) {
-                    pmix_show_help("help-plm-base.txt", "multiple-app-prefixes", true,
+                    prte_show_help("help-plm-base.txt", "multiple-app-prefixes", true,
                                    prte_tool_basename, PRTE_CLI_APP_PREFIX,
                                    PRTE_CLI_APP_PREFIX, param, opt->values[i]);
-                    return PRTE_ERR_FATAL;
+                    rc = PRTE_ERR_FATAL;
+                    goto cleanup;
                 }
             }
         }
@@ -502,24 +688,68 @@ static int create_app(prte_schizo_base_module_t *schizo, char **argv,
     if (NULL != opt) {
         // cannot have a prefix as well as no-prefix
         if (NULL != (opt2 = pmix_cmd_line_get_param(&results, PRTE_CLI_APP_PREFIX))) {
-            pmix_show_help("help-plm-base.txt", "prefix-conflict", true,
+            prte_show_help("help-plm-base.txt", "prefix-conflict", true,
                            prte_tool_basename, PRTE_CLI_APP_PREFIX, opt2->values[0],
                            PRTE_CLI_NO_APP_PREFIX);
-            return PRTE_ERR_FATAL;
+            rc = PRTE_ERR_FATAL;
+            goto cleanup;
         }
         PMIX_INFO_LIST_ADD(rc, app->info, PMIX_PREFIX, NULL, PMIX_STRING);
     } else if (NULL != getenv("PMIX_APP_NO_PREFIX")) {
         // cannot have a prefix as well as no-prefix
         if (NULL != (opt2 = pmix_cmd_line_get_param(&results, PRTE_CLI_APP_PREFIX))) {
-            pmix_show_help("help-plm-base.txt", "prefix-conflict", true,
+            prte_show_help("help-plm-base.txt", "prefix-conflict", true,
                            prte_tool_basename, PRTE_CLI_APP_PREFIX, opt2->values[0],
                            "PMIX_APP_NO_PREFIX");
-            return PRTE_ERR_FATAL;
+            rc = PRTE_ERR_FATAL;
+            goto cleanup;
         }
         // allow the cmd line to override the environment
         PMIX_INFO_LIST_ADD(rc, app->info, PMIX_PREFIX, NULL, PMIX_STRING);
     }
 
+    // Hold the mapping/ranking/binding directives on the app object rather
+    // than adding them to its spec. Whether they are per-app at all is not
+    // known until every segment has been parsed - one directive applies to
+    // the whole job, however many apps there are - so prte_parse_locals()
+    // makes that call once it has seen them all.
+    opt = pmix_cmd_line_get_param(&results, PRTE_CLI_MAPBY);
+    if (NULL != opt) {
+        app->mapby = strdup(opt->values[0]);
+    }
+    opt = pmix_cmd_line_get_param(&results, PRTE_CLI_RANKBY);
+    if (NULL != opt) {
+        app->rankby = strdup(opt->values[0]);
+    }
+    opt = pmix_cmd_line_get_param(&results, PRTE_CLI_BINDTO);
+    if (NULL != opt) {
+        app->bindto = strdup(opt->values[0]);
+    }
+
+    // Hold the job-level directives this segment carried, for the same
+    // reason: the tool's global parse of the cmd line stops at the first
+    // app, so a directive written in a later segment never reaches it.
+    // These are not per-app at all - prte_parse_locals() hands every
+    // segment's contribution back to that parse once the line is done.
+    opt = pmix_cmd_line_get_param(&results, PRTE_CLI_OUTPUT);
+    if (NULL != opt) {
+        app->output = PMIx_Argv_join(opt->values, ',');
+    }
+    opt = pmix_cmd_line_get_param(&results, PRTE_CLI_DISPLAY);
+    if (NULL != opt) {
+        app->display = PMIx_Argv_join(opt->values, ',');
+    }
+    opt = pmix_cmd_line_get_param(&results, PRTE_CLI_RTOS);
+    if (NULL != opt) {
+        app->rtos = PMIx_Argv_join(opt->values, ',');
+    }
+
+    /* The app is made.  Say so unconditionally rather than returning
+     * whatever the last PMIX_INFO_LIST_ADD happened to leave in rc: a
+     * failure from any of them is not acted on where it happens, so a stale
+     * one here would hand the caller an error alongside made_app == true -
+     * and the caller, seeing the error, drops the app it was just given. */
+    rc = PRTE_SUCCESS;
     *app_ptr = app;
     app = NULL;
     *made_app = true;
@@ -534,40 +764,154 @@ cleanup:
     return rc;
 }
 
+/*
+ * Hand out one class of directive (mapping, ranking or binding) once the
+ * whole cmd line has been parsed.
+ *
+ * The first app segment is where a command line speaks for the job: it is
+ * what a single-app line has, and it is what the reader sees first. So a
+ * directive written there and nowhere else describes the whole job, however
+ * many apps follow - which is also what lets it carry a qualifier that spans
+ * the job (OVERSUBSCRIBE and friends), since an app that holds one has to
+ * have it hoisted back out again later.
+ *
+ * Written anywhere else, it describes the app that carries it and only that
+ * app. Its silent siblings are not agreeing with it - they said nothing, and
+ * what an app that says nothing gets is the default. Reading a lone
+ * directive on the third of four apps as the job's meant that asking for one
+ * app to be placed differently silently placed all four that way, and there
+ * was no way to say what was plainly meant.
+ */
+static int distribute_directive(pmix_list_t *apps, pmix_list_t *jobdata,
+                                size_t offset, const char *key)
+{
+    prte_pmix_app_t *app;
+    prte_info_item_t *item;
+    char **held;
+    int count = 0, rc;
+    bool first_only;
+
+    app = (prte_pmix_app_t *) pmix_list_get_first(apps);
+    if (NULL == app || pmix_list_is_empty(apps)) {
+        return PRTE_SUCCESS;
+    }
+    held = (char **) ((char *) app + offset);
+    first_only = (NULL != *held);
+
+    PMIX_LIST_FOREACH(app, apps, prte_pmix_app_t) {
+        held = (char **) ((char *) app + offset);
+        if (NULL != *held) {
+            ++count;
+        }
+    }
+    if (0 == count) {
+        return PRTE_SUCCESS;
+    }
+    /* only the first app carried it? */
+    first_only = first_only && (1 == count);
+
+    if (!first_only) {
+        /* the user distinguished the apps - give each its own, and leave the
+         * apps that gave none to the defaults */
+        PMIX_LIST_FOREACH(app, apps, prte_pmix_app_t) {
+            held = (char **) ((char *) app + offset);
+            if (NULL != *held) {
+                PMIX_INFO_LIST_ADD(rc, app->info, key, *held, PMIX_STRING);
+                if (PMIX_SUCCESS != rc) {
+                    return prte_pmix_convert_status(rc);
+                }
+            }
+        }
+        return PRTE_SUCCESS;
+    }
+
+    /* the first app spoke for the job */
+    if (NULL == jobdata) {
+        /* nowhere to put it - leave it with the app that carried it so the
+         * directive is not simply lost */
+        PMIX_LIST_FOREACH(app, apps, prte_pmix_app_t) {
+            held = (char **) ((char *) app + offset);
+            if (NULL != *held) {
+                PMIX_INFO_LIST_ADD(rc, app->info, key, *held, PMIX_STRING);
+                if (PMIX_SUCCESS != rc) {
+                    return prte_pmix_convert_status(rc);
+                }
+            }
+        }
+        return PRTE_SUCCESS;
+    }
+    PMIX_LIST_FOREACH(app, apps, prte_pmix_app_t) {
+        held = (char **) ((char *) app + offset);
+        if (NULL == *held) {
+            continue;
+        }
+        item = PMIX_NEW(prte_info_item_t);
+        if (NULL == item) {
+            return PRTE_ERR_OUT_OF_RESOURCE;
+        }
+        PMIX_INFO_LOAD(&item->info, key, *held, PMIX_STRING);
+        pmix_list_append(jobdata, &item->super);
+        break;
+    }
+    return PRTE_SUCCESS;
+}
+
+/*
+ * Gather one job-level option from every app segment that wrote it and hand
+ * the result back to the tool's parse of the whole command line.
+ *
+ * Unlike the mapping directives above, these are never per-app: there is no
+ * such thing as one app being displayed, or one app not launching.  The
+ * only question is whether the segments agree, and that is decided in the
+ * schizo base, where the option's vocabulary lives.
+ */
+static int hoist_job_option(pmix_list_t *apps, pmix_cli_result_t *results,
+                            size_t offset, const char *key)
+{
+    prte_pmix_app_t *app;
+    char **held, **contributions = NULL;
+    int rc;
+
+    if (NULL == results) {
+        return PRTE_SUCCESS;
+    }
+    PMIX_LIST_FOREACH(app, apps, prte_pmix_app_t) {
+        held = (char **) ((char *) app + offset);
+        if (NULL != *held) {
+            PMIx_Argv_append_nosize(&contributions, *held);
+        }
+    }
+    rc = prte_schizo_base_hoist_job_option(results, key, contributions);
+    PMIx_Argv_free(contributions);
+    return rc;
+}
+
 int prte_parse_locals(prte_schizo_base_module_t *schizo,
                       pmix_list_t *jdata, char *argv[],
                       char ***hostfiles, char ***hosts,
-                      pmix_list_t *jobdata)
+                      pmix_list_t *jobdata,
+                      pmix_cli_result_t *results)
 {
     int i, rc;
-    char **temp_argv, **env;
+    char **temp_argv;
     prte_pmix_app_t *app;
     bool made_app;
 
     /* Make the apps */
     temp_argv = NULL;
-    PMIX_ARGV_APPEND_NOSIZE_COMPAT(&temp_argv, argv[0]);
+    PMIx_Argv_append_nosize(&temp_argv, argv[0]);
 
-    /* NOTE: This bogus env variable is necessary in the calls to
-     create_app(), below.  See comment immediately before the
-     create_app() function for an explanation. */
-
-    env = NULL;
     for (i = 1; NULL != argv[i]; ++i) {
         if (0 == strcmp(argv[i], ":")) {
             /* Make an app with this argv */
-            if (PMIX_ARGV_COUNT_COMPAT(temp_argv) > 1) {
-                if (NULL != env) {
-                    PMIX_ARGV_FREE_COMPAT(env);
-                    env = NULL;
-                }
+            if (PMIx_Argv_count(temp_argv) > 1) {
                 app = NULL;
-                rc = create_app(schizo, temp_argv, &app, &made_app, &env,
+                rc = create_app(schizo, temp_argv, &app, &made_app,
                                 hostfiles, hosts, jobdata);
                 if (PRTE_SUCCESS != rc) {
-                    /* Assume that the error message has already been
-                     printed; */
-                    PMIX_ARGV_FREE_COMPAT(temp_argv);
+                    /* assume that the error message has already been
+                     printed */
+                    PMIx_Argv_free(temp_argv);
                     return rc;
                 }
                 if (made_app) {
@@ -575,20 +919,25 @@ int prte_parse_locals(prte_schizo_base_module_t *schizo,
                 }
 
                 /* Reset the temps */
-                PMIX_ARGV_FREE_COMPAT(temp_argv);
+                PMIx_Argv_free(temp_argv);
                 temp_argv = NULL;
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&temp_argv, argv[0]);
+                PMIx_Argv_append_nosize(&temp_argv, argv[0]);
             }
         } else {
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&temp_argv, argv[i]);
+            PMIx_Argv_append_nosize(&temp_argv, argv[i]);
         }
     }
 
-    if (PMIX_ARGV_COUNT_COMPAT(temp_argv) > 1) {
+    if (PMIx_Argv_count(temp_argv) > 1) {
         app = NULL;
-        rc = create_app(schizo, temp_argv, &app, &made_app, &env,
+        rc = create_app(schizo, temp_argv, &app, &made_app,
                         hostfiles, hosts, jobdata);
         if (PRTE_SUCCESS != rc) {
+            /* this return used to skip the free below entirely, so any
+             * command line that fails its final segment leaked temp_argv -
+             * "--display map --display cpus" is enough, since a repeated
+             * option is refused here */
+            PMIx_Argv_free(temp_argv);
             return rc;
         }
         if (made_app) {
@@ -596,10 +945,44 @@ int prte_parse_locals(prte_schizo_base_module_t *schizo,
         }
     }
 
-    if (NULL != env) {
-        PMIX_ARGV_FREE_COMPAT(env);
+    PMIx_Argv_free(temp_argv);
+
+    /* every segment has now been seen, so it can be decided whether the
+     * mapping/ranking/binding directives are per-app or belong to the job */
+    rc = distribute_directive(jdata, jobdata,
+                              offsetof(prte_pmix_app_t, mapby), PMIX_MAPBY);
+    if (PRTE_SUCCESS != rc) {
+        return rc;
     }
-    PMIX_ARGV_FREE_COMPAT(temp_argv);
+    rc = distribute_directive(jdata, jobdata,
+                              offsetof(prte_pmix_app_t, rankby), PMIX_RANKBY);
+    if (PRTE_SUCCESS != rc) {
+        return rc;
+    }
+    rc = distribute_directive(jdata, jobdata,
+                              offsetof(prte_pmix_app_t, bindto), PMIX_BINDTO);
+    if (PRTE_SUCCESS != rc) {
+        return rc;
+    }
+
+    /* the job-level options go back to the tool's own parse, which is where
+     * every consumer of them looks - including the ones that apply them to
+     * the DVM itself rather than to the job */
+    rc = hoist_job_option(jdata, results,
+                          offsetof(prte_pmix_app_t, output), PRTE_CLI_OUTPUT);
+    if (PRTE_SUCCESS != rc) {
+        return rc;
+    }
+    rc = hoist_job_option(jdata, results,
+                          offsetof(prte_pmix_app_t, display), PRTE_CLI_DISPLAY);
+    if (PRTE_SUCCESS != rc) {
+        return rc;
+    }
+    rc = hoist_job_option(jdata, results,
+                          offsetof(prte_pmix_app_t, rtos), PRTE_CLI_RTOS);
+    if (PRTE_SUCCESS != rc) {
+        return rc;
+    }
 
     /* All done */
 

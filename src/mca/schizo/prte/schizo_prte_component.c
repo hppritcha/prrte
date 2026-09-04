@@ -6,7 +6,7 @@
  * Copyright (c) 2019      Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -26,13 +26,14 @@
 
 static int component_query(pmix_mca_base_module_t **module, int *priority);
 static int component_register(void);
+static int component_close(void);
 
 /*
  * Struct of function pointers and all that to let us be initialized
  */
 prte_schizo_prte_component_t prte_mca_schizo_prte_component = {
     .super = {
-        PRTE_MCA_SCHIZO_BASE_VERSION_1_0_0,
+        PRTE_MCA_BASE_VERSION(schizo),
         .pmix_mca_component_name = "prte",
         PMIX_MCA_BASE_MAKE_VERSION(component,
                                    PRTE_MAJOR_VERSION,
@@ -40,9 +41,11 @@ prte_schizo_prte_component_t prte_mca_schizo_prte_component = {
                                    PMIX_RELEASE_VERSION),
         .pmix_mca_query_component = component_query,
         .pmix_mca_register_component_params = component_register,
+        .pmix_mca_close_component = component_close,
     },
     .priority = 5,
-    .warn_deprecations = true
+    .warn_deprecations = true,
+    .warned = false
 };
 PMIX_MCA_BASE_COMPONENT_INIT(prte, schizo, prte)
 
@@ -56,6 +59,16 @@ static int component_register(void)
                                                 PMIX_MCA_BASE_VAR_TYPE_BOOL,
                                                 &prte_mca_schizo_prte_component.warn_deprecations);
 
+    return PRTE_SUCCESS;
+}
+
+static int component_close(void)
+{
+    /* the version string we handed PMIx is ours to reclaim */
+    if (NULL != prte_schizo_prte_version) {
+        free(prte_schizo_prte_version);
+        prte_schizo_prte_version = NULL;
+    }
     return PRTE_SUCCESS;
 }
 

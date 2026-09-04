@@ -10,4 +10,10 @@ find information on that subject here.
    :maxdepth: 2
 
    session_dirs.rst
+   per-app-mapping.rst
+   preloading-files.rst
+   publish-lookup.rst
    schedulers/index.rst
+   state_machine.rst
+   rml/index.rst
+   pmix2_vs_pmix.rst
