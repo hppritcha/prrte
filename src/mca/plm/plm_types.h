@@ -88,6 +88,7 @@ typedef int32_t prte_exit_code_t;
 #define PRTE_PROC_STATE_NO_PATH_TO_TARGET       (PRTE_PROC_STATE_ERROR + 16) /* no path for communicating to target peer */
 #define PRTE_PROC_STATE_FAILED_TO_CONNECT       (PRTE_PROC_STATE_ERROR + 17) /* unable to connect to target peer */
 #define PRTE_PROC_STATE_PEER_UNKNOWN            (PRTE_PROC_STATE_ERROR + 18) /* unknown peer */
+#define PRTE_PROC_STATE_KILLED_BY_RELEASE       (PRTE_PROC_STATE_ERROR + 19) /* the node the process ran on was released from the DVM */
 
 /* Define a boundary so that external developers
  * have a starting point for defining their own
@@ -130,6 +131,7 @@ typedef int32_t prte_job_state_t;
 #define PRTE_JOB_STATE_RUNNING               14 /* all procs have been fork'd */
 #define PRTE_JOB_STATE_SUSPENDED             15 /* job has been suspended */
 #define PRTE_JOB_STATE_REGISTERED            16 /* all procs registered for sync */
+#define PRTE_JOB_STATE_WAITING_FOR_DAEMONS   17 /* parked: daemon launch/shrink campaign in progress */
 #define PRTE_JOB_STATE_LOCAL_LAUNCH_COMPLETE 18 /* all local procs have attempted launch */
 #define PRTE_JOB_STATE_READY_FOR_DEBUG       19 /* all local procs report ready for debug */
 #define PRTE_JOB_STATE_STARTED               20 /* first process has been started */
@@ -180,6 +182,7 @@ typedef int32_t prte_job_state_t;
 #define PRTE_JOB_STATE_MAP_FAILED               (PRTE_JOB_STATE_ERROR + 19) /* job failed to map */
 #define PRTE_JOB_STATE_CANNOT_LAUNCH            (PRTE_JOB_STATE_ERROR + 20) /* resources were busy and so the job cannot be launched */
 #define PRTE_JOB_STATE_FILES_POSN_FAILED        (PRTE_JOB_STATE_ERROR + 21)
+#define PRTE_JOB_STATE_KILLED_BY_RELEASE        (PRTE_JOB_STATE_ERROR + 22) /* a node release killed at least one of this job's procs */
 
 #define PRTE_JOB_STATE_FT (PRTE_JOB_STATE_ERROR + 200)
 /* define an FT event */
@@ -228,6 +231,7 @@ typedef uint8_t prte_plm_cmd_flag_t;
 #define PRTE_PLM_TOOL_ATTACHED_CMD      4
 #define PRTE_PLM_READY_FOR_DEBUG_CMD    5
 #define PRTE_PLM_LOCAL_LAUNCH_COMP_CMD  6
+#define PRTE_PLM_TOOL_DEPARTED_CMD      7
 
 END_C_DECLS
 

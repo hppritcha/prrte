@@ -1,6 +1,6 @@
 # -*- text -*-
 #
-# Copyright (c) 2025      Nanook Consulting  All rights reserved.
+# Copyright (c) 2025-2026 Nanook Consulting  All rights reserved.
 # $COPYRIGHT$
 #
 # Additional copyrights may follow
@@ -8,6 +8,12 @@
 # $HEADER$
 #
 # This is the US/English general help file for PRTE's hwloc support.
+#
+[version]
+
+%s (%s) %s
+
+%s
 #
 [usage]
 
@@ -24,14 +30,27 @@ option to the help request as "--help <option>".
 +----------------------+-----------------------------------------------+
 | Option               | Description                                   |
 |======================|===============================================|
+| "-h" | "--help"      | This help message                             |
++----------------------+-----------------------------------------------+
+| "-h <arg0>" |        | Help for the specified option                 |
+| "--help <arg0>"      |                                               |
++----------------------+-----------------------------------------------+
+| "-V" | "--version"   | Print version and exit                        |
+|======================|===============================================|
+| "--pmixmca <key>     | Pass context-specific PMIx MCA parameters     |
+| <value>"             | ("key" is the parameter name; "value" is the  |
+|                      | parameter value)                              |
++----------------------+-----------------------------------------------+
+| "--prtemca <key>     | Pass context-specific PRRTE MCA parameters    |
+| <value>"             | ("key" is the parameter name; "value" is the  |
+|                      | parameter value)                              |
+|======================|===============================================|
 | "-a" | "--all"       | Show all configuration options and MCA        |
 |                      | parameters                                    |
 +----------------------+-----------------------------------------------+
 | "--arch"             | Show architecture on which PRRTE was compiled |
 +----------------------+-----------------------------------------------+
 | "-c" | "--config"    | Show configuration options                    |
-+----------------------+-----------------------------------------------+
-| "-h" | "--help"      | This help message                             |
 +----------------------+-----------------------------------------------+
 | "--hostname"         | Show the hostname on which PRRTE was          |
 |                      | configured and built                          |
@@ -45,6 +64,16 @@ option to the help request as "--help <option>".
 |                      | specific component names (if only             |
 |                      | "<framework>" is given, then all components   |
 |                      | will be reported).                            |
++----------------------+-----------------------------------------------+
+| "--params <framework | Synonym for "--param"                         |
+| >:<component1>,<com  |                                               |
+| ponent2>"            |                                               |
++----------------------+-----------------------------------------------+
+| "-t" | "--type       | Show MCA parameters of the specified type.    |
+| <type>"              | Accepts the following parameters:             |
+|                      | "unsigned_int", "unsigned_long",              |
+|                      | "unsigned_long_long", "size_t", "string",     |
+|                      | "version_string", "bool", and "double".       |
 +----------------------+-----------------------------------------------+
 | "--path <type>"      | Show paths with which PRRTE was configured.   |
 |                      | Accepts the following parameters: "prefix",   |
@@ -60,10 +89,43 @@ option to the help request as "--help <option>".
 |                      | can be one of: "full", "major", "minor",      |
 |                      | "release", "greek", "git".                    |
 +----------------------+-----------------------------------------------+
-| "-V" | "--version"   | Print version and exit                        |
+| "--include-pmix"     | Include PMIx params and build info in output  |
++----------------------+-----------------------------------------------+
+| "--pretty-print"     | When used in conjunction with other           |
+|                      | parameters, display the output in "pretty-    |
+|                      | print" format (default)                       |
++----------------------+-----------------------------------------------+
+| "--parsable"         | When used in conjunction with other           |
+|                      | parameters, display the output in a machine-  |
+|                      | parsable format                               |
++----------------------+-----------------------------------------------+
+| "--parseable"        | Synonym for "--parsable"                      |
++----------------------+-----------------------------------------------+
+| "--color <hue>"      | Control color coding: "auto" (default),       |
+|                      | "never", "always"                             |
++----------------------+-----------------------------------------------+
+| "--show-failed"      | Show the components that failed to load,      |
+|                      | along with the reason why they failed         |
++----------------------+-----------------------------------------------+
+| "--selected-only"    | Show only variables from selected (active)    |
+|                      | components                                    |
 +----------------------+-----------------------------------------------+
 
-Report bugs to %s
+%s
+#
+[pmixmca]
+
+Pass a PMIx MCA parameter
+
+Syntax: "--pmixmca <key> <value>", where "key" is the parameter name
+and "value" is the parameter value.
+#
+[prtemca]
+
+Pass a PRRTE MCA parameter
+
+Syntax: "--prtemca <key> <value>", where "key" is the parameter name
+and "value" is the parameter value.
 #
 [param]
 
@@ -72,6 +134,61 @@ Syntax: "--param <arg0> <arg1>"
 Show MCA parameters.  The first parameter is the framework (or the
 keyword "all"); the second parameter is the specific component name
 (or the keyword "all").
+#
+[params]
+
+Syntax: "--params <arg0> <arg1>"
+
+Synonym for "--param".
+#
+[type]
+
+Syntax: "--type <arg0>"
+
+Show MCA parameters of the type specified in the parameter. Accepts
+the following parameters: "unsigned_int", "unsigned_long",
+"unsigned_long_long", "size_t", "string", "version_string", "bool",
+and "double".
+#
+[pretty-print]
+
+Syntax: "--pretty-print"
+
+When used in conjunction with other parameters, the output is
+displayed in "pretty-print" format (default)
+#
+[parsable]
+
+Syntax: "--parsable"
+
+When used in conjunction with other parameters, the output is
+displayed in a machine-parsable format
+#
+[parseable]
+
+Syntax: "--parseable"
+
+Synonym for "--parsable"
+#
+[color]
+
+Syntax: "--color <hue>"
+
+Control color coding of the output: "auto" (the default - color only
+when stdout is a terminal), "never", or "always"
+#
+[show-failed]
+
+Syntax: "--show-failed"
+
+Show the components that failed to load, along with the reason why
+they failed
+#
+[selected-only]
+
+Syntax: "--selected-only"
+
+Show only variables from selected (active) components
 #
 [internal]
 
@@ -110,6 +227,12 @@ Syntax: "-a" or "--all"
 
 Show all configuration options and MCA parameters
 #
+[include-pmix]
+
+Syntax: "--include-pmix"
+
+Include PMIx params and build info in output
+#
 [lib-call-fail]
 
 A library call unexpectedly failed.  This is a terminal error; please
@@ -118,24 +241,14 @@ show this message to a PRTE wizard:
    Library call: %s Source file: %s Source line number: %d
 
 Aborting...
+
 #
-[developer warning: field too long]
+[no-args]
 
-DEVELOPER WARNING: A field in prte_info output is too long and will
-appear poorly in the prettyprint output.
+The %s command does not accept arguments other than those specifically
+defined by the command. The following were not recognized:
 
-   Value:      "%s" Max length: %d
-#
-[not-found]
+   Args: %s
 
-The specified framework could not be found:
-
-   Framework: %s
-
-This could be due to a misspelling of the framework name, or because
-support for that framework was not configured into this version of
-PRTE. Please see
-
-   prte_info --config
-
-for a full report of how PRTE was configured.
+Please see "%s --help" for a description of all accepted command
+options.

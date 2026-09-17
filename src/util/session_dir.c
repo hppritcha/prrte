@@ -13,7 +13,7 @@
  * Copyright (c) 2015      Research Organization for Information Science
  *                         and Technology (RIST). All rights reserved.
  * Copyright (c) 2015-2020 Intel, Inc.  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -43,6 +43,7 @@
 #    include <unistd.h>
 #endif /* HAVE_UNISTD_H */
 #include <errno.h>
+#include <fcntl.h>
 #ifdef HAVE_DIRENT_H
 #    include <dirent.h>
 #endif /* HAVE_DIRENT_H */
@@ -62,6 +63,7 @@
 #include "src/util/name_fns.h"
 #include "src/util/proc_info.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 
 #include "src/mca/errmgr/errmgr.h"
 #include "src/mca/ras/base/base.h"
@@ -83,9 +85,74 @@ static bool setup_base_complete = false;
  * Funcationality
  ****************************/
 /*
+ * Confirm that a session directory PRRTE has just created - or found
+ * already sitting at the name it composed - is really ours to use.
+ *
+ * Every name that reaches here is one PRRTE composes itself
+ * (<tmpdir>/<prefix>.<pid>, then <jobid>, then <rank>), and the top of
+ * that tree sits under a world-writable root such as /tmp. The name is
+ * therefore predictable by anyone on the node, who can create it first.
+ * pmix_os_dirpath_create() answers PMIX_ERR_EXISTS for such a directory
+ * and cannot refuse it on ownership grounds: its generic callers
+ * legitimately hand it directories they do not own - the system tmpdir
+ * itself, or a shared, user-named output directory. The decision can
+ * only be made here, where the name is known to be a per-user one.
+ * Adopting a planted directory would put our rendezvous files and
+ * per-job data where another user can read and replace them, and the
+ * finalize path would later recursively destroy it.
+ *
+ * The inspection is done through a descriptor so the directory checked
+ * is the directory the path names at that moment: O_NOFOLLOW refuses a
+ * symlink planted at the final component (the composed names never end
+ * in a separator, which would defeat it). Nothing is done by path after
+ * the check - another user cannot change the ownership or mode of a
+ * directory we own, and the sticky bit on a shared root keeps them from
+ * renaming it away. The root itself was handed to us by the user or the
+ * system and is deliberately not examined.
+ *
+ * A directory we own is refused too if it is writable by group or
+ * other: we never create one that way, and one that is carries the same
+ * exposure as a foreign directory - someone else may already have put
+ * files in it.
+ */
+static int _check_owner(const pmix_nspace_t nspace, const char *directory)
+{
+    struct stat buf;
+    int fd, save;
+
+    fd = open(directory, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (0 > fd) {
+        save = errno;
+        prte_show_help(nspace, "help-prte-runtime.txt", "prte:session:dir:inspect", true,
+                       directory, strerror(save));
+        return PRTE_ERR_SILENT;
+    }
+    if (0 != fstat(fd, &buf)) {
+        save = errno;
+        close(fd);
+        prte_show_help(nspace, "help-prte-runtime.txt", "prte:session:dir:inspect", true,
+                       directory, strerror(save));
+        return PRTE_ERR_SILENT;
+    }
+    close(fd);
+
+    if (buf.st_uid != geteuid()) {
+        prte_show_help(nspace, "help-prte-runtime.txt", "prte:session:dir:owner", true,
+                       directory, (unsigned long) buf.st_uid, (unsigned long) geteuid());
+        return PRTE_ERR_SILENT;
+    }
+    if (0 != (buf.st_mode & (S_IWGRP | S_IWOTH))) {
+        prte_show_help(nspace, "help-prte-runtime.txt", "prte:session:dir:writable", true,
+                       directory, (unsigned int) (buf.st_mode & 07777));
+        return PRTE_ERR_SILENT;
+    }
+    return PRTE_SUCCESS;
+}
+
+/*
  * Check and create the directory requested
  */
-static int _create_dir(char *directory)
+static int _create_dir(const pmix_nspace_t nspace, char *directory)
 {
     mode_t my_mode = S_IRWXU; /* I'm looking for full rights */
     int ret;
@@ -93,13 +160,16 @@ static int _create_dir(char *directory)
     /* attempt to create it */
     ret = pmix_os_dirpath_create(directory, my_mode);
     if (PMIX_ERR_EXISTS == ret) {
-        // existence is good enough
+        // existence is good enough - provided it is ours
         ret = PMIX_SUCCESS;
     } else if (PMIX_SUCCESS != ret) {
         PMIX_ERROR_LOG(ret);
+        return prte_pmix_convert_status(ret);
     }
-    ret = prte_pmix_convert_status(ret);
-    return ret;
+    // check a freshly created directory as well: the check is cheap,
+    // and pmix_os_dirpath_create() answers success, not EXISTS, when
+    // the final component appeared while it was building the tree
+    return _check_owner(nspace, directory);
 }
 
 static int _setup_top_session_dir(void)
@@ -138,7 +208,7 @@ static int _setup_top_session_dir(void)
             }
         }
     }
-    rc = _create_dir(prte_process_info.top_session_dir);
+    rc = _create_dir(PRTE_PROC_MY_NAME->nspace, prte_process_info.top_session_dir);
 
 exit:
     if (PRTE_SUCCESS != rc) {
@@ -161,7 +231,14 @@ static int _setup_job_session_dir(prte_job_t *jdata)
                               PRTE_LOCAL_JOBID_PRINT(jdata->nspace))) {
             return PRTE_ERR_OUT_OF_RESOURCE;
         }
-        rc = _create_dir(jdata->session_dir);
+        rc = _create_dir(jdata->nspace, jdata->session_dir);
+        if (PRTE_SUCCESS != rc) {
+            // forget a directory we did not get: the finalize path
+            // recursively destroys whatever this names, and it may be
+            // someone else's
+            free(jdata->session_dir);
+            jdata->session_dir = NULL;
+        }
     }
     return rc;
 }
@@ -176,7 +253,7 @@ static int _setup_proc_session_dir(prte_job_t *jdata,
                           PMIX_RANK_PRINT(p->rank))) {
         return PRTE_ERR_OUT_OF_RESOURCE;
     }
-    rc = _create_dir(tmp);
+    rc = _create_dir(jdata->nspace, tmp);
     free(tmp);
     return rc;
 }
@@ -185,11 +262,11 @@ static int setup_base(void)
 {
     int rc;
 
-    // only do this once
+    // only do this once, and only latch that once it has actually worked -
+    // a failed attempt used to be remembered as a success
     if (setup_base_complete) {
         return PRTE_SUCCESS;
     }
-    setup_base_complete = true;
 
     /* Ensure that system info is set */
     prte_proc_info();
@@ -197,29 +274,32 @@ static int setup_base(void)
     /* BEFORE doing anything else, check to see if this prefix is
      * allowed by the system
      */
-    if (NULL != prte_prohibited_session_dirs || NULL != prte_process_info.tmpdir_base) {
+    if (NULL != prte_prohibited_session_dirs && NULL != prte_process_info.tmpdir_base) {
         char **list;
         int i, len;
         /* break the string into tokens - it should be
          * separated by ','
          */
-        list = PMIX_ARGV_SPLIT_COMPAT(prte_prohibited_session_dirs, ',');
-        len = PMIX_ARGV_COUNT_COMPAT(list);
+        list = PMIx_Argv_split(prte_prohibited_session_dirs, ',');
+        len = PMIx_Argv_count(list);
         /* cycle through the list */
         for (i = 0; i < len; i++) {
             /* check if prefix matches */
             if (0 == strncmp(prte_process_info.tmpdir_base, list[i], strlen(list[i]))) {
                 /* this is a prohibited location */
-                pmix_show_help("help-prte-runtime.txt", "prte:session:dir:prohibited", true,
+                prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prte-runtime.txt", "prte:session:dir:prohibited", true,
                                prte_process_info.tmpdir_base, prte_prohibited_session_dirs);
-                PMIX_ARGV_FREE_COMPAT(list);
+                PMIx_Argv_free(list);
                 return PRTE_ERR_FATAL;
             }
         }
-        PMIX_ARGV_FREE_COMPAT(list); /* done with this */
+        PMIx_Argv_free(list); /* done with this */
     }
 
     rc = _setup_top_session_dir();
+    if (PRTE_SUCCESS == rc) {
+        setup_base_complete = true;
+    }
 
     return rc;
 }
@@ -261,7 +341,7 @@ int prte_session_dir(pmix_proc_t *proc)
         }
     }
 
-    if (prte_debug_flag) {
+    if (prte_debug_daemons_flag) {
         pmix_output(0, "jobdir: %s", PRTE_PRINTF_FIX_STRING(jdata->session_dir));
         pmix_output(0, "top: %s", PRTE_PRINTF_FIX_STRING(prte_process_info.top_session_dir));
         pmix_output(0, "tmp: %s", PRTE_PRINTF_FIX_STRING(prte_process_info.tmpdir_base));
@@ -293,6 +373,7 @@ void prte_job_session_dir_finalize(prte_job_t *jdata)
         if (prte_finalizing) {
             if (NULL != prte_process_info.top_session_dir) {
                 pmix_os_dirpath_destroy(prte_process_info.top_session_dir, true, _check_file);
+                /* if the top session dir is now empty, remove it */
                 rmdir(prte_process_info.top_session_dir);
                 free(prte_process_info.top_session_dir);
                 prte_process_info.top_session_dir = NULL;
@@ -328,6 +409,7 @@ static bool _check_file(const char *root, const char *path)
         if (0 != stat(fullpath, &st)) {
             pmix_output(0, "%s Syscall failure for stat: %s(%d)",
                         PMIX_NAME_PRINT(&pmix_globals.myid), strerror(errno), errno);
+            free(fullpath);
             return true;
         }
         free(fullpath);

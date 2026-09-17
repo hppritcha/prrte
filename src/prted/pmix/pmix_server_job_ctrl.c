@@ -19,7 +19,7 @@
  * Copyright (c) 2014-2019 Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2020      IBM Corporation.  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -30,41 +30,53 @@
 
 #include "prte_config.h"
 
-#ifdef HAVE_UNISTD_H
-#    include <unistd.h>
-#endif
-
-#include "src/hwloc/hwloc-internal.h"
 #include "src/pmix/pmix-internal.h"
-#include "src/util/pmix_argv.h"
 #include "src/util/pmix_output.h"
 
+#include "src/grpcomm/grpcomm.h"
 #include "src/mca/errmgr/errmgr.h"
-#include "src/mca/grpcomm/base/base.h"
-#include "src/mca/iof/base/base.h"
-#include "src/mca/iof/iof.h"
-#include "src/mca/plm/base/plm_private.h"
+#include "src/mca/odls/odls_types.h"
 #include "src/mca/plm/plm.h"
-#include "src/mca/plm/base/plm_private.h"
-#include "src/mca/rmaps/rmaps_types.h"
 #include "src/rml/rml.h"
-#include "src/mca/schizo/schizo.h"
-#include "src/mca/state/state.h"
 #include "src/runtime/prte_globals.h"
-#include "src/runtime/prte_locks.h"
-#include "src/threads/pmix_threads.h"
 #include "src/util/name_fns.h"
-#include "src/util/pmix_show_help.h"
 
 #include "src/prted/pmix/pmix_server_internal.h"
 
-
-pmix_status_t pmix_server_job_ctrl_fn(const pmix_proc_t *requestor, const pmix_proc_t targets[],
-                                      size_t ntargets, const pmix_info_t directives[], size_t ndirs,
-                                      pmix_info_cbfunc_t cbfunc, void *cbdata)
+/* Record that a job is ending because someone asked for it to, rather than
+ * because it finished or failed.
+ *
+ * state/dvm reads PRTE_JOB_CANCELLED in the two places that decide what
+ * status a terminating job carries - check_complete_resume() and
+ * dvm_notify() - and answers PMIX_ERR_JOB_CANCELED there instead of the
+ * job's exit code.  Without it the tool is told whatever the processes
+ * happened to exit with when we killed them, which it cannot tell from the
+ * job having failed on its own.
+ *
+ * PRTE_ATTR_LOCAL: both readers run on the DVM master, against the master's
+ * own copy of the job, so this never needs to travel.
+ *
+ * The daemon job is not a job anybody cancelled, and a tool's job object
+ * never reaches those readers; skip both. */
+static void mark_cancelled(prte_job_t *jdata)
 {
-    int rc, j;
-    int32_t signum;
+    if (NULL == jdata ||
+        PMIX_CHECK_NSPACE_STRICT(jdata->nspace, PRTE_PROC_MY_NAME->nspace) ||
+        PRTE_FLAG_TEST(jdata, PRTE_JOB_FLAG_TOOL)) {
+        return;
+    }
+    prte_set_bool_attribute(&jdata->attributes, PRTE_JOB_CANCELLED, PRTE_ATTR_LOCAL, true);
+}
+
+/* process a job control request - runs on the PRRTE progress
+ * thread, since it accesses proc objects and drives the PLM
+ * and daemon-command xcasts */
+static pmix_status_t process_job_ctrl(const pmix_proc_t *requestor, const pmix_proc_t targets[],
+                                      size_t ntargets, const pmix_info_t directives[], size_t ndirs)
+{
+    pmix_status_t rc;
+    int prc, j;
+    int32_t signum, ntgts;
     size_t m, n;
     prte_proc_t *proc;
     pmix_nspace_t jobid;
@@ -72,12 +84,7 @@ pmix_status_t pmix_server_job_ctrl_fn(const pmix_proc_t *requestor, const pmix_p
     pmix_data_buffer_t *cmd;
     prte_daemon_cmd_flag_t cmmnd;
     pmix_proc_t *proct;
-    PRTE_HIDE_UNUSED_PARAMS(cbfunc, cbdata);
-
-    pmix_output_verbose(2, prte_pmix_server_globals.output,
-                        "%s job control request from %s:%d",
-                        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                        requestor->nspace, requestor->rank);
+    PRTE_HIDE_UNUSED_PARAMS(requestor);
 
     for (m = 0; m < ndirs; m++) {
         if (PMIX_CHECK_KEY(&directives[m], PMIX_JOB_CTRL_KILL)) {
@@ -87,9 +94,15 @@ pmix_status_t pmix_server_job_ctrl_fn(const pmix_proc_t *requestor, const pmix_p
             } else {
                 PMIX_CONSTRUCT(&parray, pmix_pointer_array_t);
                 for (n = 0; n < ntargets; n++) {
+                    /* whatever we are about to kill, its job did not end of
+                     * its own accord */
+                    mark_cancelled(prte_get_job_data_object(targets[n].nspace));
                     if (PMIX_RANK_WILDCARD == targets[n].rank) {
                         /* create an object */
                         proc = PMIX_NEW(prte_proc_t);
+                        if (NULL == proc) {
+                            continue;
+                        }
                         PMIX_LOAD_PROCID(&proc->name, targets[n].nspace, PMIX_RANK_WILDCARD);
                     } else {
                         /* get the proc object for this proc */
@@ -103,8 +116,9 @@ pmix_status_t pmix_server_job_ctrl_fn(const pmix_proc_t *requestor, const pmix_p
                 }
                 ptrarray = &parray;
             }
-            if (PRTE_SUCCESS != (rc = prte_plm.terminate_procs(ptrarray))) {
-                PRTE_ERROR_LOG(rc);
+            prc = prte_plm.terminate_procs(ptrarray);
+            if (PRTE_SUCCESS != prc) {
+                PRTE_ERROR_LOG(prc);
             }
             if (NULL != ptrarray) {
                 /* cleanup the array */
@@ -115,15 +129,22 @@ pmix_status_t pmix_server_job_ctrl_fn(const pmix_proc_t *requestor, const pmix_p
                 }
                 PMIX_DESTRUCT(&parray);
             }
-            if (PMIX_SUCCESS != rc) {
-                return rc;
+            if (PRTE_SUCCESS != prc) {
+                return prte_pmix_convert_rc(prc);
             }
             return PMIX_OPERATION_SUCCEEDED;
         }
 
         if (PMIX_CHECK_KEY(&directives[m], PMIX_JOB_CTRL_TERMINATE)) {
             if (NULL == targets) {
-                /* terminate the daemons and all running jobs */
+                /* terminate the daemons and all running jobs.  This is the
+                 * pterm path - it sends exactly this directive with no
+                 * targets - so every job still running in the DVM is being
+                 * cancelled, and each should say so rather than report the
+                 * status its processes happened to die with. */
+                for (n = 0; n < (size_t) prte_job_data->size; n++) {
+                    mark_cancelled((prte_job_t *) pmix_pointer_array_get_item(prte_job_data, n));
+                }
                 PMIX_DATA_BUFFER_CREATE(cmd);
                 /* pack the command */
                 cmmnd = PRTE_DAEMON_HALT_VM_CMD;
@@ -133,15 +154,22 @@ pmix_status_t pmix_server_job_ctrl_fn(const pmix_proc_t *requestor, const pmix_p
                     PMIX_DATA_BUFFER_RELEASE(cmd);
                     return rc;
                 }
-                if (PRTE_SUCCESS != (rc = prte_grpcomm.xcast(PRTE_RML_TAG_DAEMON, cmd))) {
-                    PRTE_ERROR_LOG(rc);
-                }
+                prc = prte_grpcomm_xcast(PRTE_RML_TAG_DAEMON, cmd);
                 PMIX_DATA_BUFFER_RELEASE(cmd);
-                if (PMIX_SUCCESS != rc) {
-                    return rc;
+                if (PRTE_SUCCESS != prc) {
+                    PRTE_ERROR_LOG(prc);
+                    return prte_pmix_convert_rc(prc);
                 }
                 return PMIX_OPERATION_SUCCEEDED;
             }
+            /* Terminating a named set of procs is PMIX_JOB_CTRL_KILL's job
+             * here; this directive only ever means the whole DVM, and with
+             * targets there is nothing for it to do.  Say so rather than
+             * falling through, which left the refusal conditional on what
+             * else happened to be in the array - a request carrying both
+             * this and a SIGNAL was answered by signalling the job and
+             * reporting success. */
+            return PMIX_ERR_NOT_SUPPORTED;
         }
 
         if (PMIX_CHECK_KEY(&directives[m], PMIX_JOB_CTRL_SIGNAL)) {
@@ -168,7 +196,7 @@ pmix_status_t pmix_server_job_ctrl_fn(const pmix_proc_t *requestor, const pmix_p
                 return rc;
             }
             /* pack the signal */
-            PMIX_VALUE_GET_NUMBER(rc, &directives[m].value, signum, int32_t);
+            rc = PMIx_Value_get_number(&directives[m].value, &signum, PMIX_INT32);
             if (PMIX_SUCCESS != rc) {
                 PMIX_DATA_BUFFER_RELEASE(cmd);
                 return rc;
@@ -179,18 +207,32 @@ pmix_status_t pmix_server_job_ctrl_fn(const pmix_proc_t *requestor, const pmix_p
                 PMIX_DATA_BUFFER_RELEASE(cmd);
                 return rc;
             }
-            if (PRTE_SUCCESS != (rc = prte_grpcomm.xcast(PRTE_RML_TAG_DAEMON, cmd))) {
-                PRTE_ERROR_LOG(rc);
-            }
+            prc = prte_grpcomm_xcast(PRTE_RML_TAG_DAEMON, cmd);
             PMIX_DATA_BUFFER_RELEASE(cmd);
-            if (PMIX_SUCCESS != rc) {
-                return rc;
+            if (PRTE_SUCCESS != prc) {
+                PRTE_ERROR_LOG(prc);
+                return prte_pmix_convert_rc(prc);
             }
             return PMIX_OPERATION_SUCCEEDED;
         }
 
-#ifdef PMIX_JOB_CTRL_DEFINE_PSET
         if (PMIX_CHECK_KEY(&directives[m], PMIX_JOB_CTRL_DEFINE_PSET)) {
+            /* The directive is the client's, straight off the wire, and
+             * nothing between it and here checks what it holds. The name
+             * is read out of the value union below, so a value of any
+             * other type hands the packer whatever those eight bytes are
+             * as a char* and it faults in strlen - one PMIx_Job_control
+             * away, from any process attached to this daemon. A member
+             * list is equally required: the receiving daemon sizes an
+             * allocation from the count and PMIx refuses a set with no
+             * members or no name, so either would leave every daemon in
+             * the DVM logging an error while the requestor was told the
+             * operation succeeded. */
+            if (PMIX_STRING != directives[m].value.type ||
+                NULL == directives[m].value.data.string ||
+                NULL == targets || 0 == ntargets) {
+                return PMIX_ERR_BAD_PARAM;
+            }
             // goes to all daemons
             PMIX_DATA_BUFFER_CREATE(cmd);
             cmmnd = PRTE_DAEMON_DEFINE_PSET;
@@ -208,8 +250,12 @@ pmix_status_t pmix_server_job_ctrl_fn(const pmix_proc_t *requestor, const pmix_p
                 PMIX_DATA_BUFFER_RELEASE(cmd);
                 return rc;
             }
-            // pack the #targets
-            rc = PMIx_Data_pack(NULL, cmd, &ntargets, 1, PMIX_INT32);
+            /* pack the #targets - the receiver unpacks an int32, so
+             * narrow it here rather than handing PMIx the address of a
+             * size_t and letting it read the wrong half on a big-endian
+             * machine */
+            ntgts = (int32_t) ntargets;
+            rc = PMIx_Data_pack(NULL, cmd, &ntgts, 1, PMIX_INT32);
             if (PMIX_SUCCESS != rc) {
                 PMIX_ERROR_LOG(rc);
                 PMIX_DATA_BUFFER_RELEASE(cmd);
@@ -222,17 +268,163 @@ pmix_status_t pmix_server_job_ctrl_fn(const pmix_proc_t *requestor, const pmix_p
                 PMIX_DATA_BUFFER_RELEASE(cmd);
                 return rc;
             }
-            if (PRTE_SUCCESS != (rc = prte_grpcomm.xcast(PRTE_RML_TAG_DAEMON, cmd))) {
-                PRTE_ERROR_LOG(rc);
-            }
+            prc = prte_grpcomm_xcast(PRTE_RML_TAG_DAEMON, cmd);
             PMIX_DATA_BUFFER_RELEASE(cmd);
-            if (PMIX_SUCCESS != rc) {
-                return rc;
+            if (PRTE_SUCCESS != prc) {
+                PRTE_ERROR_LOG(prc);
+                return prte_pmix_convert_rc(prc);
             }
             return PMIX_OPERATION_SUCCEEDED;
         }
-#endif
     }
 
     return PMIX_ERR_NOT_SUPPORTED;
+}
+
+/* release the one-element context-id result once it has been packed */
+static void ctxid_relfn(void *cbdata)
+{
+    pmix_info_t *results = (pmix_info_t *) cbdata;
+
+    PMIX_INFO_FREE(results, 1);
+}
+
+/* Answer a PMIX_GROUP_ASSIGN_CONTEXT_ID directive.
+ *
+ * This arrives as a job-control request because the group it is for is being
+ * formed by PMIx_Group_invite, which runs no server collective - so unlike
+ * PMIx_Group_construct there is no group up-call to carry the request, and
+ * the PMIx library asks this way instead.
+ *
+ * Only the DVM master holds the id pool, and the leader of an invited group
+ * is an application process that may sit anywhere, so this usually has to be
+ * relayed. Nothing about the id depends on the directives, so the relay
+ * carries none of them.
+ *
+ * On PMIX_SUCCESS this has taken over the caddy and answered (or will
+ * answer) the request; the caller must do neither. Any other return means it
+ * did neither and the caller still owns both. */
+static pmix_status_t assign_group_ctxid(prte_pmix_server_op_caddy_t *cd)
+{
+    prte_pmix_server_req_t *req;
+    pmix_info_t *results;
+    size_t ctxid;
+    int rc;
+
+    if (PRTE_PROC_IS_MASTER) {
+        rc = prte_grpcomm_assign_context_id(&ctxid);
+        if (PRTE_SUCCESS != rc) {
+            return prte_pmix_convert_rc(rc);
+        }
+        PMIX_INFO_CREATE(results, 1);
+        if (NULL == results) {
+            return PMIX_ERR_NOMEM;
+        }
+        PMIX_INFO_LOAD(&results[0], PMIX_GROUP_CONTEXT_ID, &ctxid, PMIX_SIZE);
+        /* the reply is packed after a thread shift, so hand the array over
+         * with a release function rather than freeing it here */
+        cd->infocbfunc(PMIX_SUCCESS, results, 1, cd->cbdata, ctxid_relfn, results);
+        PMIX_RELEASE(cd);
+        return PMIX_SUCCESS;
+    }
+
+    req = PMIX_NEW(prte_pmix_server_req_t);
+    if (NULL == req) {
+        return PMIX_ERR_NOMEM;
+    }
+    pmix_asprintf(&req->operation, "GROUPCTXID");
+    PMIX_PROC_LOAD(&req->tproc, cd->proc.nspace, cd->proc.rank);
+    req->infocbfunc = cd->infocbfunc;
+    req->cbdata = cd->cbdata;
+    req->local_index = pmix_pointer_array_add(&prte_pmix_server_globals.local_reqs, req);
+    rc = prte_server_send_request(PRTE_PMIX_GROUP_CTXID, req);
+    if (PRTE_SUCCESS != rc) {
+        /* nothing will answer it, so take it back off the tracker and let the
+         * caller report the failure */
+        pmix_pointer_array_set_item(&prte_pmix_server_globals.local_reqs,
+                                    req->local_index, NULL);
+        PMIX_RELEASE(req);
+        return prte_pmix_convert_rc(rc);
+    }
+    PMIX_RELEASE(cd);
+    return PMIX_SUCCESS;
+}
+
+static void _job_ctrl(int sd, short args, void *cbdata)
+{
+    prte_pmix_server_op_caddy_t *cd = (prte_pmix_server_op_caddy_t *) cbdata;
+    pmix_status_t rc;
+    size_t n;
+    bool ctxid_req = false;
+    PRTE_HIDE_UNUSED_PARAMS(sd, args);
+
+    PMIX_ACQUIRE_OBJECT(cd);
+
+    /* A context-id request is the one directive here that produces a result
+     * rather than a status, and it may have to be relayed to the master, so
+     * it is handled ahead of process_job_ctrl() - which can express neither.
+     * It takes over the caddy when it succeeds. */
+    for (n = 0; n < cd->ndirs; n++) {
+        if (PMIX_CHECK_KEY(&cd->directives[n], PMIX_GROUP_ASSIGN_CONTEXT_ID) &&
+            PMIX_INFO_TRUE(&cd->directives[n])) {
+            ctxid_req = true;
+            break;
+        }
+    }
+    if (ctxid_req) {
+        if (NULL == cd->infocbfunc) {
+            /* there would be nowhere to put the answer */
+            rc = PMIX_ERR_NOT_SUPPORTED;
+        } else {
+            rc = assign_group_ctxid(cd);
+            if (PMIX_SUCCESS == rc) {
+                return;
+            }
+        }
+        if (NULL != cd->infocbfunc) {
+            cd->infocbfunc(rc, NULL, 0, cd->cbdata, NULL, NULL);
+        }
+        PMIX_RELEASE(cd);
+        return;
+    }
+
+    rc = process_job_ctrl(&cd->proc, cd->procs, cd->nprocs, cd->directives, cd->ndirs);
+    if (PMIX_OPERATION_SUCCEEDED == rc) {
+        rc = PMIX_SUCCESS;
+    }
+    if (NULL != cd->infocbfunc) {
+        cd->infocbfunc(rc, NULL, 0, cd->cbdata, NULL, NULL);
+    }
+    PMIX_RELEASE(cd);
+}
+
+pmix_status_t pmix_server_job_ctrl_fn(const pmix_proc_t *requestor, const pmix_proc_t targets[],
+                                      size_t ntargets, const pmix_info_t directives[], size_t ndirs,
+                                      pmix_info_cbfunc_t cbfunc, void *cbdata)
+{
+    prte_pmix_server_op_caddy_t *cd;
+
+    pmix_output_verbose(2, prte_pmix_server_globals.output,
+                        "%s job control request from %s:%d",
+                        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                        requestor->nspace, requestor->rank);
+
+    /* this upcall arrives on the PMIx progress thread - the request
+     * requires access to proc objects, the PLM, and the daemon
+     * command channel, so shift it to our progress thread. The
+     * targets and directives arrays remain valid until we invoke
+     * the callback, which happens at the end of the shifted
+     * handler */
+    cd = PMIX_NEW(prte_pmix_server_op_caddy_t);
+    memcpy(&cd->proc, requestor, sizeof(pmix_proc_t));
+    cd->procs = (pmix_proc_t *) targets;
+    cd->nprocs = ntargets;
+    cd->directives = (pmix_info_t *) directives;
+    cd->ndirs = ndirs;
+    cd->infocbfunc = cbfunc;
+    cd->cbdata = cbdata;
+    prte_event_set(prte_event_base, &(cd->ev), -1, PRTE_EV_WRITE, _job_ctrl, cd);
+    PMIX_POST_OBJECT(cd);
+    prte_event_active(&(cd->ev), PRTE_EV_WRITE, 1);
+    return PMIX_SUCCESS;
 }

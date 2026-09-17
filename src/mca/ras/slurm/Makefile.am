@@ -12,7 +12,9 @@
 # Copyright (c) 2010-2020 Cisco Systems, Inc.  All rights reserved
 # Copyright (c) 2017      IBM Corporation.  All rights reserved.
 # Copyright (c) 2017-2020 Intel, Inc.  All rights reserved.
-# Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+# Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
+# Copyright (c) 2026      Barcelona Supercomputing Center (BSC-CNS).
+#                         All rights reserved.
 # $COPYRIGHT$
 #
 # Additional copyrights may follow
@@ -28,8 +30,33 @@ EXTRA_DIST = \
 sources = \
         ras_slurm.h \
         ras_slurm_component.c \
-        ras_slurm_module.c
+        ras_slurm_module.c \
+        ras_slurm_modify_common.c \
+        ras_slurm_modify_cancel.c \
+        ras_slurm_modify_extend.c \
+        ras_slurm_modify_release.c \
+        ras_slurm_modify_release_tracker.c \
+        ras_slurm_modify_release_tracker.h
 
+# The build gate for the elastic extensions.  PRTE_WANT_SLURM_EXTENSIONS is
+# true when jansson was found (or --enable-testbuild-launchers was given, in
+# which case the real parser compiles against the declarations in
+# base/testbuild_jansson.h so this ~1000 line file is at least syntax-checked
+# on machines with no jansson -- such a build must not be run, see
+# src/mca/ras/AGENTS.md) AND the Slurm this tree was configured against is new
+# enough to emit the JSON the parser reads.  See configure.m4.
+#
+# Only the parser is switched.  The modify sources above are the request
+# plumbing -- they build command lines and are not tied to any Slurm release
+# -- and each of their three entry points refuses up front when the
+# extensions are not built, so there is no stub surface to keep in step here.
+if PRTE_WANT_SLURM_EXTENSIONS
+sources += \
+        ras_slurm_jansson.c
+else
+sources += \
+        ras_slurm_jansson_stub.c
+endif
 
 # Make the output library in this directory, and name it either
 # mca_<type>_<name>.la (for DSO builds) or libmca_<type>_<name>.la
@@ -50,9 +77,18 @@ endif
 mcacomponentdir = $(prtelibdir)
 mcacomponent_LTLIBRARIES = $(component)
 prte_mca_ras_slurm_la_SOURCES = $(component_sources)
-prte_mca_ras_slurm_la_LDFLAGS = -module -avoid-version
-prte_mca_ras_slurm_la_LIBADD = $(top_builddir)/src/libprrte.la
+prte_mca_ras_slurm_la_CPPFLAGS = $(ras_slurm_jansson_CPPFLAGS)
+prte_mca_ras_slurm_la_LDFLAGS = -module -avoid-version $(ras_slurm_jansson_LDFLAGS)
+# NOTE: only the DSO build names the common library here.  In a static
+# build libprrte links it directly (configure puts it in
+# MCA_prte_common_STATIC_LTLIBS), and naming it in this convenience
+# library too puts a second copy of common_slurm.o on libprrte's link
+# line -- "multiple definition of prte_common_slurm_jobid".
+prte_mca_ras_slurm_la_LIBADD = $(top_builddir)/src/mca/common/slurm/libmca_common_slurm.la \
+        $(top_builddir)/src/libprrte.la $(ras_slurm_jansson_LIBS)
 
 noinst_LTLIBRARIES = $(lib)
 libprtemca_ras_slurm_la_SOURCES = $(lib_sources)
-libprtemca_ras_slurm_la_LDFLAGS = -module -avoid-version
+libprtemca_ras_slurm_la_CPPFLAGS = $(ras_slurm_jansson_CPPFLAGS)
+libprtemca_ras_slurm_la_LDFLAGS = -module -avoid-version $(ras_slurm_jansson_LDFLAGS)
+libprtemca_ras_slurm_la_LIBADD = $(ras_slurm_jansson_LIBS)

@@ -107,7 +107,9 @@ static void compute_local_rank(prte_job_t *jdata)
 }
 
 int prte_rmaps_base_compute_vpids(prte_job_t *jdata,
-                                  prte_rmaps_options_t *options)
+                                  prte_rmaps_options_t *options,
+                                  int app_idx,
+                                  uint32_t *next_vpid)
 {
     int m, n, j, cnt;
     unsigned k, nobjs;
@@ -125,6 +127,15 @@ int prte_rmaps_base_compute_vpids(prte_job_t *jdata,
          * on-the-fly during mapping) */
         compute_local_rank(jdata);
         compute_app_rank(jdata);
+        if (0 <= app_idx && NULL != next_vpid) {
+            /* the mapper numbered this app's procs itself, starting from the
+             * cursor it was handed in options->start_vpid. Move the cursor
+             * past what it used, or the next app is numbered on top of it */
+            app = (prte_app_context_t *) pmix_pointer_array_get_item(jdata->apps, app_idx);
+            if (NULL != app) {
+                *next_vpid += app->num_procs;
+            }
+        }
         return PRTE_SUCCESS;
     }
 
@@ -139,8 +150,11 @@ int prte_rmaps_base_compute_vpids(prte_job_t *jdata,
      *     4 5       6 7        12 13     14 15
      */
     if (PRTE_RANK_BY_SLOT == options->rank) {
-        rank = 0;
+        rank = (app_idx >= 0 && NULL != next_vpid) ? (pmix_rank_t)*next_vpid : 0;
         for (j=0; j < jdata->apps->size; j++) {
+            if (app_idx >= 0 && j != app_idx) {
+                continue;
+            }
             if (NULL == (app = (prte_app_context_t*)pmix_pointer_array_get_item(jdata->apps, j))) {
                 continue;
             }
@@ -177,6 +191,9 @@ int prte_rmaps_base_compute_vpids(prte_job_t *jdata,
                 }
             }
         }
+        if (app_idx >= 0 && NULL != next_vpid) {
+            *next_vpid = (uint32_t)rank;
+        }
         compute_local_rank(jdata);
         compute_app_rank(jdata);
         return PRTE_SUCCESS;
@@ -192,8 +209,11 @@ int prte_rmaps_base_compute_vpids(prte_job_t *jdata,
      *     8 10     12 14        9 11     13 15
      */
     if (PRTE_RANK_BY_NODE == options->rank) {
-        rank = 0;
+        rank = (app_idx >= 0 && NULL != next_vpid) ? (pmix_rank_t)*next_vpid : 0;
         for (j=0; j < jdata->apps->size; j++) {
+            if (app_idx >= 0 && j != app_idx) {
+                continue;
+            }
             if (NULL == (app = (prte_app_context_t*)pmix_pointer_array_get_item(jdata->apps, j))) {
                 continue;
             }
@@ -238,6 +258,9 @@ int prte_rmaps_base_compute_vpids(prte_job_t *jdata,
                 }
             }
         }
+        if (app_idx >= 0 && NULL != next_vpid) {
+            *next_vpid = (uint32_t)rank;
+        }
         compute_local_rank(jdata);
         compute_app_rank(jdata);
         return PRTE_SUCCESS;
@@ -252,8 +275,11 @@ int prte_rmaps_base_compute_vpids(prte_job_t *jdata,
      *     2 3       6 7        10 11     14 15
      */
     if (PRTE_RANK_BY_FILL == options->rank) {
-        rank = 0;
+        rank = (app_idx >= 0 && NULL != next_vpid) ? (pmix_rank_t)*next_vpid : 0;
         for (j=0; j < jdata->apps->size; j++) {
+            if (app_idx >= 0 && j != app_idx) {
+                continue;
+            }
             if (NULL == (app = (prte_app_context_t*)pmix_pointer_array_get_item(jdata->apps, j))) {
                 continue;
             }
@@ -308,6 +334,9 @@ int prte_rmaps_base_compute_vpids(prte_job_t *jdata,
                 }
             }
         }
+        if (app_idx >= 0 && NULL != next_vpid) {
+            *next_vpid = (uint32_t)rank;
+        }
         compute_local_rank(jdata);
         compute_app_rank(jdata);
         return PRTE_SUCCESS;
@@ -325,13 +354,23 @@ int prte_rmaps_base_compute_vpids(prte_job_t *jdata,
      *     8 12      9 13       10 14     11 15
      */
     if (PRTE_RANK_BY_SPAN == options->rank) {
-        rank = 0;
+        rank = (app_idx >= 0 && NULL != next_vpid) ? (pmix_rank_t)*next_vpid : 0;
         for (j=0; j < jdata->apps->size; j++) {
+            if (app_idx >= 0 && j != app_idx) {
+                continue;
+            }
             if (NULL == (app = (prte_app_context_t*)pmix_pointer_array_get_item(jdata->apps, j))) {
                 continue;
             }
             cnt = 0;
-            while (cnt < app->num_procs) {
+            one_found = true;
+            /* the "one_found" guard matters as much here as it does in the
+             * by-node loop above: if a pass over every node and object ranks
+             * nothing - a proc whose locale is not an object of the mapping
+             * type, or an app whose num_procs outruns what was actually
+             * placed - then cnt never advances and this loop never ends */
+            while (cnt < app->num_procs && one_found) {
+                one_found = false;
                 // scan across the nodes
                 for (n=0; n < jdata->map->nodes->size; n++) {
                     node = (prte_node_t*)pmix_pointer_array_get_item(jdata->map->nodes, n);
@@ -383,11 +422,15 @@ int prte_rmaps_base_compute_vpids(prte_job_t *jdata,
                             }
                             ++rank;
                             ++cnt;
+                            one_found = true;
                             break;
                         }
                     }
                 }
             }
+        }
+        if (app_idx >= 0 && NULL != next_vpid) {
+            *next_vpid = (uint32_t)rank;
         }
         compute_local_rank(jdata);
         compute_app_rank(jdata);
@@ -398,63 +441,3 @@ int prte_rmaps_base_compute_vpids(prte_job_t *jdata,
     return PRTE_ERR_NOT_IMPLEMENTED;
 }
 
-/* when we restart a process on a different node, we have to
- * ensure that the node and local ranks assigned to the proc
- * don't overlap with any pre-existing proc on that node. If
- * we don't, then it would be possible for procs to conflict
- * when opening static ports, should that be enabled.
- */
-void prte_rmaps_base_update_local_ranks(prte_job_t *jdata, prte_node_t *oldnode,
-                                        prte_node_t *newnode, prte_proc_t *newproc)
-{
-    int k;
-    prte_node_rank_t node_rank;
-    prte_local_rank_t local_rank;
-    prte_proc_t *proc;
-
-    PMIX_OUTPUT_VERBOSE((5, prte_rmaps_base_framework.framework_output,
-                         "%s rmaps:base:update_local_ranks",
-                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
-
-    /* if the node hasn't changed, then we can just use the
-     * pre-defined values
-     */
-    if (oldnode == newnode) {
-        return;
-    }
-
-    /* if the node has changed, then search the new node for the
-     * lowest unused local and node rank
-     */
-    node_rank = 0;
-retry_nr:
-    for (k = 0; k < newnode->procs->size; k++) {
-        /* if this proc is NULL, skip it */
-        if (NULL == (proc = (prte_proc_t *) pmix_pointer_array_get_item(newnode->procs, k))) {
-            continue;
-        }
-        if (node_rank == proc->node_rank) {
-            node_rank++;
-            goto retry_nr;
-        }
-    }
-    newproc->node_rank = node_rank;
-
-    local_rank = 0;
-retry_lr:
-    for (k = 0; k < newnode->procs->size; k++) {
-        /* if this proc is NULL, skip it */
-        if (NULL == (proc = (prte_proc_t *) pmix_pointer_array_get_item(newnode->procs, k))) {
-            continue;
-        }
-        /* ignore procs from other jobs */
-        if (!PMIX_CHECK_NSPACE(proc->name.nspace, jdata->nspace)) {
-            continue;
-        }
-        if (local_rank == proc->local_rank) {
-            local_rank++;
-            goto retry_lr;
-        }
-    }
-    newproc->local_rank = local_rank;
-}

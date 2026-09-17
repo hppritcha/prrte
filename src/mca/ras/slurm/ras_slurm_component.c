@@ -17,6 +17,8 @@
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
  * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2026      Barcelona Supercomputing Center (BSC-CNS).
+ *                         All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -37,6 +39,7 @@
 #include "src/util/name_fns.h"
 
 #include "ras_slurm.h"
+#include "src/mca/common/slurm/common_slurm.h"
 #include "src/mca/ras/base/base.h"
 
 /*
@@ -49,7 +52,7 @@ static int prte_mca_ras_slurm_component_query(pmix_mca_base_module_t **module, i
 
 prte_mca_ras_slurm_component_t prte_mca_ras_slurm_component = {
     .super = {
-        PRTE_RAS_BASE_VERSION_2_0_0,
+        PRTE_MCA_BASE_VERSION(ras),
 
         /* Component name and version */
         .pmix_mca_component_name = "slurm",
@@ -83,6 +86,55 @@ static int ras_slurm_register(void)
                                                 PMIX_MCA_BASE_VAR_TYPE_BOOL,
                                                 &prte_mca_ras_slurm_component.use_all);
 
+    prte_mca_ras_slurm_component.propagate_account = true;
+    (void) pmix_mca_base_component_var_register(component, "propagate_account",
+                                                "Propagate Slurm account details when requesting additional resources",
+                                                PMIX_MCA_BASE_VAR_TYPE_BOOL,
+                                                &prte_mca_ras_slurm_component.propagate_account);
+    
+    prte_mca_ras_slurm_component.propagate_partition = true;
+    (void) pmix_mca_base_component_var_register(component, "propagate_partition",
+                                                "Propagate Slurm partition details when requesting additional resources",
+                                                PMIX_MCA_BASE_VAR_TYPE_BOOL,
+                                                &prte_mca_ras_slurm_component.propagate_partition);
+
+    prte_mca_ras_slurm_component.propagate_qos = true;
+    (void) pmix_mca_base_component_var_register(component, "propagate_qos",
+                                                "Propagate Slurm QoS details when requesting additional resources",
+                                                PMIX_MCA_BASE_VAR_TYPE_BOOL,
+                                                &prte_mca_ras_slurm_component.propagate_qos);
+
+    prte_mca_ras_slurm_component.propagate_cwd = true;
+    (void) pmix_mca_base_component_var_register(component, "propagate_cwd",
+                                                "Propagate current working directory when requesting additional resources",
+                                                PMIX_MCA_BASE_VAR_TYPE_BOOL,
+                                                &prte_mca_ras_slurm_component.propagate_cwd);
+
+    prte_mca_ras_slurm_component.propagate_mem_per_cpu = true;
+    (void) pmix_mca_base_component_var_register(component, "propagate_mem_per_cpu",
+                                                "Propagate Slurm memory per CPU information when requesting additional resources",
+                                                PMIX_MCA_BASE_VAR_TYPE_BOOL,
+                                                &prte_mca_ras_slurm_component.propagate_mem_per_cpu);
+
+    prte_mca_ras_slurm_component.propagate_mem_per_node = true;
+    (void) pmix_mca_base_component_var_register(component, "propagate_mem_per_node",
+                                                "Propagate Slurm memory per node information when requesting additional resources",
+                                                PMIX_MCA_BASE_VAR_TYPE_BOOL,
+                                                &prte_mca_ras_slurm_component.propagate_mem_per_node);
+
+    prte_mca_ras_slurm_component.propagate_time = true;
+    (void) pmix_mca_base_component_var_register(component, "propagate_time",
+                                                "Propagate original time limit when requesting additional resources, and trim the resulting job to the end of the original allocation",
+                                                PMIX_MCA_BASE_VAR_TYPE_BOOL,
+                                                &prte_mca_ras_slurm_component.propagate_time);
+
+    prte_mca_ras_slurm_component.propagate_threads_per_core = true;
+    (void) pmix_mca_base_component_var_register(component, "propagate_threads_per_core",
+                                                "Propagate threads per core of original job when requesting additional resources",
+                                                PMIX_MCA_BASE_VAR_TYPE_BOOL,
+                                                &prte_mca_ras_slurm_component.propagate_threads_per_core);
+
+
     return PRTE_SUCCESS;
 }
 
@@ -102,7 +154,7 @@ static int prte_mca_ras_slurm_component_query(pmix_mca_base_module_t **module, i
      * I am not in a Slurm allocation, and dynamic alloc
      * is not enabled, then disqualify myself
      */
-    if (NULL == getenv("SLURM_JOBID")) {
+    if (NULL == prte_common_slurm_jobid()) {
         /* disqualify ourselves */
         *priority = 0;
         *module = NULL;

@@ -4,7 +4,7 @@
 # Copyright (c) 2013      Los Alamos National Security, LLC.
 #                         All rights reserved.
 # Copyright (c) 2018-2020 Intel, Inc.  All rights reserved.
-# Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+# Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
 # $COPYRIGHT$
 #
 # Additional copyrights may follow
@@ -20,17 +20,17 @@ Check to make sure the path and filename are correct.
 
 usage:  %s --map-by rankfile:file=<path> ./app
 
-Examples of proper syntax include:
-  cat hostfile
-    host1
-    host2
-    host3
-    host4
-  cat rankfile
-    rank 1=host1 slot=1:0,1
-    rank 0=host2 slot=0:*
-    rank 2=host4 slot=1-2
-    rank 3=host3 slot=0:1;1:0-2
+#include#prrte#help-placement.txt#placement-rankfiles
+
+#
+[read-error]
+%s could not read the rankfile to its end:
+  Filename: %s
+
+The read stopped after line %d. Nothing in the file was used, because a
+rankfile that was only partly read would place only some of the ranks it
+lists. Check that the file is still readable - on a network file system,
+that the server is reachable - and try again.
 #
 [bad-host]
 The rankfile that was used claimed that a host was either not
@@ -49,6 +49,11 @@ Error, rank %d is already assigned to %s, check %s
 #
 [bad-syntax]
 Error, invalid syntax in the rankfile (%s)
+
+Line number %d could not be understood. The parser stopped at:
+
+   %s
+
 syntax must be the following
 
 rank i=host_i slot=string

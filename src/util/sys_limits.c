@@ -17,7 +17,7 @@
  * Copyright (c) 2015      Research Organization for Information Science
  *                         and Technology (RIST). All rights reserved.
  * Copyright (c) 2020      NVIDIA Corporation.  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -67,12 +67,27 @@ static int prte_setlimit(int resource, char *value, rlim_t *out)
 
     rlim.rlim_cur = 0;
 
+    if (NULL == value || '\0' == value[0]) {
+        return PRTE_ERR_BAD_PARAM;
+    }
     if (0 == strcmp(value, "max")) {
         maxlim = (rlim_t) -1;
     } else if (0 == strncmp(value, "unlimited", strlen(value))) {
         maxlim = RLIM_INFINITY;
     } else {
-        maxlim = strtol(value, NULL, 10);
+        char *endptr = NULL;
+        long lval;
+
+        /* strtol() reports a non-numeric value as zero, and this function
+         * then dutifully *lowered* the limit to zero - "openfiles:many"
+         * left the daemon unable to open a single file. Refuse anything
+         * that is not a complete non-negative integer instead. */
+        errno = 0;
+        lval = strtol(value, &endptr, 10);
+        if (0 != errno || NULL == endptr || '\0' != *endptr || 0 > lval) {
+            return PRTE_ERR_BAD_PARAM;
+        }
+        maxlim = (rlim_t) lval;
     }
 
     if (0 <= getrlimit(resource, &rlim)) {
@@ -118,15 +133,15 @@ int prte_util_init_sys_limits(char **errmsg)
     }
 
     /* parse the requested limits to set */
-    lims = PMIX_ARGV_SPLIT_COMPAT(prte_set_max_sys_limits, ',');
+    lims = PMIx_Argv_split(prte_set_max_sys_limits, ',');
     if (NULL == lims) {
         return PRTE_ERR_OUT_OF_RESOURCE;
     }
 
     /* each limit is expressed as a "param:value" pair */
     for (i = 0; NULL != lims[i]; i++) {
-        lim = PMIX_ARGV_SPLIT_COMPAT(lims[i], ':');
-        if (1 == PMIX_ARGV_COUNT_COMPAT(lim)) {
+        lim = PMIx_Argv_split(lims[i], ':');
+        if (1 == PMIx_Argv_count(lim)) {
             setlim = "max";
         } else {
             setlim = lim[1];
@@ -172,7 +187,7 @@ int prte_util_init_sys_limits(char **errmsg)
 #if HAVE_DECL_RLIMIT_CORE
             if (PRTE_SUCCESS != prte_setlimit(RLIMIT_CORE, setlim, &value)) {
                 *errmsg = pmix_show_help_string("help-prte-util.txt", "sys-limit-failed", true,
-                                                "openfiles", setlim);
+                                                "core", setlim);
                 goto out;
             }
 #endif
@@ -224,7 +239,7 @@ int prte_util_init_sys_limits(char **errmsg)
                                             lim[0], setlim);
             goto out;
         }
-        PMIX_ARGV_FREE_COMPAT(lim);
+        PMIx_Argv_free(lim);
         lim = NULL;
     }
 
@@ -234,9 +249,9 @@ int prte_util_init_sys_limits(char **errmsg)
     rc = PRTE_SUCCESS;
 
 out:
-    PMIX_ARGV_FREE_COMPAT(lims);
+    PMIx_Argv_free(lims);
     if (NULL != lim) {
-        PMIX_ARGV_FREE_COMPAT(lim);
+        PMIx_Argv_free(lim);
     }
 
     return rc;

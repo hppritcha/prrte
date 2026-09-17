@@ -13,7 +13,7 @@
  *                         reserved.
  * Copyright (c) 2016-2020 Intel, Inc.  All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -52,16 +52,35 @@ PRTE_EXPORT int prte_ras_base_select(void);
  * globals that might be needed
  */
 typedef struct prte_ras_base_t {
-    bool first_pass_completed;
-    bool allocation_read;
-    prte_ras_base_module_t *active_module;
+    /* list of selected modules */
+    pmix_list_t selected_modules;
+    /* Does an external resource manager own our allocation?  Copied from the
+     * selected module (prte_ras_base_module_t::scheduler_owned) once, because
+     * everything that wants to know is nowhere near the ras. */
+    bool scheduler_owned;
+    /* PMIX_ALLOC_RELEASE requests parked because the DVM was still growing
+     * when they arrived, in arrival order. See prte_ras_base_dvm_is_growing()
+     * and prte_ras_base_replay_deferred_releases() below. */
+    pmix_list_t deferred_releases;
     int total_slots_alloc;
     int multiplier;
     bool launch_orted_on_hn;
-    bool simulated;
+    /* set once the DVM's base allocation has been established (the first
+     * allocation to complete). Used to detect that a subsequent job must
+     * reuse the existing allocation rather than re-run discovery. This is
+     * independent of whether the HNP node itself is part of the allocation. */
+    bool allocation_established;
 } prte_ras_base_t;
 
 PRTE_EXPORT extern prte_ras_base_t prte_ras_base;
+
+typedef struct {
+    pmix_list_item_t super;
+    int pri;
+    prte_ras_base_module_t *module;
+    pmix_mca_base_component_t *component;
+} prte_ras_base_selected_module_t;
+PMIX_CLASS_DECLARATION(prte_ras_base_selected_module_t);
 
 /**
  * Add the specified node definitions to the registry
@@ -76,9 +95,125 @@ PRTE_EXPORT void prte_ras_base_allocate(int fd, short args, void *cbdata);
 
 PRTE_EXPORT void prte_ras_base_modify(int fd, short args, void *cbdata);
 
+/* Is any daemon still joining the DVM?  No shrink campaign may be created
+ * while one is: the shrink is broadcast DVM-wide and drains only when every
+ * daemon has received it, so a daemon that has not reported home leaves the
+ * campaign unable to either complete or abort.  See the definition for the
+ * three states of a growing DVM this has to answer for. */
+PRTE_EXPORT bool prte_ras_base_dvm_is_growing(void);
+
+/* Re-drive every PMIX_ALLOC_RELEASE that prte_ras_base_modify parked because
+ * the DVM was still growing when it arrived.  Called from
+ * prte_plm_base_grow_drain() on both of its outcomes: the requests are replayed
+ * from scratch, so a grow that failed simply lets them re-evaluate against the
+ * rolled-back DVM and fail through the ordinary error paths. */
+PRTE_EXPORT void prte_ras_base_replay_deferred_releases(void);
+
+/* Answer every parked release with the given status and drop it.  For teardown,
+ * where the grow that would have replayed them is never going to resolve. */
+PRTE_EXPORT void prte_ras_base_flush_deferred_releases(pmix_status_t status);
+
+/* Notify the active RAS modules that a shrink campaign has completed so they
+ * can release the freed resources back to the scheduler. Cycles across every
+ * selected module, calling the shrink_complete entry point on each that
+ * provides one. */
+PRTE_EXPORT void prte_ras_base_shrink_complete(prte_shrink_campaign_t *campaign);
+
+PRTE_EXPORT void prte_ras_base_release_allocation(prte_session_t *session);
+
+/* Tear down a reservation: drop its hold on its nodes (clearing the
+ * node->session backpointer so the nodes revert to the default pool) and
+ * deregister it so it can no longer be targeted. When return_to_scheduler is
+ * true, member nodes carrying a daemon are additionally shrunk out of the DVM
+ * and handed back to the scheduler; otherwise the nodes simply become
+ * unreserved within the session. */
+PRTE_EXPORT void prte_ras_base_teardown_reservation(prte_session_t *session,
+                                                    bool return_to_scheduler);
+
+/* Apply the namespace-termination inheritance disposition of every reservation
+ * when the namespace owning jdata terminates. NONE/DEFAULT fire when the owning
+ * namespace exits; CHILD/CHILD_DEFAULT fire when the last derived child of the
+ * owning namespace exits. The *_DEFAULT variants unreserve into the session
+ * rather than returning nodes to the scheduler. */
+PRTE_EXPORT void prte_ras_base_check_reservations_on_term(prte_job_t *jdata);
+
 PRTE_EXPORT int prte_ras_base_add_hosts(prte_job_t *jdata);
 
+/* Bring nodes the allocation already contains, but which carry no daemon,
+ * into the DVM.  Collects the PRTE_APP_ACTIVATE_HOSTS directives (the
+ * "--activate" cmd line option) across the job's apps, resolves them against
+ * the node pool, marks the resolved entries PRTE_NODE_STATE_ADDED and
+ * activates a DVM grow.  Unlike prte_ras_base_add_hosts() this adds nothing
+ * to the allocation and touches no scheduler, so it is permitted even where
+ * a resource manager owns the allocation.  Must be called AFTER
+ * prte_ras_base_add_hosts(): when the same request carries both, the grow
+ * that add-host posts is the one that launches, and it will pick up the
+ * nodes marked here.  Sets prte_dvm_ready = false when it activates a grow
+ * of its own. */
+PRTE_EXPORT int prte_ras_base_activate_hosts(prte_job_t *jdata);
+
+/* Serve the allocation request a spawn carries (PMIX_SPAWN_ALLOC), in the
+ * name of the process that asked for the spawn.  Sets *posted when there was
+ * one and it is now in flight - the request holds the job until it answers,
+ * so the caller must stop there and launch nothing; the outcome reaches plm
+ * through prte_plm_base_spawn_alloc_granted()/_failed().  Leaves *posted
+ * false, and succeeds, where the spawn carries no allocation request at all.
+ * A malformed request - no directive, a value that is not an info array - is
+ * refused here and now, so the caller can fail the spawn outright. */
+PRTE_EXPORT int prte_ras_base_spawn_alloc(prte_job_t *jdata, bool *posted);
+
+/* Hand back an allocation obtained by prte_ras_base_spawn_alloc() for a job
+ * that then failed to launch.  Issues an ordinary PMIX_ALLOC_RELEASE in the
+ * requester's name and calls prte_plm_base_spawn_alloc_released() when it
+ * resolves, whatever the outcome.  Returns an error only if the release
+ * could not be posted at all. */
+PRTE_EXPORT int prte_ras_base_release_spawn_alloc(prte_job_t *jdata,
+                                                  const char *alloc_id);
+
+/* Resolve an activation request - a host specification, a hostfile, or both -
+ * against the node pool and mark the resolved entries PRTE_NODE_STATE_ADDED,
+ * reporting in nactivated how many entries that changed (zero meaning every
+ * named node is already in the DVM or already on its way in, so there is
+ * nothing to launch).  Either argument may be NULL, but not both; the
+ * hostfile argument may name several files, comma-delimited.  The host
+ * specification is "--host" syntax, including the "file=<path>" form, and is
+ * parsed by the same code that parses "--activate".
+ *
+ * This resolves and marks only: activating the grow is the caller's, since
+ * only the caller knows whether another request is already about to launch
+ * one.  Refusals are reported through show_help and returned as
+ * PRTE_ERR_SILENT. */
+PRTE_EXPORT int prte_ras_base_activate_nodes(const char *hosts,
+                                             const char *hostfile,
+                                             int *nactivated);
+
+/* Render the node specification carried by a PMIX_ALLOC_NODE_LIST-style info
+ * (a string, a regex, or a regex2) into a comma-delimited node-name string the
+ * caller must free. Returns PMIX_ERR_BAD_PARAM for any other value type. */
+PRTE_EXPORT pmix_status_t prte_ras_base_parse_node_list(pmix_info_t *info,
+                                                        char **ndstring);
+
+/* Add the named nodes to the global pool, marking each PRTE_NODE_STATE_ADDED,
+ * and register them with the destination reservation (which withholds them
+ * from general use). Pass NULL or the default session to leave them in the
+ * general pool. Returns a PRRTE code. */
+PRTE_EXPORT int prte_ras_base_insert_node_string(char *ndstring,
+                                                 prte_session_t *dest);
+
 PRTE_EXPORT char *prte_ras_base_flag_string(prte_node_t *node);
+
+PRTE_EXPORT void prte_ras_base_activate_dvm_grow(void);
+
+PRTE_EXPORT int prte_ras_base_prepare_dvm_shrink(prte_pmix_server_req_t *req,
+                                                 pmix_rank_t *ranks,
+                                                 int32_t nranks,
+                                                 prte_shrink_campaign_t **campaign);
+
+PRTE_EXPORT int prte_ras_base_commit_dvm_shrink(prte_shrink_campaign_t *campaign);
+
+PRTE_EXPORT void prte_ras_base_abort_dvm_shrink(prte_shrink_campaign_t *campaign);
+
+PRTE_EXPORT void prte_ras_base_complete_request(prte_pmix_server_req_t *req);
 
 END_C_DECLS
 

@@ -20,7 +20,6 @@
 #
 
 AM_CPPFLAGS = $(LTDLINCL)
-EXTRA_DIST = README.txt
 
 # main library setup
 noinst_LTLIBRARIES = libprtemca_iof.la
@@ -29,10 +28,6 @@ libprtemca_iof_la_SOURCES =
 # local files
 headers = iof.h iof_types.h
 libprtemca_iof_la_SOURCES += $(headers)
-
-# Conditionally install the header files
-prtedir = $(prteincludedir)/$(subdir)
-nobase_prte_HEADERS = $(headers)
 
 include base/Makefile.am
 

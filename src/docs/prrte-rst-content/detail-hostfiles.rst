@@ -1,6 +1,6 @@
 .. -*- rst -*-
 
-   Copyright (c) 2022-2023 Nanook Consulting.  All rights reserved.
+   Copyright (c) 2022-2026 Nanook Consulting.  All rights reserved.
    Copyright (c) 2023      Jeffrey M. Squyres.  All rights reserved.
 
    $COPYRIGHT$
@@ -35,6 +35,34 @@ including a designated number of "slots":
 
 Blank lines and lines beginning with a ``#`` are ignored.
 
+A node name may carry the account PRRTE is to use when reaching that
+node, written in front of it and separated by a single ``@``:
+
+.. code:: sh
+
+   user01@node01  slots=4
+
+An entry may contain at most one ``@``, and both the account and the
+node name must be given: a second ``@``, or an ``@`` with nothing on
+one side of it, is reported as a parse error naming the hostfile and
+the line it is on.
+
+A node name written with a leading ``^`` is *excluded* rather than
+used.  The ``^`` goes in front of the whole entry, account included:
+
+.. code:: sh
+
+   node01  slots=4
+   node02  slots=4
+   node03  slots=4
+   ^user01@node02
+
+Where the hostfile also names nodes, an exclusion takes a node back
+out of what it named |mdash| the file above names ``node01`` and
+``node03``.  A hostfile given to a job in a running DVM may consist of
+nothing but exclusions, and then it selects every node of the
+allocation except the ones it excludes.
+
 A "slot" is the PRRTE term for an allocatable unit where we can launch
 a process.  See the section on definition of the term ``slot`` for a
 longer description of slots.
@@ -46,3 +74,11 @@ RM.
 
 .. important:: If using a resource manager, the user-specified number
                of slots is capped by the RM-assigned value.
+
+A hostfile given to a job that is being submitted to an already-running
+DVM *selects within* the DVM's allocation: it names the subset of nodes
+that job may use, and a ``slots`` count smaller than the node's own is
+the number of slots that job may take there.  It says nothing about how
+big the node is, so it applies to that job alone |mdash| the node is
+back to its allocated size for the next job, which may be someone
+else's.  Changing the allocation is what ``--add-hostfile`` is for.

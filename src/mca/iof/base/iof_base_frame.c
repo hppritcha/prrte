@@ -66,7 +66,7 @@ static int prte_iof_base_register(pmix_mca_base_register_flag_t flags)
     PRTE_HIDE_UNUSED_PARAMS(flags);
 
     /* check for maximum number of pending output messages */
-    prte_iof_base_output_limit = (size_t) INT_MAX;
+    prte_iof_base_output_limit = INT_MAX;
     (void) pmix_mca_base_var_register("prte", "iof", "base", "output_limit",
                                       "Maximum backlog of output messages [default: unlimited]",
                                       PMIX_MCA_BASE_VAR_TYPE_INT,
@@ -94,7 +94,7 @@ static int prte_iof_base_open(pmix_mca_base_open_flag_t flags)
     return pmix_mca_base_framework_components_open(&prte_iof_base_framework, flags);
 }
 
-PMIX_MCA_BASE_FRAMEWORK_DECLARE(prte, iof, "PRTE I/O Forwarding",
+PRTE_MCA_BASE_FRAMEWORK_DECLARE(iof, "PRTE I/O Forwarding",
                                 prte_iof_base_register,
                                 prte_iof_base_open, prte_iof_base_close,
                                 prte_iof_base_static_components,
@@ -120,6 +120,14 @@ void prte_iof_base_output(const pmix_proc_t *source,
 {
     prte_iof_deliver_t *p;
     pmix_status_t rc;
+
+    /* every caller hands us the result of a formatter, and a formatter that
+     * failed hands back NULL - prte_map_print documents NULL as its default
+     * result. There is nothing to emit and nothing to free, so say so here
+     * rather than in strlen() */
+    if (NULL == string) {
+        return;
+    }
 
     p = PMIX_NEW(prte_iof_deliver_t);
     PMIX_XFER_PROCID(&p->source, source);
@@ -160,8 +168,6 @@ static void prte_iof_base_sink_construct(prte_iof_sink_t *ptr)
 {
     PMIX_LOAD_PROCID(&ptr->daemon, NULL, PMIX_RANK_INVALID);
     ptr->wev = PMIX_NEW(prte_iof_write_event_t);
-    ptr->xoff = false;
-    ptr->exclusive = false;
     ptr->closed = false;
 }
 static void prte_iof_base_sink_destruct(prte_iof_sink_t *ptr)
@@ -182,11 +188,9 @@ static void prte_iof_base_read_event_construct(prte_iof_read_event_t *rev)
 {
     rev->proc = NULL;
     rev->fd = -1;
-    rev->active = false;
     rev->activated = false;
     rev->always_readable = false;
     rev->ev = prte_event_alloc();
-    rev->sink = NULL;
     rev->tv.tv_sec = 0;
     rev->tv.tv_usec = 0;
 }
@@ -204,9 +208,6 @@ static void prte_iof_base_read_event_destruct(prte_iof_read_event_t *rev)
         rev->fd = -1;
     } else {
         free(rev->ev);
-    }
-    if (NULL != rev->sink) {
-        PMIX_RELEASE(rev->sink);
     }
     if (NULL != proct) {
         PMIX_RELEASE(proct);
@@ -239,7 +240,14 @@ static void prte_iof_base_write_event_destruct(prte_iof_write_event_t *wev)
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), wev->fd));
         close(wev->fd);
     }
-    PMIX_DESTRUCT(&wev->outputs);
+    /* Anything still queued here was never written - the sink closed with a
+     * backlog, or carried the zero-byte marker that only asks for the fd to
+     * be closed.  It has to be RELEASED, not merely destructed:
+     * pmix_list_destruct() re-initializes the list and frees nothing on it,
+     * so the plain PMIX_DESTRUCT this used to do looked like a drain and was
+     * not one.  Each chunk carries its buffer inline, so a release of the
+     * item is the whole of it. */
+    PMIX_LIST_DESTRUCT(&wev->outputs);
 }
 PMIX_CLASS_INSTANCE(prte_iof_write_event_t, pmix_list_item_t,
                     prte_iof_base_write_event_construct,

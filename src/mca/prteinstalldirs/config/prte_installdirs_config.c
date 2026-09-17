@@ -5,7 +5,7 @@
  * Copyright (c) 2019      Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -20,7 +20,7 @@
 
 const prte_prteinstalldirs_base_component_t prte_mca_prteinstalldirs_config_component = {
     .component = {
-        PRTE_INSTALLDIRS_BASE_VERSION_2_0_0,
+        PRTE_MCA_BASE_VERSION(prteinstalldirs),
 
         /* Component name and version */
         .pmix_mca_component_name = "config",
@@ -31,6 +31,8 @@ const prte_prteinstalldirs_base_component_t prte_mca_prteinstalldirs_config_comp
 
     },
 
+    /* Next the pmix_install_dirs_t install_dirs_data information */
+    .install_dirs_data =
     {
         PRTE_PREFIX,
         PRTE_EXEC_PREFIX,

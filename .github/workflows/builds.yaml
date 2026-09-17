@@ -2,6 +2,9 @@ name: Build tests
 
 on: [pull_request]
 
+permissions:
+  contents: read
+
 jobs:
   macos:
     runs-on: macos-latest
@@ -13,7 +16,7 @@ jobs:
     - name: Install dependencies
       run: brew install libevent hwloc autoconf automake libtool
     - name: Git clone OpenPMIx
-      uses: actions/checkout@v3
+      uses: actions/checkout@v6
       with:
             submodules: recursive
             repository: openpmix/openpmix
@@ -35,7 +38,7 @@ jobs:
         make -j
         make install
     - name: Git clone PRRTE
-      uses: actions/checkout@v3
+      uses: actions/checkout@v6
       with:
             submodules: recursive
             clean: false
@@ -75,7 +78,23 @@ jobs:
             LDFLAGS=$libevent_ldflags
         make -j
         make install
-        make uninstall
+    - name: Run unit tests
+      run: |
+        if test "${{ matrix.path }}" = vpath; then
+            cd build
+        fi
+        make check
+    - name: Build examples
+      run: |
+        pushd examples
+        export PATH=$RUNNER_TEMP/prteinstall/bin:$RUNNER_TEMP/pmixinstall/bin:${PATH}
+        make
+        popd
+    - name: Test sanity check
+      run: |
+        export PATH=$RUNNER_TEMP/prteinstall/bin:$RUNNER_TEMP/pmixinstall/bin:${PATH}
+        export LD_LIBRARY_PATH=$RUNNER_TEMP/prteinstall/lib:${LD_LIBRARY_PATH}
+        prterun --map-by ppr:1:core examples/hello
 
   ubuntu:
     runs-on: ubuntu-latest
@@ -89,7 +108,7 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends software-properties-common libhwloc-dev libevent-dev
     - name: Git clone OpenPMIx
-      uses: actions/checkout@v3
+      uses: actions/checkout@v6
       with:
             submodules: recursive
             repository: openpmix/openpmix
@@ -103,7 +122,7 @@ jobs:
         make -j
         make install
     - name: Git clone PRRTE
-      uses: actions/checkout@v3
+      uses: actions/checkout@v6
       with:
             submodules: recursive
             clean: false
@@ -129,7 +148,99 @@ jobs:
             --enable-testbuild-launchers
         make -j
         make install
-        make uninstall
+    - name: Run unit tests
+      run: |
+        if test "${{ matrix.path }}" = vpath; then
+            cd build
+        fi
+        make check
+    - name: Build examples
+      run: |
+        pushd examples
+        export PATH=$RUNNER_TEMP/prteinstall/bin:$RUNNER_TEMP/pmixinstall/bin:${PATH}
+        export LD_LIBRARY_PATH=$RUNNER_TEMP/prteinstall/lib:${LD_LIBRARY_PATH}
+        make
+        popd
+    - name: Test sanity check
+      run: |
+        export PATH=$RUNNER_TEMP/prteinstall/bin:$RUNNER_TEMP/pmixinstall/bin:${PATH}
+        export LD_LIBRARY_PATH=$RUNNER_TEMP/prteinstall/lib:${LD_LIBRARY_PATH}
+        prterun --map-by ppr:1:core examples/hello
+        prterun --map-by ppr:1:core examples/legacy
+
+  # Every component built as a run-time loadable DSO rather than linked
+  # into libprrte.  This is a supported build, and the one the stubbed
+  # test-build launchers require, but nothing else in CI exercises it --
+  # so a component that only works when statically linked (a missing
+  # symbol export, a constructor that runs at link time) would otherwise
+  # reach users unnoticed.
+  ubuntuMcaDso:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends software-properties-common libhwloc-dev libevent-dev
+    - name: Git clone OpenPMIx
+      uses: actions/checkout@v6
+      with:
+            submodules: recursive
+            repository: openpmix/openpmix
+            path: openpmix/master
+            ref: master
+    - name: Build OpenPMIx
+      run: |
+        cd openpmix/master
+        ./autogen.pl
+        ./configure --prefix=$RUNNER_TEMP/pmixinstall
+        make -j
+        make install
+    - name: Git clone PRRTE
+      uses: actions/checkout@v6
+      with:
+            submodules: recursive
+            clean: false
+    - name: Build PRRTE
+      run: |
+        ./autogen.pl
+        mkdir build
+        cd build
+        ../configure --prefix=$RUNNER_TEMP/prteinstall --with-pmix=$RUNNER_TEMP/pmixinstall \
+            --enable-devel-check \
+            --enable-testbuild-launchers \
+            --enable-mca-dso
+        make -j
+        make install
+    - name: Confirm the components were built as DSOs
+      run: |
+        # Without this the rest of the job would happily pass on a build
+        # that had quietly linked everything statically, testing nothing.
+        #
+        # The test is a named component, not a count: the DEFAULT build
+        # already installs a DSO or two (the launchers that need
+        # third-party headers are in the default --enable-mca-dso list),
+        # so "some .so exists" would pass without this flag. rmaps is
+        # never in that list, so its components are loadable only because
+        # --enable-mca-dso put them there.
+        ls -1 $RUNNER_TEMP/prteinstall/lib/prte/ || true
+        test -f $RUNNER_TEMP/prteinstall/lib/prte/prte_mca_rmaps_round_robin.so
+    - name: Run unit tests
+      run: |
+        cd build
+        make check
+    - name: Build examples
+      run: |
+        pushd examples
+        export PATH=$RUNNER_TEMP/prteinstall/bin:$RUNNER_TEMP/pmixinstall/bin:${PATH}
+        export LD_LIBRARY_PATH=$RUNNER_TEMP/prteinstall/lib:${LD_LIBRARY_PATH}
+        make
+        popd
+    - name: Test sanity check
+      run: |
+        export PATH=$RUNNER_TEMP/prteinstall/bin:$RUNNER_TEMP/pmixinstall/bin:${PATH}
+        export LD_LIBRARY_PATH=$RUNNER_TEMP/prteinstall/lib:${LD_LIBRARY_PATH}
+        prterun --map-by ppr:1:core examples/hello
+        prterun --map-by ppr:1:core examples/legacy
 
   ubuntuClang:
     runs-on: ubuntu-latest
@@ -139,7 +250,7 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends software-properties-common libhwloc-dev libevent-dev clang
     - name: Git clone OpenPMIx
-      uses: actions/checkout@v3
+      uses: actions/checkout@v6
       with:
             submodules: recursive
             repository: openpmix/openpmix
@@ -153,7 +264,7 @@ jobs:
         make -j
         make install
     - name: Git clone PRRTE
-      uses: actions/checkout@v3
+      uses: actions/checkout@v6
       with:
             submodules: recursive
             clean: false
@@ -170,7 +281,21 @@ jobs:
             --enable-testbuild-launchers
         make -j
         make install
-        make uninstall
+    - name: Run unit tests
+      run: make check
+    - name: Build examples
+      run: |
+        pushd examples
+        export PATH=$RUNNER_TEMP/prteinstall/bin:$RUNNER_TEMP/pmixinstall/bin:${PATH}
+        export LD_LIBRARY_PATH=$RUNNER_TEMP/prteinstall/lib:${LD_LIBRARY_PATH}
+        make
+        popd
+    - name: Test sanity check
+      run: |
+        export PATH=$RUNNER_TEMP/prteinstall/bin:$RUNNER_TEMP/pmixinstall/bin:${PATH}
+        export LD_LIBRARY_PATH=$RUNNER_TEMP/prteinstall/lib:${LD_LIBRARY_PATH}
+        prterun --map-by ppr:1:core examples/hello
+        prterun --map-by ppr:1:core examples/legacy
 
   distcheck:
     runs-on: ubuntu-latest
@@ -180,7 +305,7 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends software-properties-common libhwloc-dev libevent-dev python3 python3-pip
     - name: Git clone OpenPMIx
-      uses: actions/checkout@v3
+      uses: actions/checkout@v6
       with:
             submodules: recursive
             repository: openpmix/openpmix
@@ -194,7 +319,7 @@ jobs:
         make -j
         make install
     - name: Git clone PRRTE
-      uses: actions/checkout@v3
+      uses: actions/checkout@v6
       with:
             submodules: recursive
             clean: false

@@ -2,6 +2,9 @@ name: DVM
 
 on: [pull_request]
 
+permissions:
+  contents: read
+
 jobs:
   pub-lookup:
     runs-on: ubuntu-22.04
@@ -14,7 +17,7 @@ jobs:
       with:
             submodules: recursive
     - name: Git clone PMIx
-      uses: actions/checkout@v3
+      uses: actions/checkout@v6
       with:
             submodules: recursive
             repository: openpmix/openpmix
@@ -28,7 +31,7 @@ jobs:
         make -j
         make install
     - name: Git clone PRRTE
-      uses: actions/checkout@v3
+      uses: actions/checkout@v6
       with:
             submodules: recursive
             clean: false

@@ -16,7 +16,7 @@
  *                         and Technology (RIST). All rights reserved.
  * Copyright (c) 2018-2020 Intel, Inc.  All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -86,11 +86,27 @@ typedef int (*prte_ras_base_module_init_fn_t)(void);
  */
 typedef int (*prte_ras_base_module_allocate_fn_t)(prte_job_t *jdata, pmix_list_t *nodes);
 
-/* deallocate resources */
-typedef void (*prte_ras_base_module_dealloc_fn_t)(prte_job_t *jdata, prte_app_context_t *app);
+/* modify allocation - includes deallocation */
+typedef pmix_status_t (*prte_ras_base_module_modify_fn_t)(prte_pmix_server_req_t *req);
 
-/* modify allocation */
-typedef void (*prte_ras_base_module_modify_fn_t)(prte_pmix_server_req_t *req);
+/**
+ * Notify the resource manager that a shrink campaign has completed.
+ *
+ * Called once the campaign's targeted daemons have departed and before
+ * the final completion notification is emitted to the requester, so the
+ * module can release the freed resources back to the scheduler. The
+ * campaign object is passed so the module can identify which shrink
+ * completed.
+ */
+typedef void (*prte_ras_base_module_shrink_complete_fn_t)(prte_shrink_campaign_t *campaign);
+
+/**
+ * Release an allocation associated with the given session.
+ * Called when a prte_session_t is destructed. Returns PRTE_SUCCESS
+ * if the module handled the release, PRTE_ERR_TAKE_NEXT_OPTION to
+ * pass to the next module, or another error code on failure.
+ */
+typedef int (*prte_ras_base_module_release_fn_t)(prte_session_t *session);
 
 /**
  * Cleanup module resources.
@@ -101,12 +117,28 @@ typedef int (*prte_ras_base_module_finalize_fn_t)(void);
  * ras module
  */
 struct prte_ras_base_module_2_0_0_t {
+    /** Does an external resource manager own this allocation?
+     *
+     * True when the nodes came from a scheduler that alone decides what this
+     * DVM holds - Slurm, PBS, LSF, Flux, gridengine, or a PMIx scheduler.
+     * PRRTE may then SELECT from the allocation but must never add to it: a
+     * node the scheduler did not grant cannot be launched on, and pretending
+     * otherwise produces a daemon launch that fails and takes the DVM with
+     * it.  False for the allocators that are themselves the authority - a
+     * hostfile, a bootstrap configuration, the synthetic test components -
+     * where growing the pool on the user's say-so is exactly the point.
+     */
+    bool                                scheduler_owned;
     /** init */
     prte_ras_base_module_init_fn_t      init;
     /** Allocation function pointer */
     prte_ras_base_module_allocate_fn_t  allocate;
-    prte_ras_base_module_dealloc_fn_t   deallocate;
+    // modify function pointer
     prte_ras_base_module_modify_fn_t    modify;
+    /** Notify the RM that a shrink campaign has completed */
+    prte_ras_base_module_shrink_complete_fn_t shrink_complete;
+    /** Release an allocation when its session is destructed */
+    prte_ras_base_module_release_fn_t   release_allocation;
     /** Finalization function pointer */
     prte_ras_base_module_finalize_fn_t  finalize;
 };
@@ -122,10 +154,15 @@ typedef prte_ras_base_module_2_0_0_t prte_ras_base_module_t;
 /** Convenience typedef */
 typedef pmix_mca_base_component_t prte_ras_base_component_t;
 
-/**
- * Macro for use in components that are of type ras
- */
-#define PRTE_RAS_BASE_VERSION_2_0_0 PRTE_MCA_BASE_VERSION_3_0_0("ras", 2, 0, 0)
+/* The ras framework interface version. It is stated here and nowhere
+ * else: components stamp it into their struct with
+ * PRTE_MCA_BASE_VERSION(ras), and the framework's declaration reaches
+ * the same three by pasting its name, so the two cannot drift apart.
+ * Bump it on any change to the module interface that a component built
+ * against the previous one would not survive. */
+#define PRTE_MCA_ras_MAJOR_VERSION   2
+#define PRTE_MCA_ras_MINOR_VERSION   1
+#define PRTE_MCA_ras_RELEASE_VERSION 0
 
 END_C_DECLS
 

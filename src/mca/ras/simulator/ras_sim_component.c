@@ -16,7 +16,7 @@
  * Copyright (c) 2019      Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -43,7 +43,7 @@ static int ras_sim_component_query(pmix_mca_base_module_t **module, int *priorit
 
 prte_ras_sim_component_t prte_mca_ras_simulator_component = {
     .super = {
-        PRTE_RAS_BASE_VERSION_2_0_0,
+        PRTE_MCA_BASE_VERSION(ras),
 
         /* Component name and version */
         .pmix_mca_component_name = "simulator",
@@ -98,7 +98,6 @@ static int ras_sim_component_query(pmix_mca_base_module_t **module, int *priorit
     if (NULL != prte_mca_ras_simulator_component.num_nodes) {
         *module = (pmix_mca_base_module_t *) &prte_ras_sim_module;
         *priority = 1000;
-        prte_ras_base.simulated = true;
         return PRTE_SUCCESS;
     }
 

@@ -42,10 +42,10 @@ static int errmgr_prted_component_query(pmix_mca_base_module_t **module, int *pr
 prte_errmgr_base_component_t prte_mca_errmgr_prted_component =
 {
     /* Handle the general mca_component_t struct containing
-     *  meta information about the component itprted
+     *  meta information about the component itself
      */
     .base_version = {
-        PRTE_ERRMGR_BASE_VERSION_3_0_0,
+        PRTE_MCA_BASE_VERSION(errmgr),
         /* Component name and version */
         .pmix_mca_component_name = "prted",
         PMIX_MCA_BASE_MAKE_VERSION(component,

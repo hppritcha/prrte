@@ -1,6 +1,6 @@
 #
 # Copyright (c) 2023-2025 Jeffrey M. Squyres.  All rights reserved.
-# Copyright (c) 2023-2025 Nanook Consulting  All rights reserved.
+# Copyright (c) 2023-2026 Nanook Consulting  All rights reserved.
 #
 # $COPYRIGHT$
 #
@@ -19,8 +19,11 @@
 # packages that want to use these RST files.
 rstdir = $(prtedatadir)/rst/prrte-rst-content
 dist_rst_DATA = \
+    cli-activate.rst \
     cli-add-host.rst \
     cli-add-hostfile.rst \
+    cli-alloc-id.rst \
+    cli-alloc-refid.rst \
     cli-allow-run-as-root.rst \
     cli-app-prefix.rst \
     cli-append-env.rst \
@@ -33,7 +36,7 @@ dist_rst_DATA = \
     cli-dvm.rst \
     cli-forward-signals.rst \
     cli-general.rst \
-    cli-hetero-nodes.rst \
+    cli-homo-nodes.rst \
     cli-launcher-hostfile.rst \
     cli-leave-session-attached.rst \
     cli-map-by.rst \
@@ -48,6 +51,7 @@ dist_rst_DATA = \
     cli-no-app-prefix.rst \
     cli-rank-by.rst \
     cli-runtime-options.rst \
+    cli-session-id.rst \
     cli-set-env.rst \
     cli-stream-buffering.rst \
     cli-tune.rst \
@@ -67,6 +71,8 @@ dist_rst_DATA = \
     deprecated-output-directory.rst \
     deprecated-output-filename.rst \
     deprecated-report-bindings.rst \
+    deprecated-report-child-jobs-separately.rst \
+    deprecated-show-progress.rst \
     deprecated-tag-output.rst \
     deprecated-timestamp-output.rst \
     deprecated-xml.rst \

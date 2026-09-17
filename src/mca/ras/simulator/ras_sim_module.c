@@ -5,7 +5,7 @@
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2015-2020 Intel, Inc.  All rights reserved.
  *
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -40,10 +40,8 @@ static int finalize(void);
  * Global variable
  */
 prte_ras_base_module_t prte_ras_sim_module = {
-    .init = NULL,
+    .scheduler_owned = false,
     .allocate = allocate,
-    .deallocate = NULL,
-    .modify = NULL,
     .finalize = finalize
 };
 
@@ -62,32 +60,39 @@ static int allocate(prte_job_t *jdata, pmix_list_t *nodes)
     bool use_hwthread_cpus = false;
     hwloc_cpuset_t available;
 
-    node_cnt = PMIX_ARGV_SPLIT_COMPAT(prte_mca_ras_simulator_component.num_nodes, ',');
-    num_nodes = PMIX_ARGV_COUNT_COMPAT(node_cnt);
+    node_cnt = PMIx_Argv_split(prte_mca_ras_simulator_component.num_nodes, ',');
+    num_nodes = PMIx_Argv_count(node_cnt);
+    if (0 == num_nodes) {
+        /* the gating param was set but held nothing usable */
+        PMIx_Argv_free(node_cnt);
+        return PRTE_ERR_TAKE_NEXT_OPTION;
+    }
 
     if (NULL != prte_mca_ras_simulator_component.slots) {
-        slot_cnt = PMIX_ARGV_SPLIT_COMPAT(prte_mca_ras_simulator_component.slots, ',');
+        slot_cnt = PMIx_Argv_split(prte_mca_ras_simulator_component.slots, ',');
         /* if they didn't provide a slot count for each node, then
-         * backfill the slot_cnt so every node has a cnt */
-        nslots = PMIX_ARGV_COUNT_COMPAT(slot_cnt);
-        if (nslots < num_nodes) {
+         * backfill the slot_cnt so every node has a cnt.  An empty param
+         * value splits to nothing, so guard the "last one given" read -
+         * slot_cnt[-1] is an out-of-bounds access. */
+        nslots = PMIx_Argv_count(slot_cnt);
+        if (0 < nslots && nslots < num_nodes) {
             // take the last one given and extend it to cover remaining nodes
             tmp = slot_cnt[nslots - 1];
             for (n = nslots; n < num_nodes; n++) {
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&slot_cnt, tmp);
+                PMIx_Argv_append_nosize(&slot_cnt, tmp);
             }
         }
     }
     if (NULL != prte_mca_ras_simulator_component.slots_max) {
-        max_slot_cnt = PMIX_ARGV_SPLIT_COMPAT(prte_mca_ras_simulator_component.slots_max, ',');
+        max_slot_cnt = PMIx_Argv_split(prte_mca_ras_simulator_component.slots_max, ',');
         /* if they didn't provide a max slot count for each node, then
          * backfill the slot_cnt so every node has a cnt */
-        nslots = PMIX_ARGV_COUNT_COMPAT(max_slot_cnt);
-         if (nslots < num_nodes) {
+        nslots = PMIx_Argv_count(max_slot_cnt);
+        if (0 < nslots && nslots < num_nodes) {
             // take the last one given and extend it to cover remaining nodes
             tmp = max_slot_cnt[nslots - 1];
             for (n = nslots; n < num_nodes; n++) {
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&max_slot_cnt, tmp);
+                PMIx_Argv_append_nosize(&max_slot_cnt, tmp);
             }
         }
     }
@@ -102,7 +107,7 @@ static int allocate(prte_job_t *jdata, pmix_list_t *nodes)
     }
 
     /* see if they want are using hwthreads as cpus */
-    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_HWT_CPUS, NULL, PMIX_BOOL)) {
+    if (PRTE_ATTR_IS_TRUE(&jdata->attributes, PRTE_JOB_HWT_CPUS)) {
         use_hwthread_cpus = true;
     } else {
         use_hwthread_cpus = false;
@@ -111,11 +116,28 @@ static int allocate(prte_job_t *jdata, pmix_list_t *nodes)
     /* use our topology */
     t = (prte_topology_t *) pmix_pointer_array_get_item(prte_node_topologies, 0);
     if (NULL == t) {
+        if (NULL != max_slot_cnt) {
+            PMIx_Argv_free(max_slot_cnt);
+        }
+        if (NULL != slot_cnt) {
+            PMIx_Argv_free(slot_cnt);
+        }
+        PMIx_Argv_free(node_cnt);
+        if (NULL != job_cpuset) {
+            free(job_cpuset);
+        }
         return PRTE_ERR_NOT_FOUND;
     }
     topo = t->topo;
     if (NULL != job_cpuset) {
         available = prte_hwloc_base_generate_cpuset(topo, use_hwthread_cpus, &job_cpuset);
+        if (NULL == available) {
+            /* the cpu-set did not resolve - generate_cpuset() said which
+             * entry failed. Every simulated node dups this, and the mapper
+             * copies node->available without checking it. */
+            free(job_cpuset);
+            return PRTE_ERR_BAD_PARAM;
+        }
     } else {
         available = prte_hwloc_base_filter_cpus(topo);
     }
@@ -130,8 +152,10 @@ static int allocate(prte_job_t *jdata, pmix_list_t *nodes)
             val /= 10;
         }
 
-        /* set the prefix for this group of nodes */
-        prefix[4] += n;
+        /* set the prefix for this group of nodes. Assign (not +=): the
+         * compound form accumulates across iterations, so groups came out
+         * as A, B, D, G, K... instead of A, B, C, D. */
+        prefix[4] = 'A' + n;
 
         for (i = 0; i < num_nodes; i++) {
             node = PMIX_NEW(prte_node_t);
@@ -144,6 +168,10 @@ static int allocate(prte_job_t *jdata, pmix_list_t *nodes)
             } else {
                 node->slots = strtol(slot_cnt[n], NULL, 10);
             }
+            /* a simulated allocation is still an allocation: the sizes it
+             * fabricates are the ones the test wants mapped against, so they
+             * must not be re-derived from the topology later */
+            PRTE_FLAG_SET(node, PRTE_NODE_FLAG_SLOTS_GIVEN);
             if (NULL == max_slot_cnt || NULL == max_slot_cnt[n]) {
                 obj = hwloc_get_root_obj(t->topo);
                 node->slots_max = prte_hwloc_base_get_npus(t->topo, use_hwthread_cpus, available, obj);
@@ -165,16 +193,15 @@ static int allocate(prte_job_t *jdata, pmix_list_t *nodes)
     prte_num_allocated_nodes = pmix_list_get_size(nodes);
 
     // ensure we do not attempt to launch this job
-    prte_set_attribute(&jdata->attributes, PRTE_JOB_DO_NOT_LAUNCH, PRTE_ATTR_GLOBAL,
-                       NULL, PMIX_BOOL);
+    prte_set_bool_attribute(&jdata->attributes, PRTE_JOB_DO_NOT_LAUNCH, PRTE_ATTR_GLOBAL, true);
 
     if (NULL != max_slot_cnt) {
-        PMIX_ARGV_FREE_COMPAT(max_slot_cnt);
+        PMIx_Argv_free(max_slot_cnt);
     }
     if (NULL != slot_cnt) {
-        PMIX_ARGV_FREE_COMPAT(slot_cnt);
+        PMIx_Argv_free(slot_cnt);
     }
-    PMIX_ARGV_FREE_COMPAT(node_cnt);
+    PMIx_Argv_free(node_cnt);
     if (NULL != job_cpuset) {
         free(job_cpuset);
     }

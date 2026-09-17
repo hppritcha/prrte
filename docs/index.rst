@@ -33,6 +33,7 @@ Table of contents
    configuration
    terminology
    how-things-work/index
+   plans/index
    hosts/index
    placement/index
    launching-apps/index
@@ -40,6 +41,8 @@ Table of contents
    session-directory
    developers/index
    contributing
+   todo
+   code-of-conduct
    license
    man/index
    versions

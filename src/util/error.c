@@ -245,6 +245,18 @@ const char *prte_strerror(int errnum)
     case PRTE_ERR_FILE_ALERT:
         retval = "File alert - proc may have stalled";
         break;
+    case PRTE_ERR_MODEL_DECLARED:
+        retval = "Programming model declared";
+        break;
+    case PRTE_PMIX_LAUNCH_DIRECTIVE:
+        retval = "Launch directive";
+        break;
+    case PRTE_PMIX_LAUNCHER_READY:
+        retval = "Launcher ready";
+        break;
+    case PRTE_OPERATION_SUCCEEDED:
+        retval = "Operation succeeded";
+        break;
     case PRTE_ERR_RECV_LESS_THAN_POSTED:
         retval = "Receive was less than posted size";
         break;
@@ -397,6 +409,9 @@ const char *prte_strerror(int errnum)
     case PRTE_ERR_OPEN_CONDUIT_FAIL:
         retval = "Open messaging conduit failed";
         break;
+    case PRTE_ERR_DUPLICATE_MSG:
+        retval = "Duplicate message";
+        break;
     case PRTE_ERR_OUT_OF_ORDER_MSG:
         retval = "Out of order message";
         break;
@@ -408,6 +423,33 @@ const char *prte_strerror(int errnum)
         break;
     case PRTE_ERR_CONDUIT_SEND_FAIL:
         retval = " Transport Conduit returned send error";
+        break;
+    case PRTE_ERR_JSON_PARSE_FAILURE:
+        retval = "Failed to parse input JSON";
+        break;
+    case PRTE_ERR_SLURM_QUERY_FAILURE:
+        retval = "Failed to query Slurm job for information";
+        break;
+    case PRTE_ERR_SLURM_BAD_JOB_STATUS:
+        retval = "Found a pending Slurm job in an unexpected state";
+        break;
+    case PRTE_ERR_SLURM_SUBMIT_FAILURE:
+        retval = "Request for new resources from Slurm failed";
+        break;
+    case PRTE_ERR_SLURM_CANCEL_FAILURE:
+        retval = "Request to cancel Slurm job failed";
+        break;
+    case PRTE_ERR_SLURM_SHRINK_FAILURE:
+        retval = "Request to shrink Slurm job failed";
+        break;
+    case PRTE_ERR_PRELOAD_CONFLICT:
+        retval = "A preloaded file would have overwritten a file in the working directory";
+        break;
+    case PRTE_ERR_SLURM_UPDATE_FAILURE:
+        retval = "Request to update Slurm job failed";
+        break;
+    case PRTE_ERR_NOT_AUTHORITATIVE:
+        retval = "This process does not hold the authoritative copy of the requested data";
         break;
     default:
         retval = "Unknown error";

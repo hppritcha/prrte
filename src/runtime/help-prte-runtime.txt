@@ -1,6 +1,6 @@
 # -*- text -*-
 #
-# Copyright (c) 2025      Nanook Consulting  All rights reserved.
+# Copyright (c) 2025-2026 Nanook Consulting  All rights reserved.
 # $COPYRIGHT$
 #
 # Additional copyrights may follow
@@ -33,6 +33,45 @@ administrator to have the list of prohibited locations changed.
 Otherwise, please identify a different location to be used (use "-h"
 to see the cmd line option), or simply let the system pick a default
 location.
+#
+[prte:session:dir:owner]
+
+PRRTE found an existing directory at the location it uses for its
+session directory, but that directory belongs to another user:
+
+   Directory: %s
+   Owner uid: %lu
+   Our uid:   %lu
+
+Session directory names are predictable, so a directory with the right
+name and the wrong owner is either left over from another user's job
+or was created to intercept this one. PRRTE will not use it. Remove the
+directory (this may require the system administrator), or point PRRTE
+at a private temporary directory (use "-h" to see the cmd line option).
+#
+[prte:session:dir:writable]
+
+PRRTE found an existing directory at the location it uses for its
+session directory, but other users are allowed to write to it:
+
+   Directory: %s
+   Mode:      %04o
+
+PRRTE never creates its session directories that way, and other users
+may already have placed files in it, so PRRTE will not use it. Remove
+the directory and try again.
+#
+[prte:session:dir:inspect]
+
+PRRTE could not inspect the directory it created for its session
+directory:
+
+   Directory: %s
+   Error:     %s
+
+The directory may have been removed, or replaced with something that is
+not a directory (such as a symbolic link), after it was created. PRRTE
+will not use it.
 #
 [failed-to-uncompress]
 
@@ -87,6 +126,21 @@ on at least one node is missing a required entry:
 
 Please provide the missing information.
 #
+[bootstrap-duplicate-node]
+
+Bootstrap startup was requested, but the configuration file lists the
+same host more than once in DVMNodes:
+
+   file:   %s
+   host:   %s
+
+A host's position in DVMNodes determines its rank in the DVM, and every
+daemon computes its own rank from this same file. A repeated entry
+therefore leaves a rank that no daemon will ever claim, and the DVM can
+never finish forming.
+
+Please list each host exactly once and try again.
+#
 [bootstrap-bad-nodelist]
 
 Bootstrap startup was requested, but we were unable to parse the regex
@@ -98,6 +152,74 @@ of participating nodes on at least one node:
    error:  %s
 
 Please fix the error and try again.
+#
+[bootstrap-bad-entry]
+
+Bootstrap startup was requested, but a line in the configuration file
+on at least one node could not be parsed as a "Key=Value" entry:
+
+   node:   %s
+   file:   %s
+   line:   %s
+
+Please correct the configuration file and try again.
+#
+[bootstrap-node-not-member]
+
+Bootstrap startup was requested, but this node is neither the configured
+DVM controller host nor a member of the configured list of DVM nodes, so
+it cannot determine its identity within the DVM:
+
+   node:        %s
+   controller:  %s
+
+Please ensure this node is included in the DVMNodes list (or is the
+DVMControllerHost) in the configuration file.
+#
+[bootstrap-ipv6-unavailable]
+
+Bootstrap startup was requested with DVMIPVersion=6, but this PRRTE was
+built without IPv6 support:
+
+   node:  %s
+
+Please rebuild PRRTE with IPv6 enabled, or configure the DVM to use IPv4.
+#
+[bootstrap-unresolved-host]
+
+Bootstrap startup was unable to resolve a DVM member host to an address
+of the configured family:
+
+   node:  %s
+   host:  %s
+
+Please verify the DVMControllerHost/DVMNodes and DVMIPVersion settings
+and that name resolution is available on this node.
+#
+[bootstrap-ambiguous-address]
+
+Bootstrap startup could not unambiguously determine which address to use
+to reach a DVM member: the host resolves to multiple addresses and the
+configured networks did not narrow the choice to exactly one.
+
+   node:      %s
+   host:      %s
+   networks:  %s
+
+Set DVMNetworks to the CIDR (e.g. 10.0.0.0/16) of the interconnect the
+DVM should use, so a single address on that network can be selected.
+#
+[bootstrap-no-matching-address]
+
+Bootstrap startup resolved a DVM member host, but none of its addresses
+fall within the configured DVMNetworks:
+
+   node:      %s
+   host:      %s
+   networks:  %s
+
+Please verify that DVMNetworks names the CIDR of the interconnect these
+hosts are reachable on.
 #
 [prte:session:dir:shared]
 
@@ -129,3 +251,16 @@ directive that caused some group members to be dropped - i.e., the
 provided final order does not cover some of the final group members.
 Please revise your final order directive so that all final group
 members can be included in the returned final membership.
+[uniform-nodes-mismatch]
+A node has reported hardware that differs from this node's:
+
+  Node: %s
+
+"--uniform-nodes" (or the prte_uniform_nodes MCA parameter) asserts that
+every node of the allocation is identical, and PRRTE acts on that rather
+than merely noting it: only one daemon is asked for its hardware, and every
+other node is given what that one reported. The node above disagrees, so the
+assertion does not hold and the other nodes have been described wrongly -
+their processes would be placed and bound against hardware they do not have.
+
+Remove the option and let PRRTE discover each node's hardware for itself.

@@ -20,11 +20,37 @@ AC_DEFUN([PRTE_CONFIG_FILES],[
         src/etc/Makefile
         src/util/Makefile
         src/util/hostfile/Makefile
+        src/util/rankfile/Makefile
         src/tools/pcc/Makefile
         src/tools/prted/Makefile
         src/tools/prun/Makefile
         src/tools/prte_info/Makefile
         src/tools/prte/Makefile
         src/tools/pterm/Makefile
+        test/Makefile
+        test/attachtest/Makefile
+        test/topologies/Makefile
+        test/offline/Makefile
+        test/unit/Makefile
+        test/unit/rmaps/Makefile
+        test/unit/runtime/Makefile
+        test/unit/errmgr/Makefile
+        test/unit/ess/Makefile
+        test/unit/event/Makefile
+        test/unit/filem/Makefile
+        test/unit/grpcomm/Makefile
+        test/unit/hwloc/Makefile
+        test/unit/include/Makefile
+        test/unit/odls/Makefile
+        test/unit/iof/Makefile
+        test/unit/plm/Makefile
+        test/unit/pmix/Makefile
+        test/unit/prted/Makefile
+        test/unit/rml/Makefile
+        test/unit/ras/Makefile
+        test/unit/schizo/Makefile
+        test/unit/state/Makefile
+        test/unit/tools/Makefile
+        test/unit/util/Makefile
     ])
 ])

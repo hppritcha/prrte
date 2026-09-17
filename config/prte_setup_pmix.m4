@@ -17,7 +17,7 @@
 # Copyright (c) 2014-2019 Research Organization for Information Science
 #                         and Technology (RIST).  All rights reserved.
 # Copyright (c) 2016      IBM Corporation.  All rights reserved.
-# Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+# Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
 # Copyright (c) 2021-2022 Amazon.com, Inc. or its affiliates.
 #                         All Rights reserved.
 # Copyright (c) 2023      Jeffrey M. Squyres.  All rights reserved.
@@ -180,6 +180,26 @@ AC_DEFUN([PRTE_CHECK_PMIX],[
     PRTE_FLAGS_APPEND_UNIQ(LDFLAGS, $PRTE_FINAL_LDFLAGS)
     PRTE_FLAGS_APPEND_UNIQ(LIBS, $PRTE_FINAL_LIBS)
 
+    AC_MSG_CHECKING([for functional form of GET_NUMBER macro])
+    PRTE_CHECK_PMIX_CAP([GET_NUMBER_FN],
+                        [AC_MSG_RESULT([yes])
+                         prte_get_number_macro=1],
+                        [AC_MSG_RESULT([no])
+                         prte_get_number_macro=0])
+    AC_DEFINE_UNQUOTED([PRTE_PMIX_GET_NUMBER_FN],
+                       [$prte_get_number_macro],
+                       [Whether or not PMIx has the GET_NUMBER FN])
+
+    AC_MSG_CHECKING([for support of stop progress thread API])
+    PRTE_CHECK_PMIX_CAP([STOP_PRGTHRD],
+                        [AC_MSG_RESULT([yes])
+                         prte_pmix_stop_progress_thread=1],
+                        [AC_MSG_RESULT([no])
+                         prte_pmix_stop_progress_thread=0])
+    AC_DEFINE_UNQUOTED([PRTE_PMIX_STOP_PRGTHRD],
+                       [$prte_pmix_stop_progress_thread],
+                       [Whether or not PMIx supports the stop progress thread API])
+
     AC_MSG_CHECKING([for support of version 2 server upcalls])
     PRTE_CHECK_PMIX_CAP([UPCALLS2],
                         [AC_MSG_RESULT([yes])
@@ -202,6 +222,156 @@ AC_DEFUN([PRTE_CHECK_PMIX],[
                          AC_MSG_WARN([PMIx installation with the required capability.])
                          AC_MSG_ERROR([Cannot continue.])])
 
+    AC_MSG_CHECKING([for PMIx regex2 API support])
+    PRTE_CHECK_PMIX_CAP([REGEX2],
+                        [AC_MSG_RESULT([yes])
+                         prte_pmix_have_regex2=1],
+                        [AC_MSG_RESULT([no])
+                         prte_pmix_have_regex2=0])
+    AC_DEFINE_UNQUOTED([PRTE_PMIX_HAVE_REGEX2],
+                       [$prte_pmix_have_regex2],
+                       [Whether or not PMIx supports the PMIx_generate_regex2 API])
+
+    AC_MSG_CHECKING([for PMIx group fault-tolerance support])
+    PRTE_CHECK_PMIX_CAP([GROUP_FT],
+                        [AC_MSG_RESULT([yes])
+                         prte_pmix_have_group_ft=1],
+                        [AC_MSG_RESULT([no])
+                         prte_pmix_have_group_ft=0])
+    AC_DEFINE_UNQUOTED([PRTE_PMIX_HAVE_GROUP_FT],
+                       [$prte_pmix_have_group_ft],
+                       [Whether PMIx supports the group fault-tolerance feature set, including the PMIX_GROUP_CANCEL host operation])
+
+    AC_MSG_CHECKING([for PMIx command-line qualifier value support])
+    PRTE_CHECK_PMIX_CAP([CLI_QUAL_VALUE],
+                        [AC_MSG_RESULT([yes])],
+                        [AC_MSG_RESULT([no])
+                         AC_MSG_WARN([PRRTE requires pmix_cli_qualifier_value(), which this])
+                         AC_MSG_WARN([PMIx does not provide. It reads the value of a command])
+                         AC_MSG_WARN([line qualifier - the text after its '=' - which cannot])
+                         AC_MSG_WARN([be done correctly outside PMIx, as the option matcher])
+                         AC_MSG_WARN([accepts any unambiguous prefix of a qualifier's name.])
+                         AC_MSG_ERROR([Please update PMIx and configure again])])
+
+    dnl Every PRRTE framework states the interface version its components
+    dnl are built against, and it does so through PMIx's machinery: the
+    dnl framework declaration expands to PMIX_MCA_BASE_FRAMEWORK_DECLARE_FULL
+    dnl and each component stamps PMIX_MCA_BASE_VERSION_2_1_0.  There is
+    dnl nothing to fall back to - the version fields live in PMIx's framework
+    dnl struct, and PMIx's component-open is what compares them - so this is
+    dnl a requirement rather than a feature to switch off.
+    dnl
+    dnl Ask here because the failure otherwise lands nowhere near its cause:
+    dnl against an older PMIx the numbers reach a macro that has no room for
+    dnl them, and the build stops with "expected ')' before numeric constant"
+    dnl pointing at a #define in whichever framework header compiled first.
+    AC_MSG_CHECKING([for PMIx versioned framework declaration])
+    PRTE_CHECK_PMIX_CAP([MCA_FW_VERSION],
+                        [AC_MSG_RESULT([yes])],
+                        [AC_MSG_RESULT([no])
+                         AC_MSG_WARN([PRRTE states each framework's interface version through])
+                         AC_MSG_WARN([PMIX_MCA_BASE_FRAMEWORK_DECLARE_FULL and the])
+                         AC_MSG_WARN([PMIX_MCA_BASE_VERSION_2_1_0 component stamp, which this])
+                         AC_MSG_WARN([PMIx does not provide. Those version fields live in])
+                         AC_MSG_WARN([PMIx's framework struct and PMIx compares them when it])
+                         AC_MSG_WARN([opens a component, so there is nothing PRRTE can supply])
+                         AC_MSG_WARN([in their place.])
+                         AC_MSG_ERROR([Please update PMIx and configure again])])
+
+    dnl "--map-by device=<class>" places processes against the devices in a
+    dnl node's topology, which means first knowing what devices it has.  PMIx
+    dnl owns that answer: it already reports devices to applications through
+    dnl PMIX_DEVICE_DISTANCES, and a second enumerator here would let PRRTE
+    dnl and PMIx disagree about the same device's name - which is exactly the
+    dnl string an application correlates its assignment against.  So there is
+    dnl no local fallback to select: without the enumerator the directive
+    dnl cannot be honored at all.
+    AC_MSG_CHECKING([for PMIx device enumeration support])
+    PRTE_CHECK_PMIX_CAP([DEVICE_ENUM],
+                        [AC_MSG_RESULT([yes])],
+                        [AC_MSG_RESULT([no])
+                         AC_MSG_WARN([PRRTE requires pmix_hwloc_get_devices(), which this])
+                         AC_MSG_WARN([PMIx does not provide. It lists the devices in a])
+                         AC_MSG_WARN([topology, which is what "--map-by device=" maps])
+                         AC_MSG_WARN([against. PRRTE deliberately does not carry its own])
+                         AC_MSG_WARN([copy: the device names it hands to a process have to])
+                         AC_MSG_WARN([be the ones PMIx reports to that same process.])
+                         AC_MSG_ERROR([Please update PMIx and configure again])])
+
+    dnl The "pattern" qualifier on "--output file=NAME" hands the naming of
+    dnl the output files to the user.  Expanding the pattern is PMIx's job -
+    dnl PMIx owns the IOF sinks and is the only place that knows the rank and
+    dnl namespace at the moment a file is opened - so without those helpers
+    dnl PRRTE has nothing to hand the request to, and says so rather than
+    dnl accepting a qualifier it cannot honor.
+    AC_MSG_CHECKING([for PMIx output-file pattern support])
+    PRTE_CHECK_PMIX_CAP([IOF_FILE_PATTERN],
+                        [AC_MSG_RESULT([yes])
+                         prte_pmix_iof_file_pattern=1],
+                        [AC_MSG_RESULT([no])
+                         prte_pmix_iof_file_pattern=0])
+    AC_DEFINE_UNQUOTED([PRTE_PMIX_IOF_FILE_PATTERN],
+                       [$prte_pmix_iof_file_pattern],
+                       [Whether PMIx can expand an output-file name pattern])
+
+    dnl The environment directives (--set-env, --prepend-env, --append-env,
+    dnl --unset-env, -x) edit each other, so the order the user gave them in
+    dnl is the value the process ends up with.  Recovering that order from a
+    dnl parse result requires PMIx to have recorded where each value was
+    dnl given: the result groups every occurrence of an option onto that
+    dnl option's single instance, so an option repeated after another has
+    dnl intervened cannot be placed from the grouped view alone.  Without the
+    dnl stamps we fall back to that view, which is right for every command
+    dnl line that does not interleave repeats.
+    AC_MSG_CHECKING([for PMIx command-line occurrence order])
+    PRTE_CHECK_PMIX_CAP([CLI_ORDER],
+                        [AC_MSG_RESULT([yes])
+                         prte_pmix_cli_order=1],
+                        [AC_MSG_RESULT([no])
+                         prte_pmix_cli_order=0])
+    AC_DEFINE_UNQUOTED([PRTE_PMIX_CLI_ORDER],
+                       [$prte_pmix_cli_order],
+                       [Whether PMIx records where each command line option occurred])
+
+    dnl A tool can attach to any daemon, not just the DVM master, and the
+    dnl output of the job it launches has to reach it there.  The master is
+    dnl the only process that sees all of a job's output, so it relays a
+    dnl copy to the daemon hosting the tool - but that daemon must hand the
+    dnl copy to its PMIx server WITHOUT emitting it, since the daemon that
+    dnl actually hosts those processes has already written whatever the
+    dnl output directives called for.  Two servers writing one --output file
+    dnl is the failure that guards against.  PMIx has to be able to be told
+    dnl that per delivery; without it we cannot relay safely and a tool on a
+    dnl non-master daemon sees only the output of processes its own daemon
+    dnl happens to host.
+    AC_MSG_CHECKING([for PMIx per-delivery IOF local-output control])
+    PRTE_CHECK_PMIX_CAP([IOF_DELIVER_LOCAL],
+                        [AC_MSG_RESULT([yes])
+                         prte_pmix_iof_deliver_local=1],
+                        [AC_MSG_RESULT([no])
+                         prte_pmix_iof_deliver_local=0])
+    AC_DEFINE_UNQUOTED([PRTE_PMIX_IOF_DELIVER_LOCAL],
+                       [$prte_pmix_iof_deliver_local],
+                       [Whether PMIx honors PMIX_IOF_LOCAL_OUTPUT on an IOF delivery])
+
+    dnl The iof has always had the shape of XON/XOFF back-pressure on stdin -
+    dnl a daemon whose stdin sink passes PRTE_IOF_MAX_INPUT_BUFFERS tells the
+    dnl HNP so - but the HNP could not act on it.  Stdin originates in a PMIx
+    dnl server's read of its own stdin or in a tool's PMIx_IOF_push, and until
+    dnl PMIx grew PMIx_server_IOF_flow_control there was no way to stop either
+    dnl at the source: a refusal anywhere would have dropped bytes rather than
+    dnl slowed the producer.  Without this the HNP consumes the message and
+    dnl the daemon's sink simply queues, bounded only by iof_base_output_limit.
+    AC_MSG_CHECKING([for PMIx IOF stdin flow control])
+    PRTE_CHECK_PMIX_CAP([IOF_FLOW_CONTROL],
+                        [AC_MSG_RESULT([yes])
+                         prte_pmix_iof_flow_control=1],
+                        [AC_MSG_RESULT([no])
+                         prte_pmix_iof_flow_control=0])
+    AC_DEFINE_UNQUOTED([PRTE_PMIX_IOF_FLOW_CONTROL],
+                       [$prte_pmix_iof_flow_control],
+                       [Whether PMIx supports PMIx_server_IOF_flow_control])
+
     AC_MSG_CHECKING([for LTO compatibility])
     PRTE_CHECK_PMIX_CAP([LTO],
                         [PRTE_PMIX_LTO_CAPABILITY=1
@@ -218,6 +388,27 @@ AC_DEFUN([PRTE_CHECK_PMIX],[
     AC_DEFINE_UNQUOTED([PRTE_PMIX_LTO_CAPABILITY],
                        [$PRTE_PMIX_LTO_CAPABILITY],
                        [Whether or not PMIx has the LTO capability flag set])
+
+    dnl The elastic-DVM completion contract directs two PMIx events at the
+    dnl process that requested a DVM size change: PMIX_DVM_IS_READY on success
+    dnl and PMIX_ERR_DVM_MOD on failure.  These are plain #define'd status
+    dnl codes, not behavioral capability flags, so probe for the symbols
+    dnl themselves rather than a PMIX_CAP_* flag.  A PMIx that defines neither
+    dnl leaves the completion notification compiled out (see
+    dnl docs/plans/elastic_dvm/).
+    AC_MSG_CHECKING([for PMIx DVM modification event codes])
+    AC_PREPROC_IFELSE(
+        [AC_LANG_PROGRAM([[#include <pmix.h>
+#if !defined(PMIX_DVM_IS_READY) || !defined(PMIX_ERR_DVM_MOD)
+#error DVM modification event codes not present
+#endif
+]], [[]])],
+        [AC_MSG_RESULT([yes])
+         AC_DEFINE([PRTE_HAVE_DVM_MOD_EVENTS], [1],
+                   [Whether PMIx defines the DVM modification event codes])],
+        [AC_MSG_RESULT([no])
+         AC_DEFINE([PRTE_HAVE_DVM_MOD_EVENTS], [0],
+                   [Whether PMIx defines the DVM modification event codes])])
 
     # restore the global flags
     CPPFLAGS=$prte_external_pmix_save_CPPFLAGS

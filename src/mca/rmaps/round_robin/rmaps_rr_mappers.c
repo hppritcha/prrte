@@ -13,7 +13,7 @@
  * Copyright (c) 2013-2020 Intel, Inc.  All rights reserved.
  * Copyright (c) 2015-2018 Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * Copyright (c) 2021      IBM Corporation.  All rights reserved.
  * $COPYRIGHT$
  *
@@ -33,11 +33,33 @@
 #include "src/mca/errmgr/errmgr.h"
 #include "src/runtime/prte_globals.h"
 #include "src/util/name_fns.h"
-#include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
+#include "src/pmix/pmix-internal.h"
+#include "src/hwloc/pmix_hwloc.h"
 
 #include "rmaps_rr.h"
 #include "src/mca/rmaps/base/base.h"
 #include "src/mca/rmaps/base/rmaps_private.h"
+
+/* Hold a batch to what the node's max_slots still allows.
+ *
+ * max_slots is a hard bound that no oversubscribe directive lifts, and
+ * check_avail() enforces it only before a batch: it refuses a node already
+ * at the bound, then the batch mappers placed options->nprocs procs in one
+ * go.  With oversubscription allowed nothing else caps that number, so
+ * --map-by node:oversubscribe put eight procs on a node whose max_slots was
+ * three.  Call after check_avail() has accepted the node, which guarantees
+ * the headroom is at least one.  A tool consumes no slots, so is not held. */
+static void cap_at_max_slots(prte_app_context_t *app, prte_node_t *node,
+                             prte_rmaps_options_t *options)
+{
+    if (PRTE_FLAG_TEST(app, PRTE_APP_FLAG_TOOL) || 0 == node->slots_max) {
+        return;
+    }
+    if (node->slots_max - node->slots_inuse < options->nprocs) {
+        options->nprocs = node->slots_max - node->slots_inuse;
+    }
+}
 
 int prte_rmaps_rr_byslot(prte_job_t *jdata,
                          prte_app_context_t *app,
@@ -46,9 +68,10 @@ int prte_rmaps_rr_byslot(prte_job_t *jdata,
                          pmix_rank_t num_procs,
                          prte_rmaps_options_t *options)
 {
-    int i, rc=PRTE_SUCCESS, nprocs_mapped, ncpus;
+    int i, rc=PRTE_SUCCESS, nprocs_mapped, ncpus, nplaced;
     prte_node_t *node, *nd;
     int extra_procs_to_assign = 0, nxtra_nodes = 0;
+    size_t nnodes;
     float balance;
     prte_proc_t *proc;
     bool second_pass = false;
@@ -62,7 +85,7 @@ int prte_rmaps_rr_byslot(prte_job_t *jdata,
     /* check to see if we can map all the procs */
     if (num_slots < (int) app->num_procs) {
         if (!options->oversubscribe) {
-            pmix_show_help("help-prte-rmaps-base.txt", "prte-rmaps-base:alloc-error", true,
+            prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-rmaps-base.txt", "prte-rmaps-base:alloc-error", true,
                            app->num_procs, app->app, prte_process_info.nodename);
             PRTE_UPDATE_EXIT_STATUS(PRTE_ERROR_DEFAULT_EXIT_CODE);
             return PRTE_ERR_SILENT;
@@ -78,6 +101,7 @@ int prte_rmaps_rr_byslot(prte_job_t *jdata,
     nprocs_mapped = 0;
 
 pass:
+    nplaced = 0;
     PMIX_LIST_FOREACH_SAFE(node, nd, node_list, prte_node_t)
     {
         pmix_output_verbose(2, prte_rmaps_base_framework.framework_output,
@@ -140,6 +164,7 @@ pass:
             options->bind = savebind;
             continue;
         }
+        cap_at_max_slots(app, node, options);
 
         pmix_output_verbose(2, prte_rmaps_base_framework.framework_output,
                             "mca:rmaps:rr:slot assigning %d procs to node %s",
@@ -153,6 +178,7 @@ pass:
                 break;
             }
             nprocs_mapped++;
+            nplaced++;
             rc = prte_rmaps_base_check_oversubscribed(jdata, app, node, options);
             if (PRTE_ERR_TAKE_NEXT_OPTION == rc) {
                 /* move to next node */
@@ -170,17 +196,22 @@ pass:
             return PRTE_SUCCESS;
         }
         options->bind = savebind;
-        if(NULL != options->target)
-        {
+        if (NULL != options->target) {
             hwloc_bitmap_free(options->target);
             options->target = NULL;
         }
     }
 
-    if (second_pass) {
+    /* Another pass is worth taking only while passes still place something.
+     * One extra pass used to be all there was, but a node can take less than
+     * its share of the overflow - it hit max_slots, or its cpus ran out - and
+     * what it could not take belongs on the nodes that still have room, not
+     * in a failed map. */
+    if (second_pass && 0 == nplaced) {
+        rc = (PRTE_SUCCESS == rc) ? PRTE_ERR_OUT_OF_RESOURCE : rc;
     errout:
         if (PRTE_ERR_SILENT != rc) {
-            pmix_show_help("help-prte-rmaps-base.txt",
+            prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-rmaps-base.txt",
                            "failed-map", true,
                            PRTE_ERROR_NAME(rc),
                            (NULL == app) ? "N/A" : app->app,
@@ -192,23 +223,28 @@ pass:
     }
 
     pmix_output_verbose(2, prte_rmaps_base_framework.framework_output,
-                        "mca:rmaps:rr:slot job %s is oversubscribed - performing second pass",
+                        "mca:rmaps:rr:slot job %s is oversubscribed - performing another pass",
                         PRTE_JOBID_PRINT(jdata->nspace));
 
-    /* second pass: if we haven't mapped everyone yet, it is
-     * because we are oversubscribed. All of the nodes that are
-     * at max_slots have been removed from the list as that specifies
-     * a hard boundary, so the nodes remaining are available for
-     * handling the oversubscription. Figure out how many procs
-     * to add to each of them.
+    /* if we haven't mapped everyone yet, it is because we are
+     * oversubscribed. All of the nodes that are at max_slots have been
+     * removed from the list as that specifies a hard boundary, so the nodes
+     * remaining are available for handling the oversubscription. Figure out
+     * how many procs to add to each of them - and if that removal emptied
+     * the list, there is nowhere left to put them.
      */
-    balance = (float) ((int) app->num_procs - nprocs_mapped)
-              / (float) pmix_list_get_size(node_list);
+    nnodes = pmix_list_get_size(node_list);
+    if (0 == nnodes) {
+        rc = PRTE_ERR_OUT_OF_RESOURCE;
+        goto errout;
+    }
+    balance = (float) ((int) app->num_procs - nprocs_mapped) / (float) nnodes;
     extra_procs_to_assign = (int) balance;
+    nxtra_nodes = 0;
     if (0 < (balance - (float) extra_procs_to_assign)) {
         /* compute how many nodes need an extra proc */
         nxtra_nodes = app->num_procs - nprocs_mapped
-                      - (extra_procs_to_assign * pmix_list_get_size(node_list));
+                      - (extra_procs_to_assign * (int) nnodes);
         /* add one so that we add an extra proc to the first nodes
          * until all procs are mapped
          */
@@ -226,10 +262,11 @@ int prte_rmaps_rr_bynode(prte_job_t *jdata,
                          pmix_rank_t num_procs,
                          prte_rmaps_options_t *options)
 {
-    int rc=PRTE_SUCCESS, j, nprocs_mapped, ncpus;
+    int rc=PRTE_SUCCESS, j, nprocs_mapped, ncpus, avg, nplaced;
     prte_node_t *node, *nd;
     bool second_pass = false;
     prte_proc_t *proc;
+    size_t nnodes;
     prte_binding_policy_t savebind = options->bind;
 
     pmix_output_verbose(2, prte_rmaps_base_framework.framework_output,
@@ -240,7 +277,7 @@ int prte_rmaps_rr_bynode(prte_job_t *jdata,
     /* quick check to see if we can map all the procs */
     if (num_slots < (int) app->num_procs) {
         if (!options->oversubscribe) {
-            pmix_show_help("help-prte-rmaps-base.txt", "prte-rmaps-base:alloc-error", true,
+            prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-rmaps-base.txt", "prte-rmaps-base:alloc-error", true,
                            app->num_procs, app->app, prte_process_info.nodename);
             PRTE_UPDATE_EXIT_STATUS(PRTE_ERROR_DEFAULT_EXIT_CODE);
             return PRTE_ERR_SILENT;
@@ -263,13 +300,20 @@ pass:
      * then the avg is what we get on each node - this is
      * the most common situation.
      */
-    options->nprocs = (app->num_procs - nprocs_mapped) / pmix_list_get_size(node_list);
-    if (0 == options->nprocs) {
+    nnodes = pmix_list_get_size(node_list);
+    if (0 == nnodes) {
+        /* every node left the list at its max_slots */
+        rc = PRTE_ERR_OUT_OF_RESOURCE;
+        goto errout;
+    }
+    avg = (int) ((app->num_procs - nprocs_mapped) / nnodes);
+    if (0 == avg) {
         /* if there are less procs than nodes, we have to
          * place at least one/node
          */
-        options->nprocs = 1;
+        avg = 1;
     }
+    nplaced = 0;
 
     PMIX_LIST_FOREACH_SAFE(node, nd, node_list, prte_node_t)
     {
@@ -280,6 +324,11 @@ pass:
             goto errout;
         }
 
+        /* Every node starts from the average.  The cap below is this node's
+         * and nobody else's: it used to be applied to the pass's own count,
+         * so one small node shrank what every node after it was offered and
+         * -H a:1,b:4,c:4 -n 9 failed to map a job that exactly fits. */
+        options->nprocs = avg;
         if (!options->oversubscribe) {
             /* since oversubscribe is not allowed, cap our usage
              * at the number of available slots. */
@@ -306,6 +355,7 @@ pass:
             options->bind = savebind;
             continue;
         }
+        cap_at_max_slots(app, node, options);
 
         PMIX_OUTPUT_VERBOSE((10, prte_rmaps_base_framework.framework_output,
                              "%s NODE %s ASSIGNING %d PROCS",
@@ -320,6 +370,7 @@ pass:
                 break;
             }
             nprocs_mapped++;
+            nplaced++;
             rc = prte_rmaps_base_check_oversubscribed(jdata, app, node, options);
             if (PRTE_ERR_TAKE_NEXT_OPTION == rc) {
                 /* move to next node */
@@ -336,18 +387,19 @@ pass:
             return PRTE_SUCCESS;
         }
         options->bind = savebind;
-        if(NULL != options->target)
-        {
+        if (NULL != options->target) {
             hwloc_bitmap_free(options->target);
             options->target = NULL;
         }
     }
 
-    if (second_pass) {
+    /* keep going while passes still place something - see byslot */
+    if (second_pass && 0 == nplaced) {
+        rc = (PRTE_SUCCESS == rc) ? PRTE_ERR_OUT_OF_RESOURCE : rc;
     errout:
         /* unable to do it */
         if (PRTE_ERR_SILENT != rc) {
-            pmix_show_help("help-prte-rmaps-base.txt",
+            prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-rmaps-base.txt",
                            "failed-map", true,
                            PRTE_ERROR_NAME(rc),
                            (NULL == app) ? "N/A" : app->app,
@@ -358,29 +410,83 @@ pass:
         return PRTE_ERR_SILENT;
     }
     pmix_output_verbose(2, prte_rmaps_base_framework.framework_output,
-                        "mca:rmaps:rr:node job %s is oversubscribed - performing second pass",
+                        "mca:rmaps:rr:node job %s is oversubscribed - performing another pass",
                         PRTE_JOBID_PRINT(jdata->nspace));
 
-    /* second pass: if we haven't mapped everyone yet, it is
-     * because we are oversubscribed. All of the nodes that are
-     * at max_slots have been removed from the list as that specifies
-     * a hard boundary, so the nodes remaining are available for
-     * handling the oversubscription.
+    /* if we haven't mapped everyone yet, it is because a node could not
+     * take its share. All of the nodes that are at max_slots have been
+     * removed from the list as that specifies a hard boundary, so the
+     * nodes remaining are available for the rest.
      */
     second_pass = true;
     goto pass;
 }
 
-/* mapping by cpu */
+/* mapping by device - the shared loop, with the devices as its targets */
+int prte_rmaps_rr_bydevice(prte_job_t *jdata, prte_app_context_t *app,
+                           pmix_list_t *node_list, int32_t num_slots,
+                           pmix_rank_t num_procs,
+                           prte_rmaps_options_t *options)
+{
+    size_t ndevs;
+    int rc;
+    /* A named device is "put every process near this one" - shared by
+     * definition, whatever the "shared" qualifier says. */
+    bool shared = options->map_shared || prte_rmaps_base_devices_named(options->map_device);
+    prte_rmaps_target_enum_t tgts = {
+        .begin = prte_rmaps_base_devices_begin,
+        .count = prte_rmaps_base_devices_count,
+        .item = prte_rmaps_base_devices_locale,
+        .placed = prte_rmaps_base_devices_record,
+        .end = prte_rmaps_base_devices_end,
+        .name = options->map_device,
+        /* A device is assigned to a process, not subdivided between them:
+         * two procs sharing a GPU is a different thing from two procs
+         * sharing a core.  So it has its own qualifier rather than riding on
+         * binding's "overload-allowed", which is about running more procs
+         * than there are CPUs - a different resource, a different question,
+         * and answering both with one word would leave neither sayable on
+         * its own. */
+        .nowrap = !shared
+    };
+
+    if (NULL == options->map_device) {
+        /* the policy cannot be set without a value - see the two --map-by
+         * parsers - so this is a programming error, not user input */
+        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    /* Say up front when there are not enough devices to go round, rather
+     * than letting the placement run out partway and report a generic
+     * failure. */
+    if (!shared) {
+        rc = prte_rmaps_base_devices_total(node_list, options, &ndevs);
+        if (PRTE_SUCCESS != rc) {
+            PRTE_ERROR_LOG(rc);
+            return rc;
+        }
+        if (0 < ndevs && ndevs < (size_t) app->num_procs) {
+            prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-rmaps-base.txt", "rmaps:too-few-devices", true,
+                           (int) app->num_procs, options->map_device, (int) ndevs);
+            return PRTE_ERR_SILENT;
+        }
+    }
+
+    return prte_rmaps_rr_map_targets(jdata, app, node_list, num_slots,
+                                     num_procs, options, &tgts);
+}
+
 int prte_rmaps_rr_bycpu(prte_job_t *jdata, prte_app_context_t *app,
                         pmix_list_t *node_list, int32_t num_slots,
                         pmix_rank_t num_procs, prte_rmaps_options_t *options)
 {
-    int i, rc, nprocs_mapped, ncpus;
+    int i, rc = PRTE_SUCCESS, nprocs_mapped, ncpus, nplaced = 0;
     prte_node_t *node, *nd;
     prte_proc_t *proc;
     char **tmp;
     int ntomap;
+    size_t nnodes;
     bool second_pass = false;
     int extra_procs_to_assign = 0, nxtra_nodes = 0;
     float balance;
@@ -396,7 +502,7 @@ int prte_rmaps_rr_bycpu(prte_job_t *jdata, prte_app_context_t *app,
     /* check to see if we can map all the procs */
     if (num_slots < (int) app->num_procs) {
         if (!options->oversubscribe) {
-            pmix_show_help("help-prte-rmaps-base.txt", "prte-rmaps-base:alloc-error", true,
+            prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-rmaps-base.txt", "prte-rmaps-base:alloc-error", true,
                            app->num_procs, app->app, prte_process_info.nodename);
             PRTE_UPDATE_EXIT_STATUS(PRTE_ERROR_DEFAULT_EXIT_CODE);
             return PRTE_ERR_SILENT;
@@ -410,9 +516,10 @@ int prte_rmaps_rr_bycpu(prte_job_t *jdata, prte_app_context_t *app,
     }
 
     nprocs_mapped = 0;
-    savecpuset = strdup(options->cpuset);
+    savecpuset = (NULL != options->cpuset) ? strdup(options->cpuset) : NULL;
 
 pass:
+    nplaced = 0;
     PMIX_LIST_FOREACH_SAFE(node, nd, node_list, prte_node_t)
     {
         pmix_output_verbose(2, prte_rmaps_base_framework.framework_output,
@@ -435,11 +542,11 @@ pass:
                     --extra_procs_to_assign;
                 }
             }
-        } else  if (options->ordered || !options->overload) {
+        } else if (options->ordered || !options->overload) {
             // see how many PEs we were given
-            tmp = PMIX_ARGV_SPLIT_COMPAT(options->cpuset, ',');
-            ntomap = PMIX_ARGV_COUNT_COMPAT(tmp);
-            PMIX_ARGV_FREE_COMPAT(tmp);
+            tmp = PMIx_Argv_split(options->cpuset, ',');
+            ntomap = PMIx_Argv_count(tmp);
+            PMIx_Argv_free(tmp);
             options->nprocs = ntomap;
         } else {
             /* assign a number of procs equal to the number of available slots */
@@ -476,6 +583,7 @@ pass:
             options->bind = savebind;
             continue;
         }
+        cap_at_max_slots(app, node, options);
 
         pmix_output_verbose(2, prte_rmaps_base_framework.framework_output,
                             "mca:rmaps:rr:cpu assigning %d procs to node %s",
@@ -488,6 +596,7 @@ pass:
                 goto errout;
             }
             nprocs_mapped++;
+            nplaced++;
             rc = prte_rmaps_base_check_oversubscribed(jdata, app, node, options);
             if (PRTE_ERR_TAKE_NEXT_OPTION == rc) {
                 /* move to next node */
@@ -509,9 +618,13 @@ pass:
                 hwloc_bitmap_free(options->job_cpuset);
                 options->job_cpuset = NULL;
             }
-            if (NULL != savecpuset) {
-                free(savecpuset);
+            /* restore the list the caller handed us - what is in options
+             * now is the remainder this pass did not consume, and it is
+             * ours to release, exactly as on the per-node path below */
+            if (NULL != options->cpuset) {
+                free(options->cpuset);
             }
+            options->cpuset = savecpuset;
             return PRTE_SUCCESS;
         }
         if (NULL != options->target) {
@@ -525,7 +638,7 @@ pass:
         if (NULL != options->cpuset) {
             free(options->cpuset);
         }
-        options->cpuset = strdup(savecpuset);
+        options->cpuset = (NULL != savecpuset) ? strdup(savecpuset) : NULL;
     } // next node
 
     /* second pass: if we haven't mapped everyone yet, it is
@@ -535,14 +648,16 @@ pass:
      * handling the oversubscription. Figure out how many procs
      * to add to each of them.
      */
-    if (options->oversubscribe && !second_pass) {
-        balance = (float) ((int) app->num_procs - nprocs_mapped)
-        / (float) pmix_list_get_size(node_list);
+    /* ...and keep going while passes still place something - see byslot */
+    nnodes = pmix_list_get_size(node_list);
+    if (options->oversubscribe && (!second_pass || 0 < nplaced) && 0 < nnodes) {
+        balance = (float) ((int) app->num_procs - nprocs_mapped) / (float) nnodes;
         extra_procs_to_assign = (int) balance;
+        nxtra_nodes = 0;
         if (0 < (balance - (float) extra_procs_to_assign)) {
             /* compute how many nodes need an extra proc */
             nxtra_nodes = app->num_procs - nprocs_mapped
-            - (extra_procs_to_assign * pmix_list_get_size(node_list));
+            - (extra_procs_to_assign * (int) nnodes);
             /* add one so that we add an extra proc to the first nodes
              * until all procs are mapped
              */
@@ -552,7 +667,7 @@ pass:
         if (NULL != options->cpuset) {
             free(options->cpuset);
         }
-        options->cpuset = strdup(savecpuset);
+        options->cpuset = (NULL != savecpuset) ? strdup(savecpuset) : NULL;
         // Rescan the nodes
         second_pass = true;
         goto pass;
@@ -561,7 +676,7 @@ pass:
 errout:
     /* if we get here, then we were unable to map all the procs */
     if (PRTE_ERR_SILENT != rc) {
-        pmix_show_help("help-prte-rmaps-rr.txt",
+        prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-rmaps-rr.txt",
                        "prte-rmaps-rr:not-enough-cpus", true,
                        app->app, app->num_procs, savecpuset);
     }
@@ -571,33 +686,73 @@ errout:
     return PRTE_ERR_SILENT;
 }
 
-/* mapping by hwloc object looks a lot like mapping by node,
- * but has the added complication of possibly having different
- * numbers of objects on each node
- */
+/* The hwloc-object enumerator: the targets are every object of
+ * options->maptype on the node.  Stateless - no begin/end needed. */
+static unsigned hwloc_targets_count(prte_node_t *node,
+                                    prte_rmaps_options_t *opts,
+                                    void *ctx)
+{
+    PRTE_HIDE_UNUSED_PARAMS(ctx);
+    return prte_hwloc_base_get_nbobjs_by_type(node->topology->topo, opts->maptype);
+}
+
+static hwloc_obj_t hwloc_targets_item(prte_node_t *node,
+                                      prte_rmaps_options_t *opts,
+                                      void *ctx, unsigned j)
+{
+    PRTE_HIDE_UNUSED_PARAMS(ctx);
+    return prte_hwloc_base_get_obj_by_type(node->topology->topo, opts->maptype, j);
+}
+
 int prte_rmaps_rr_byobj(prte_job_t *jdata, prte_app_context_t *app,
                         pmix_list_t *node_list, int32_t num_slots,
                         pmix_rank_t num_procs,
                         prte_rmaps_options_t *options)
 {
+    prte_rmaps_target_enum_t tgts = {
+        .begin = NULL,
+        .count = hwloc_targets_count,
+        .item = hwloc_targets_item,
+        .placed = NULL,
+        .end = NULL,
+        /* hwloc_obj_type_string() returns a static string */
+        .name = hwloc_obj_type_string(options->maptype)
+    };
+
+    return prte_rmaps_rr_map_targets(jdata, app, node_list, num_slots,
+                                     num_procs, options, &tgts);
+}
+
+int prte_rmaps_rr_map_targets(prte_job_t *jdata, prte_app_context_t *app,
+                              pmix_list_t *node_list, int32_t num_slots,
+                              pmix_rank_t num_procs,
+                              prte_rmaps_options_t *options,
+                              prte_rmaps_target_enum_t *tgts)
+{
     int rc=PRTE_SUCCESS, nprocs_mapped;
     prte_node_t *node, *nnext;
-    int ncpus;
+    int ncpus, budget, nplaced, ndx;
+    int extra_procs_to_assign = 0, nxtra_nodes = 0;
+    float balance;
     prte_proc_t *proc;
-    bool nodefull, allfull, outofcpus=false;
+    bool nodefull, allfull, outofcpus=false, firstpass, wasfirst, interleave;
     hwloc_obj_t obj = NULL;
-    unsigned j, nobjs;
+    unsigned i, j, nobjs, start;
+    void *ctx = NULL;
+    bool began = false;
+    int *cursor = NULL;
+    int ncursor = 0;
 
     pmix_output_verbose(2, prte_rmaps_base_framework.framework_output,
                         "mca:rmaps:rr:byobj mapping by %s for job %s slots %d num_procs %lu",
-                        hwloc_obj_type_string(options->maptype),
+                        tgts->name,
                         PRTE_JOBID_PRINT(jdata->nspace),
                         (int) num_slots, (unsigned long) num_procs);
 
     /* quick check to see if we can map all the procs */
-    if (num_slots < app->num_procs) {
+    if (num_slots < (int) app->num_procs) {
         if (!options->oversubscribe) {
-            pmix_show_help("help-prte-rmaps-base.txt", "prte-rmaps-base:alloc-error", true,
+            prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-rmaps-base.txt", "prte-rmaps-base:alloc-error", true,
                            app->num_procs, app->app, prte_process_info.nodename);
             PRTE_UPDATE_EXIT_STATUS(PRTE_ERROR_DEFAULT_EXIT_CODE);
             return PRTE_ERR_SILENT;
@@ -623,10 +778,68 @@ int prte_rmaps_rr_byobj(prte_job_t *jdata, prte_app_context_t *app,
      * to the next node. Thus, procs tend to be "front loaded" onto the
      * list of nodes, as opposed to being "load balanced" in the span mode
      */
+    /* Span cycles across the nodes, so it has to remember which target it
+     * used last on each of them: the k'th proc a node receives goes on its
+     * k'th target. Keyed by the node's slot in the global pool, which is the
+     * one identifier that survives a node being dropped from the list.
+     * A target set that cannot be revisited (nowrap) is left alone - it gets
+     * one pass, so there is nothing to cycle. */
+    interleave = (options->mapspan && !tgts->nowrap);
+    /* A target set that cannot be revisited needs a cursor for a different
+     * reason: a later pass - which only oversubscription brings - must
+     * resume at the first target this node has not yet handed out, rather
+     * than start over at one already assigned. Without it such a map got a
+     * single pass, so being allowed to oversubscribe changed nothing: four
+     * GPUs on a node with two slots refused -n 4, and said the mapper result
+     * was "Success". */
+    if (interleave || tgts->nowrap) {
+        PMIX_LIST_FOREACH(node, node_list, prte_node_t) {
+            if (node->index >= ncursor) {
+                ncursor = node->index + 1;
+            }
+        }
+        if (0 < ncursor) {
+            cursor = (int *) calloc(ncursor, sizeof(int));
+            if (NULL == cursor) {
+                rc = PRTE_ERR_OUT_OF_RESOURCE;
+                goto errout;
+            }
+        } else {
+            /* no node carries a pool index - nothing to key on, so place
+             * these the way a non-span map would rather than guess (and give
+             * an unshareable set its single pass) */
+            interleave = false;
+        }
+    }
+
     allfull = true;
     nprocs_mapped = 0;
+    firstpass = true;
     do {
         allfull = true;
+        /* Every pass after the first is placing procs the nodes have no room
+         * for, which only happens when we were told we may oversubscribe.
+         * Spread those evenly rather than letting the head of the list absorb
+         * them: the same even split by-slot and by-node use for their second
+         * pass, so the mappers answer an oversubscribed job alike. Recomputed
+         * each time round because a node may take less than its share (its
+         * cpus ran out, or it hit max_slots and left the list), and the next
+         * pass should then divide what is left among the nodes still here. */
+        if (!firstpass && options->oversubscribe && !interleave) {
+            int nnodes = (int) pmix_list_get_size(node_list);
+            int remaining = (int) app->num_procs - nprocs_mapped;
+            if (0 >= nnodes) {
+                break;
+            }
+            balance = (float) remaining / (float) nnodes;
+            extra_procs_to_assign = (int) balance;
+            nxtra_nodes = 0;
+            if (0 < (balance - (float) extra_procs_to_assign)) {
+                /* the first few nodes take one more than the rest */
+                nxtra_nodes = remaining - (extra_procs_to_assign * nnodes);
+                extra_procs_to_assign++;
+            }
+        }
         PMIX_LIST_FOREACH_SAFE(node, nnext, node_list, prte_node_t)
         {
             outofcpus = false;
@@ -647,46 +860,145 @@ int prte_rmaps_rr_byobj(prte_job_t *jdata, prte_app_context_t *app,
             options->nobjs = 0;
             /* have to delay checking for availability until we have the object */
 
-            /* get the number of objects of this type on this node */
-            nobjs = prte_hwloc_base_get_nbobjs_by_type(node->topology->topo,
-                                             options->maptype);
+            /* let the enumerator set up whatever it needs for this node */
+            if (NULL != tgts->begin) {
+                rc = tgts->begin(jdata, node, options, &ctx);
+                if (PRTE_SUCCESS != rc) {
+                    goto errout;
+                }
+                began = true;
+            }
+
+            /* get the number of targets on this node */
+            nobjs = tgts->count(node, options, ctx);
             if (0 == nobjs) {
-                /* this node doesn't have any objects of this type, so
-                 * we might as well drop it from consideration */
-                pmix_list_remove_item(node_list, &node->super);
-                PMIX_RELEASE(node);
-                continue;
+                /* We only ever map by an object because the user asked us
+                 * to, so a node that has no such object is a request we
+                 * cannot answer - say so. Quietly dropping the node instead
+                 * shrank the allocation the user gave us without telling
+                 * them, and quietly falling back to by-slot (which the
+                 * caller used to do) placed the job by a rule they never
+                 * asked for. */
+                prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-rmaps-base.txt", "rmaps:mapping-target-not-found",
+                               true, tgts->name, node->name);
+                rc = PRTE_ERR_SILENT;
+                goto errout;
             }
             pmix_output_verbose(2, prte_rmaps_base_framework.framework_output,
                                 "mca:rmaps:rr: found %u %s objects on node %s",
-                                nobjs, hwloc_obj_type_string(options->maptype),
-                                node->name);
+                                nobjs, tgts->name, node->name);
 
+            /* How many procs may this node take on this pass?
+             *
+             * What a node offers a job is node->slots_available, not its slot
+             * count: a ":N" suffix on a -host entry caps what this job may
+             * take from it, and get_target_nodes records the cap there
+             * (setup_proc consumes one per placed proc). Nothing below sees
+             * it - check_avail and check_oversubscribed both measure against
+             * node->slots - so without this the loop filled each node to its
+             * slot count and left the rest of the -host list empty.
+             *
+             * Permission to oversubscribe does not change how the procs are
+             * distributed, only how many a node may end up with. So the first
+             * pass still hands each node exactly what it offers, and the
+             * passes after it hand out the even share computed above. A tool
+             * does not consume slots at all, so nothing bounds it here. */
+            ndx = (NULL != cursor && 0 <= node->index && node->index < ncursor)
+                  ? node->index : -1;
+            start = 0;
+            if (PRTE_FLAG_TEST(app, PRTE_APP_FLAG_TOOL)) {
+                budget = (int) app->num_procs;
+            } else if (interleave) {
+                /* one target per node per trip round the list - the cycling
+                 * IS the load balance, so there is no share to compute here
+                 * and no need to treat the first pass differently: a node
+                 * simply stops taking procs when it has given what it has,
+                 * unless we may oversubscribe, in which case it keeps its
+                 * place in the rotation and the overflow spreads itself. */
+                budget = (options->oversubscribe || 0 < node->slots_available) ? 1 : 0;
+                if (0 <= ndx) {
+                    start = (unsigned) (cursor[ndx] % (int) nobjs);
+                }
+            } else if (firstpass || !options->oversubscribe) {
+                budget = node->slots_available;
+            } else {
+                budget = extra_procs_to_assign;
+                if (0 < nxtra_nodes) {
+                    --nxtra_nodes;
+                    if (0 == nxtra_nodes) {
+                        --extra_procs_to_assign;
+                    }
+                }
+            }
+            if (tgts->nowrap && 0 <= ndx) {
+                /* resume after the targets earlier passes used up */
+                start = (unsigned) cursor[ndx];
+            }
             nodefull = false;
+            nplaced = 0;
         redo:
-            for (j=0; j < nobjs && nprocs_mapped < app->num_procs && !nodefull; j++) {
+            for (i=0; i < nobjs && nprocs_mapped < app->num_procs && !nodefull; i++) {
+                /* the node-major walk takes the targets in order; the
+                 * interleaved one resumes where this node left off, wrapping
+                 * so an oversubscribed second lap starts over at the front */
+                if (tgts->nowrap) {
+                    if (nobjs <= start + i) {
+                        /* every target on this node has been handed out */
+                        break;
+                    }
+                    j = start + i;
+                } else {
+                    j = (0 == start) ? i : (unsigned) ((start + i) % nobjs);
+                }
                 pmix_output_verbose(10, prte_rmaps_base_framework.framework_output,
                                     "mca:rmaps:rr: assigning proc to object %d", j);
-                /* get the hwloc object */
-                obj = prte_hwloc_base_get_obj_by_type(node->topology->topo,
-                                            options->maptype, j);
+                if (nplaced >= budget) {
+                    /* this node has had its share for this pass */
+                    nodefull = true;
+                    break;
+                }
+                /* get the target object */
+                obj = tgts->item(node, options, ctx, j);
                 if (NULL == obj) {
                     /* out of objects on this node */
                     break;
                 }
                 /* does this object have enough available cpus to
-                 * support the requested cpus_per_rank? */
+                 * support the requested cpus_per_rank? This only matters
+                 * when we are actually going to bind. If binding has been
+                 * turned off - e.g., because the node is oversubscribed and
+                 * the top-of-function check reset an unset binding policy to
+                 * BIND_TO_NONE - then a shortage of free cpus on the object
+                 * must not block placement. Otherwise a genuinely
+                 * oversubscribed node (whose cpus were already consumed by an
+                 * earlier job, such as the parent of a PMIx_Spawn) would be
+                 * wrongly rejected as overloaded and the unbound proc would
+                 * fail to map. */
                 ncpus = prte_rmaps_base_get_ncpus(node, obj, options);
-                if (ncpus < options->cpus_per_rank && !options->overload) {
+                if (PRTE_BIND_TO_NONE != options->bind &&
+                    ncpus < options->cpus_per_rank && !options->overload) {
                     outofcpus = true;
+                    if (tgts->nowrap && 0 <= ndx) {
+                        /* passed over, and not to be offered again */
+                        cursor[ndx] = (int) j + 1;
+                    }
                     continue;
                 }
                 options->nprocs = 1;
 
                 if (!prte_rmaps_base_check_avail(jdata, app, node, node_list, obj, options)) {
                     rc = PRTE_ERR_OUT_OF_RESOURCE;
-                    PRTE_ERROR_LOG(rc);
-                    // out of resources on this node
+                    /* This node can take no more. Mark it done rather than
+                     * merely breaking out of the object loop: without this the
+                     * "redo" retry below re-enters the loop on the same node,
+                     * and if check_avail declined because the node reached its
+                     * max_slots bound it has already removed the node from
+                     * node_list and released it - so the retry asks it to
+                     * remove and release the very same node a second time,
+                     * corrupting the list and dropping the node's last
+                     * reference. That crashed the HNP for a --map-by <object>
+                     * job on a hostfile carrying max_slots. */
+                    nodefull = true;
                     break;
                 }
 
@@ -695,7 +1007,25 @@ int prte_rmaps_rr_byobj(prte_job_t *jdata, prte_app_context_t *app,
                     rc = PRTE_ERR_OUT_OF_RESOURCE;
                     goto errout;
                 }
+                /* let the enumerator record whatever the target means to it -
+                 * a device map notes which device this proc was placed
+                 * against, which the proc has no other way to learn */
+                if (NULL != tgts->placed) {
+                    rc = tgts->placed(proc, options, ctx, j);
+                    if (PRTE_SUCCESS != rc) {
+                        PMIX_RELEASE(proc);
+                        goto errout;
+                    }
+                }
                 nprocs_mapped++;
+                nplaced++;
+                if (0 <= ndx) {
+                    if (tgts->nowrap) {
+                        cursor[ndx] = (int) j + 1;
+                    } else {
+                        cursor[ndx]++;
+                    }
+                }
                 rc = prte_rmaps_base_check_oversubscribed(jdata, app, node, options);
                 if (PRTE_ERR_TAKE_NEXT_OPTION == rc) {
                     /* move to next node */
@@ -713,36 +1043,76 @@ int prte_rmaps_rr_byobj(prte_job_t *jdata, prte_app_context_t *app,
                 allfull = false;
             }
             if (nprocs_mapped < app->num_procs && !allfull &&
-                !nodefull && !outofcpus && !options->mapspan) {
+                !nodefull && !outofcpus && !options->mapspan &&
+                !tgts->nowrap) {
                 // keep working these objects until full
                 goto redo;
             }
             // move to the next node
+            if (began) {
+                if (NULL != tgts->end) {
+                    tgts->end(ctx);
+                }
+                ctx = NULL;
+                began = false;
+            }
             if (NULL != options->target) {
                 hwloc_bitmap_free(options->target);
                 options->target = NULL;
             }
         }
-    } while (nprocs_mapped < app->num_procs && !allfull);
+        /* with no cursor to resume from, one pass is all an unshareable
+         * target set gets: coming round again would put a second proc on a
+         * target already assigned */
+        if (tgts->nowrap && NULL == cursor) {
+            break;
+        }
+        wasfirst = firstpass;
+        firstpass = false;
+        /* A first pass that placed nothing at all normally means the job
+         * cannot be placed - but not when we may oversubscribe: there every
+         * node offering nothing is exactly the case oversubscription exists
+         * for, and it is the pass after this one that places those procs.
+         * Ending the loop here failed the map instead, which is what a
+         * PMIx_Spawn onto a node its parent job has filled looks like. */
+    } while (nprocs_mapped < app->num_procs &&
+             (!allfull || (options->oversubscribe && wasfirst)));
 
     if (nprocs_mapped == app->num_procs) {
+        if (NULL != cursor) {
+            free(cursor);
+        }
         return PRTE_SUCCESS;
     }
 
 errout:
+    if (NULL != cursor) {
+        free(cursor);
+        cursor = NULL;
+    }
+    /* an early exit can leave the enumerator holding this node's state */
+    if (began && NULL != tgts->end) {
+        tgts->end(ctx);
+    }
     if (PRTE_ERR_SILENT == rc) {
         return rc;
     }
+    if (PRTE_SUCCESS == rc) {
+        /* the placement ran out of targets or budget without any call
+         * failing - still a failure to map, and not one to report as
+         * "Success" */
+        rc = PRTE_ERR_OUT_OF_RESOURCE;
+    }
     if (outofcpus) {
         /* ran out of cpus */
-        pmix_show_help("help-prte-rmaps-base.txt",
+        prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-rmaps-base.txt",
                        "allocation-overload", true,
                        app->app, app->num_procs,
                        prte_rmaps_base_print_mapping(options->map),
                        prte_hwloc_base_print_binding(options->bind));
         return PRTE_ERR_SILENT;
     }
-    pmix_show_help("help-prte-rmaps-base.txt",
+    prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-rmaps-base.txt",
                    "failed-map", true,
                    PRTE_ERROR_NAME(rc),
                    app->app, app->num_procs,

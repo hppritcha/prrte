@@ -58,7 +58,6 @@ event_min_version = f"{prte_data['event_min_version']}"
 automake_min_version = f"{prte_data['automake_min_version']}"
 autoconf_min_version = f"{prte_data['autoconf_min_version']}"
 libtool_min_version = f"{prte_data['libtool_min_version']}"
-flex_min_version = f"{prte_data['flex_min_version']}"
 python_min_version = f"{prte_data['python_min_version']}"
 
 # "release" is a sphinx config variable: assign it to the computed
@@ -131,7 +130,7 @@ if key in os.environ and os.environ[key] == 'True':
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
 # ones.
 import sphinx_rtd_theme
-extensions = ['recommonmark', "sphinx_rtd_theme"]
+extensions = ["sphinx_rtd_theme"]
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
@@ -239,7 +238,6 @@ rst_prolog = f"""
 .. |automake_min_version| replace:: {automake_min_version}
 .. |autoconf_min_version| replace:: {autoconf_min_version}
 .. |libtool_min_version| replace:: {libtool_min_version}
-.. |flex_min_version| replace:: {flex_min_version}
 .. |python_min_version| replace:: {python_min_version}
 
 """
